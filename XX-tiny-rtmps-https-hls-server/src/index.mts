@@ -6,7 +6,7 @@ import { parseArgs } from 'node:util';
 import type { ParseArgsOptionsConfig } from 'node:util';
 
 import { run } from '../../01-tiny-rtmp-server/src/rtmp-session.mts';
-import { logger } from '../../01-tiny-rtmp-server/src/logger.mts';
+import { ConsoleLogger, logger, registerLogger } from '../../01-tiny-rtmp-server/src/logger.mts';
 
 import handle_rtmp from '../../02-tiny-http-flv-server/src/rtmp-accepter.mts';
 import { AuthConfiguration } from '../../01-tiny-rtmp-server/src/auth.mts';
@@ -41,11 +41,12 @@ const options = {
     type: 'string',
   },
 } as const satisfies ParseArgsOptionsConfig;
-const { values: args } = parseArgs({ options, tokens: true });
-if (Number.isNaN(Number.parseInt(args.rtmp, 10))) {
-  console.error('Please Specify valid port number'); process.exit(1);
-}
-if (Number.isNaN(Number.parseInt(args.web, 10))) {
+const { values: args } = parseArgs({ options });
+const port = Number.parseInt(args.rtmp, 10);
+const web = Number.parseInt(args.web, 10);
+const bandwidth = args.bandwidth != null ? Number.parseInt(args.bandwidth, 10) : undefined;
+const maxage = args.maxage != null ? Number.parseInt(args.maxage, 10) : 36000;
+if (Number.isNaN(port) || Number.isNaN(web)) {
   console.error('Please Specify valid port number'); process.exit(1);
 }
 if (args.key == null) {
@@ -60,21 +61,18 @@ if (args.app == null) {
 if (args.streamKey == null) {
   console.error('Please Specify valid streamKey'); process.exit(1);
 }
-if (args.bandwidth != null && Number.isNaN(Number.parseInt(args.bandwidth, 10))) {
+if (Number.isNaN(bandwidth)) {
   console.error('Please Specify valid bandwidth'); process.exit(1);
 }
-if (args.maxage != null && Number.isNaN(Number.parseInt(args.maxage, 10))) {
+if (Number.isNaN(maxage)) {
   console.error('Please Specify valid maxage'); process.exit(1);
 }
-const port = Number.parseInt(args.rtmp, 10);
-const web = Number.parseInt(args.web, 10);
 const key = fs.readFileSync(args.key);
 const cert = fs.readFileSync(args.cert);
 const app = args.app;
 const streamKey = args.streamKey;
-const bandwidth = args.bandwidth != null ? Number.parseInt(args.bandwidth, 10) : undefined;
-const maxage = args.maxage != null ? Number.parseInt(args.maxage, 10) : 36000;
 const auth = AuthConfiguration.simpleAuth(app, streamKey);
+registerLogger(new ConsoleLogger());
 
 const page = `
 <!DOCTYPE html>
@@ -102,96 +100,70 @@ const page = `
 
 let rtmp_to_hls: HLSGenerator | null = null;
 const handle = async (connection: Duplex) => {
+  // この接続の配信で作った HLSGenerator (認証に失敗した接続などが終了しても、配信中のものを消さないようにする)
+  let generator: HLSGenerator | null = null;
   try {
     for await (const message of handle_rtmp(connection, { auth, limit: { bandwidth } })) {
-      if (rtmp_to_hls == null) { rtmp_to_hls = new HLSGenerator(3); }
-      rtmp_to_hls.feed(message);
+      if (generator == null) {
+        generator = new HLSGenerator(3);
+        rtmp_to_hls = generator;
+      }
+      generator.feed(message);
     }
   } catch (e) {
-    const message = e instanceof Error ? e.message : String(e);
-    logger.error(`RTMP session error: ${message}`, e instanceof Error ? { stack: e.stack } : undefined);
+    logger.error('RTMP session error', { error: e });
   } finally {
-    rtmp_to_hls = null;
+    generator?.end();
+    if (rtmp_to_hls === generator) { rtmp_to_hls = null; }
   }
 };
 
-const rtmp_server = tls.createServer({ noDelay: true, key, cert }, async (connection) => {
-  await run(async () => {
-    await handle(connection);
-  });
+const rtmp_server = tls.createServer({ noDelay: true, key, cert }, (connection) => {
+  run(() => handle(connection));
 });
 rtmp_server.listen(port);
 
 const web_server = https.createServer({ key, cert }, async (req, res) => {
-  const notfound = () => {
-    res.writeHead(404, { 'access-control-allow-origin': '*' });
-    res.end();
+  const respond = (status: number, headers: Record<string, string>, body: string | Buffer = '') => {
+    res.writeHead(status, { 'access-control-allow-origin': '*', ... headers });
+    res.end(body);
   };
 
-  if (req.url == null) {
-    notfound();
-    return;
-  }
-  const url = new URL(req.url, `http://localhost:${web}`);
-  if (!(req.method === 'GET' && url.pathname.startsWith(`/${app}/${streamKey}/`))) {
-    notfound();
-    return;
-  }
-  if (rtmp_to_hls == null) {
-    notfound();
+  const url = new URL(req.url ?? '/', `http://localhost:${web}`);
+  const directory = `/${app}/${streamKey}/`;
+  // await している間に配信が終わって差し替わっても大丈夫なように、今の配信の HLSGenerator を取り出しておく
+  const generator = rtmp_to_hls;
+  if (!(req.method === 'GET' && url.pathname.startsWith(directory)) || generator == null) {
+    respond(404, {});
     return;
   }
 
-  const prefix = url.pathname.slice(`/${app}/${streamKey}/`.length);
-  if (prefix === '' || prefix === 'index.html') {
-    res.writeHead(200, {
-      'content-type': 'text/html',
-      'access-control-allow-origin': '*',
-      'cache-control': 'max-age=0',
-    });
-    res.write(page);
-    res.end();
+  const filename = url.pathname.slice(directory.length);
+  if (filename === '' || filename === 'index.html') {
+    respond(200, { 'content-type': 'text/html', 'cache-control': 'max-age=0' }, page);
     return;
   }
-  if (prefix === 'playlist.m3u8') {
-    const published = await rtmp_to_hls.published();
-    if (!published) {
-      notfound();
+  if (filename === 'playlist.m3u8') {
+    // セグメントが揃ってプレイリストを公開できるようになるまで待つ
+    if (!await generator.published()) {
+      respond(404, {});
       return;
     }
-
-    res.writeHead(200, {
-      'content-type': 'application/vnd.apple.mpegurl',
-      'access-control-allow-origin': '*',
-      'cache-control': 'max-age=0',
-    });
-    res.write(rtmp_to_hls.m3u8());
-    res.end();
+    respond(200, { 'content-type': 'application/vnd.apple.mpegurl', 'cache-control': 'max-age=0' }, generator.m3u8());
     return;
   }
-  if (prefix.endsWith('.ts') && !Number.isNaN(Number.parseInt(prefix.slice(0, -3), 10))) {
-    const index = Number.parseInt(prefix.slice(0, -3), 10);
-    const segment = rtmp_to_hls.segment(index);
-
+  const ts = /^(\d+)\.ts$/.exec(filename);
+  if (ts != null) {
+    const [, msn] = ts;
+    const segment = generator.segment(Number.parseInt(msn, 10));
     if (segment == null) {
-      res.writeHead(404, {
-        'access-control-allow-origin': '*',
-        'cache-control': 'max-age=0',
-      });
-      res.end();
+      respond(404, { 'cache-control': 'max-age=0' });
       return;
     }
-
-    res.writeHead(200, {
-      'content-type': 'video/mp2t',
-      'access-control-allow-origin': '*',
-      'cache-control': `max-age=${maxage}`,
-    });
-    res.write(segment);
-    res.end();
+    respond(200, { 'content-type': 'video/mp2t', 'cache-control': `max-age=${maxage}` }, segment);
     return;
   }
 
-  notfound();
+  respond(404, {});
 });
 web_server.listen({ port: web });

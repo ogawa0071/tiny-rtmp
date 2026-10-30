@@ -30,15 +30,14 @@ export default class MediaPlaylist {
   private publishedNotify: (success: boolean) => void;
 
   private sequenceNumber: number = -1;
-  private orphanedNumber: number;
 
   private liveWindowLength: number;
   private orphanedWindowLength: number;
   private partialSegmentDuration: number;
 
   private currentSegment: ConcatenatedSegment | null = null;
-  private segmentMap: Map<number, ConcatenatedSegment> = new Map<number, ConcatenatedSegment>();
-  private orphanedMap: Map<number, ConcatenatedSegment> = new Map<number, ConcatenatedSegment>();
+  private segmentMap: Map<number, ConcatenatedSegment> = new Map<number, ConcatenatedSegment>(); // プレイリストに載せるセグメント
+  private orphanedMap: Map<number, ConcatenatedSegment> = new Map<number, ConcatenatedSegment>(); // プレイリストから外れたが、まだ取得できるセグメント
 
   private minimumSegmentDuration: number;
   private targetduration: number | null = null;
@@ -47,7 +46,6 @@ export default class MediaPlaylist {
     const option = MediaPlaylistOption.from(opt);
     this.liveWindowLength = option.liveWindowLength;
     this.orphanedWindowLength = option.orphanedWindowLength;
-    this.orphanedNumber = this.sequenceNumber - option.liveWindowLength;
     this.partialSegmentDuration = option.partialSegmentDuration;
     this.minimumSegmentDuration = option.minimumSegmentDuration;
 
@@ -62,29 +60,23 @@ export default class MediaPlaylist {
     }
     const previousSegment = this.currentSegment;
 
-    this.currentSegment?.complete(timestamp, false);
-    if (this.currentSegment) {
-      this.segmentMap.set(this.sequenceNumber, this.currentSegment);
-      if (this.targetduration == null) {
-        this.targetduration = Math.ceil(this.currentSegment.extinf()!);
-      }
+    if (previousSegment != null) {
+      // 完成を待っている視聴者への通知は、次のセグメントをプレイリストに載せてから行う
+      previousSegment.complete(timestamp, false);
+      this.segmentMap.set(this.sequenceNumber, previousSegment);
+      // EXT-X-TARGETDURATION は全てのセグメントの長さ以上である必要があるので、一番長いセグメントに合わせる
+      this.targetduration = Math.max(this.targetduration ?? 0, Math.ceil(previousSegment.extinf()!));
     }
-    if (this.sequenceNumber - this.liveWindowLength >= 0) {
-      const sequenceNumber = this.sequenceNumber - this.liveWindowLength;
-      const segment = this.segmentMap.get(sequenceNumber);
-
-      if (segment) {
-        this.orphanedMap.set(sequenceNumber, segment);
-        this.segmentMap.delete(sequenceNumber);
-      }
+    // ライブウィンドウから外れたセグメントは、プレイリストを取得済みの視聴者のために少しの間だけ残しておく
+    const orphaned = this.sequenceNumber - this.liveWindowLength;
+    const orphanedSegment = this.segmentMap.get(orphaned);
+    if (orphanedSegment != null) {
+      this.orphanedMap.set(orphaned, orphanedSegment);
+      this.segmentMap.delete(orphaned);
     }
-    if (this.orphanedNumber - this.orphanedWindowLength >= 0) {
-      const sequenceNumber = this.orphanedNumber - this.orphanedWindowLength;
-      this.orphanedMap.delete(sequenceNumber);
-    }
+    this.orphanedMap.delete(orphaned - this.orphanedWindowLength);
 
     this.sequenceNumber += 1;
-    this.orphanedNumber += 1;
     this.currentSegment = new ConcatenatedSegment(timestamp, timescale, new Date());
     previousSegment?.notify();
 
@@ -103,16 +95,23 @@ export default class MediaPlaylist {
     }
   }
 
+  // 配信の終了時に呼ぶ (プレイリストを公開できるまで待っている視聴者に、公開できなかったことを伝える)
+  public end(): void {
+    this.publishedNotify(false);
+  }
+
   public m3u8(): string {
+    const begin = Math.max(0, this.sequenceNumber - this.liveWindowLength);
+
     let m3u8 = '';
     m3u8 += '#EXTM3U\n';
     m3u8 += '#EXT-X-VERSION:6\n';
     m3u8 += `#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES,PART-HOLD-BACK=${(this.partialSegmentDuration * 3.5).toFixed(6)}\n`;
     m3u8 += `#EXT-X-PART-INF:PART-TARGET=${this.partialSegmentDuration.toFixed(6)}\n`;
-    m3u8 += `#EXT-X-MEDIA-SEQUENCE:${Math.max(0, this.sequenceNumber - this.liveWindowLength)}\n`;
+    m3u8 += `#EXT-X-MEDIA-SEQUENCE:${begin}\n`;
     m3u8 += `#EXT-X-TARGETDURATION:${this.targetduration}\n`;
     m3u8 += '\n';
-    for (let i = Math.max(0, this.sequenceNumber - this.liveWindowLength); i < this.sequenceNumber; i++) {
+    for (let i = begin; i < this.sequenceNumber; i++) {
       const segment = this.segmentMap.get(i)!;
       const programDateTime = segment.programDateTime();
       if (programDateTime != null) {
@@ -133,8 +132,9 @@ export default class MediaPlaylist {
     for (const [index, part] of this.currentSegment.enumerate()) {
       const extinf = part.extinf();
       if (extinf != null) {
-        m3u8 += `#EXT-X-PART:DURATION=${part.extinf()!.toFixed(6)},URI="${this.sequenceNumber}_${index}.ts"` + (part.independent() ? ',INDEPENDENT=YES' : '') + '\n';
+        m3u8 += `#EXT-X-PART:DURATION=${extinf.toFixed(6)},URI="${this.sequenceNumber}_${index}.ts"` + (part.independent() ? ',INDEPENDENT=YES' : '') + '\n';
       } else {
+        // まだ完成していないパーシャルセグメントは、先読みのヒントとして載せる
         m3u8 += `#EXT-X-PRELOAD-HINT:TYPE=PART,URI="${this.sequenceNumber}_${index}.ts"\n`;
       }
     }

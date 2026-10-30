@@ -1,5 +1,6 @@
 import Segment from './segment.mts';
 
+// パーシャルセグメントを連結したセグメント (データは自身とパーシャルセグメントの両方に書き込む)
 export default class ConcatenatedSegment extends Segment {
   private parts: Segment[] = [];
 
@@ -8,34 +9,36 @@ export default class ConcatenatedSegment extends Segment {
     this.parts.push(new Segment(timestamp, timescale));
   }
 
+  // 今書き込んでいるパーシャルセグメント
+  private latest(): Segment {
+    return this.parts.at(-1)!;
+  }
+
   public latestBegin(): number {
-    return this.parts[this.parts.length - 1].begin();
+    return this.latest().begin();
   }
 
   public partialComplete(timestamp: number, timescale: number): void {
-    const part = this.parts[this.parts.length - 1];
+    const part = this.latest();
     this.parts.push(new Segment(timestamp, timescale));
     part.complete(timestamp);
   }
 
   public feed(buffer: Buffer, keyframe: boolean = false): void {
-    const part = this.parts[this.parts.length - 1];
-    if (part) { part.feed(buffer, keyframe); }
+    this.latest().feed(buffer, keyframe);
     super.feed(buffer, keyframe);
   }
 
   public complete(timestamp: number, notify: boolean = true): void {
     if (this.extinf() != null) { return; }
-    const part = this.parts[this.parts.length - 1];
-    if (part) { part.complete(timestamp, false); }
+    this.latest().complete(timestamp, false);
     super.complete(timestamp, false);
     if (!notify) { return; }
     this.notify();
   }
 
   public notify(): void {
-    const part = this.parts[this.parts.length - 1];
-    if (part) { part.notify(); }
+    this.latest().notify();
     super.notify();
   }
 
@@ -43,9 +46,7 @@ export default class ConcatenatedSegment extends Segment {
     return this.parts[index];
   }
 
-  public *enumerate(): Iterable<[index: number, partialSegment: Segment]> {
-    for (let i = 0; i < this.parts.length; i++) {
-      yield [i, this.parts[i]];
-    }
+  public enumerate(): Iterable<[index: number, partialSegment: Segment]> {
+    return this.parts.entries();
   }
 }
