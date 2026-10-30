@@ -1,6 +1,5 @@
 import ByteVector from './byte-vector.mts';
 
-
 const fixed_point_U16BE = (integer: number, decimal: number, vector: ByteVector): void => {
   vector.writeU16BE(integer);
   vector.writeU16BE(decimal);
@@ -17,12 +16,12 @@ const unit_composition_matrix = (() => {
   vector.writeU32BE(0x00000000);   // [2, 0] 2.30 固定小数点
   vector.writeU32BE(0x00000000);   // [2, 1] 2.30 固定小数点
   vector.writeU32BE(0x40000000);   // [2, 2] 2.30 固定小数点
-  // finaize
   return vector.build();
 })();
 
 export type callback = (vector: ByteVector) => void;
 
+// 各 box の関数は vector に box を書き込み、cb の中で子の box を書き込む
 export const make = (cb?: callback): Buffer => {
   const vector = new ByteVector();
   cb?.(vector);
@@ -65,13 +64,14 @@ export const mvhd = (timescale: number, vector: ByteVector, cb?: callback): void
     vector.writeU32BE(0); // modification_time
     vector.writeU32BE(timescale); // timescale
     vector.writeU32BE(0); // duration
-    fixed_point_U16BE(1, 0, vector); // prefered ratio
-    vector.writeU16BE(1); // prefered volume
-    vector.writeU16BE(0); // predefined
+    fixed_point_U16BE(1, 0, vector); // preferred rate (16.16 固定小数点で 1.0)
+    vector.writeU16BE(0x0100); // preferred volume (8.8 固定小数点で 1.0)
+    vector.writeU16BE(0); // reserved
     vector.write(Buffer.alloc(8)); // reserved
     vector.write(unit_composition_matrix); // composition_matrix
-    vector.write(Buffer.alloc(24)); // reserved
+    vector.write(Buffer.alloc(24)); // pre_defined
     vector.writeI32BE(-1); // next_track_id
+    cb?.(vector);
   });
 };
 export const mvex = (vector: ByteVector, cb?: callback): void => {
@@ -84,6 +84,7 @@ export const trex = (track_id: number, vector: ByteVector, cb?: callback): void 
     vector.writeU32BE(0); // default_sample_duration
     vector.writeU32BE(0); // default_sample_size
     vector.writeU32BE(0x00010001); // default_sample_flags
+    cb?.(vector);
   });
 };
 export const trak = (vector: ByteVector, cb?: callback): void => {
@@ -360,8 +361,8 @@ export const tfhd = (trackId: number, vector: ByteVector, cb?: callback): void =
 export const tfdt = (baseMediaDecodeTime: number, vector: ByteVector, cb?: callback): void => {
   fullbox('tfdt', 1, 0x000000, vector, (vector) => {
     // Number.MAX_SAFE_INTEGER (2^53 - 1) を超えることはない、という仮定のもとで number で表現している
-    vector.writeU32BE(Math.floor(baseMediaDecodeTime / 2 ** 32) % (2 ** 32));
-    vector.writeU32BE(Math.floor(baseMediaDecodeTime / 2 **  0) % (2 ** 32));
+    vector.writeU32BE(Math.floor(baseMediaDecodeTime / 2 ** 32)); // 上位 32bit
+    vector.writeU32BE(baseMediaDecodeTime % (2 ** 32)); // 下位 32bit
     cb?.(vector);
   });
 };
@@ -408,16 +409,18 @@ export type FragmentInformation = {
   duration: number;
   keyframe: boolean;
 };
+// trun の data_offset の位置 (trun の先頭から size, fourcc, version + flags, sample_count の後ろ)
+export const TRUN_DATA_OFFSET_POSITION = 4 + 4 + 4 + 4;
+
 export const fragment = (information: FragmentInformation, data: Buffer, vector: ByteVector, cb?: callback): void => {
-  let trun_offset = null;
   const moof_begin = vector.byteLength();
+  let trun_begin = 0;
   moof(vector, (vector) => {
     mfhd(vector);
     traf(vector, (vector) => {
       tfhd(information.track_id, vector);
-      tfdt(information.dts, vector, (vector) => {
-        trun_offset = vector.byteLength();
-      });
+      tfdt(information.dts, vector);
+      trun_begin = vector.byteLength();
       trun(0 /* ダミー */, [{
         duration: information.duration,
         bytes: data.byteLength,
@@ -428,7 +431,6 @@ export const fragment = (information: FragmentInformation, data: Buffer, vector:
   });
   const moof_end = vector.byteLength();
   mdat(data, vector, cb);
-  // trun の ダミーを正しい値にする
-  const trun_access_index = 4 /* size */ + 4 /* fourcc */ + 4 /* version + flags */ + 4;
-  vector.writeU32BE(moof_end - moof_begin + 8 /* mdat header */, trun_offset! + trun_access_index);
+  // trun の data_offset (moof の先頭から mdat の中身までのバイト数) のダミーを、moof の大きさが確定した今、正しい値にする
+  vector.writeU32BE(moof_end - moof_begin + 8 /* mdat header */, trun_begin + TRUN_DATA_OFFSET_POSITION);
 };

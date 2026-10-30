@@ -5,7 +5,7 @@ import { parseArgs } from 'node:util';
 import type { ParseArgsOptionsConfig } from 'node:util';
 
 import { run } from '../../01-tiny-rtmp-server/src/rtmp-session.mts';
-import { logger } from '../../01-tiny-rtmp-server/src/logger.mts';
+import { ConsoleLogger, logger, registerLogger } from '../../01-tiny-rtmp-server/src/logger.mts';
 
 import handle_rtmp from '../../02-tiny-http-flv-server/src/rtmp-accepter.mts';
 import { AuthConfiguration } from '../../01-tiny-rtmp-server/src/auth.mts';
@@ -44,11 +44,12 @@ const options = {
     type: 'string',
   },
 } as const satisfies ParseArgsOptionsConfig;
-const { values: args } = parseArgs({ options, tokens: true });
-if (Number.isNaN(Number.parseInt(args.rtmp, 10))) {
-  console.error('Please Specify valid port number'); process.exit(1);
-}
-if (Number.isNaN(Number.parseInt(args.web, 10))) {
+const { values: args } = parseArgs({ options });
+const port = Number.parseInt(args.rtmp, 10);
+const web = Number.parseInt(args.web, 10);
+const bandwidth = args.bandwidth != null ? Number.parseInt(args.bandwidth, 10) : undefined;
+const maxage = args.maxage != null ? Number.parseInt(args.maxage, 10) : 36000;
+if (Number.isNaN(port) || Number.isNaN(web)) {
   console.error('Please Specify valid port number'); process.exit(1);
 }
 if (args.app == null) {
@@ -57,7 +58,7 @@ if (args.app == null) {
 if (args.streamKey == null) {
   console.error('Please Specify valid streamKey'); process.exit(1);
 }
-if (args.encryptionScheme == null || !(args.encryptionScheme === 'cenc' || args.encryptionScheme === 'cbcs')) {
+if (args.encryptionScheme !== 'cenc' && args.encryptionScheme !== 'cbcs') {
   console.error('Please Specify valid encryptionScheme'); process.exit(1);
 }
 if (args.encryptionKeyId == null || !/^[0-9a-fA-F]{32}$/.test(args.encryptionKeyId)) {
@@ -66,22 +67,19 @@ if (args.encryptionKeyId == null || !/^[0-9a-fA-F]{32}$/.test(args.encryptionKey
 if (args.encryptionKey == null || !/^[0-9a-fA-F]{32}$/.test(args.encryptionKey)) {
   console.error('Please Specify valid encryptionKey'); process.exit(1);
 }
-if (args.bandwidth != null && Number.isNaN(Number.parseInt(args.bandwidth, 10))) {
+if (Number.isNaN(bandwidth)) {
   console.error('Please Specify valid bandwidth'); process.exit(1);
 }
-if (args.maxage != null && Number.isNaN(Number.parseInt(args.maxage, 10))) {
+if (Number.isNaN(maxage)) {
   console.error('Please Specify valid maxage'); process.exit(1);
 }
-const port = Number.parseInt(args.rtmp, 10);
-const web = Number.parseInt(args.web, 10);
 const app = args.app;
 const streamKey = args.streamKey;
 const encryptionFormat = EncryptionFormat.from(args.encryptionScheme);
 const encryptionKeyId = Buffer.from(args.encryptionKeyId, 'hex');
 const encryptionKey = Buffer.from(args.encryptionKey, 'hex');
-const bandwidth = args.bandwidth != null ? Number.parseInt(args.bandwidth, 10) : undefined;
-const maxage = args.maxage != null ? Number.parseInt(args.maxage, 10) : 36000;
 const auth = AuthConfiguration.simpleAuth(app, streamKey);
+registerLogger(new ConsoleLogger());
 
 const page = `
 <!DOCTYPE html>
@@ -120,130 +118,64 @@ const page = `
 
 let rtmp_to_dash: DASHGenerator | null = null;
 const handle = async (connection: Duplex) => {
+  // この接続の配信で作った DASHGenerator (認証に失敗した接続などが終了しても、配信中のものを消さないようにする)
+  let generator: DASHGenerator | null = null;
   try {
     for await (const message of handle_rtmp(connection, { auth, limit: { bandwidth } })) {
-      if (rtmp_to_dash == null) { rtmp_to_dash = new DASHGenerator(encryptionFormat, encryptionKeyId, encryptionKey, 3); }
-      rtmp_to_dash.feed(message);
+      if (generator == null) {
+        generator = new DASHGenerator(encryptionFormat, encryptionKeyId, encryptionKey, 3);
+        rtmp_to_dash = generator;
+      }
+      generator.feed(message);
     }
   } catch (e) {
-    const message = e instanceof Error ? e.message : String(e);
-    logger.error(`RTMP session error: ${message}`, e instanceof Error ? { stack: e.stack } : undefined);
+    logger.error('RTMP session error', { error: e });
   } finally {
-    rtmp_to_dash = null;
+    if (rtmp_to_dash === generator) { rtmp_to_dash = null; }
   }
 };
 
-const rtmp_server = net.createServer({ noDelay: true }, async (connection) => {
-  await run(async () => {
-    await handle(connection);
-  });
+const rtmp_server = net.createServer({ noDelay: true }, (connection) => {
+  run(() => handle(connection));
 });
 rtmp_server.listen(port);
 
-const web_server = http.createServer(async (req, res) => {
-  const notfound = () => {
-    res.writeHead(404, { 'access-control-allow-origin': '*' });
-    res.end();
+const web_server = http.createServer((req, res) => {
+  const respond = (status: number, headers: Record<string, string>, body: string | Buffer = '') => {
+    res.writeHead(status, { 'access-control-allow-origin': '*', ... headers });
+    res.end(body);
   };
 
-  if (req.url == null) {
-    notfound();
-    return;
-  }
-  const url = new URL(req.url, `http://localhost:${web}`);
-  if (!(req.method === 'GET' && url.pathname.startsWith(`/${app}/${streamKey}/`))) {
-    notfound();
-    return;
-  }
-  if (rtmp_to_dash == null) {
-    notfound();
+  const url = new URL(req.url ?? '/', `http://localhost:${web}`);
+  const directory = `/${app}/${streamKey}/`;
+  const generator = rtmp_to_dash;
+  if (!(req.method === 'GET' && url.pathname.startsWith(directory)) || generator == null) {
+    respond(404, {});
     return;
   }
 
-  const prefix = url.pathname.slice(`/${app}/${streamKey}/`.length);
-  if (prefix === '' || prefix === 'index.html') {
-    res.writeHead(200, {
-      'content-type': 'text/html',
-      'access-control-allow-origin': '*',
-      'cache-control': 'max-age=0',
-    });
-    res.write(page);
-    res.end();
+  const filename = url.pathname.slice(directory.length);
+  if (filename === '' || filename === 'index.html') {
+    respond(200, { 'content-type': 'text/html', 'cache-control': 'max-age=0' }, page);
     return;
   }
-  if (prefix === 'manifest.mpd') {
-    res.writeHead(200, {
-      'content-type': 'application/dash+xml',
-      'access-control-allow-origin': '*',
-      'cache-control': 'max-age=0',
-    });
-    res.write(rtmp_to_dash.mpd());
-    res.end();
+  if (filename === 'manifest.mpd') {
+    respond(200, { 'content-type': 'application/dash+xml', 'cache-control': 'max-age=0' }, generator.mpd());
     return;
   }
-  if (prefix.endsWith('.mp4')) {
-    const type = prefix.slice(0, 5); // video/audio + _ + init
-    const init = prefix.slice(6, -4);
-    if (init !== 'init') {
-      res.writeHead(404, {
-        'access-control-allow-origin': '*',
-        'cache-control': 'max-age=0',
-      });
-      res.end();
-      return;
-    }
-
-    const segment = rtmp_to_dash.initialize(type);
+  // 初期化セグメントは {video|audio}_init.mp4, セグメントは {video|audio}_{番号}.m4s
+  const mp4 = /^(video|audio)_(?:init\.mp4|(\d+)\.m4s)$/.exec(filename);
+  if (mp4 != null) {
+    const [, type, msn] = mp4;
+    const segment = msn == null ? generator.initialize(type) : generator.segment(type, Number.parseInt(msn, 10));
     if (segment == null) {
-      res.writeHead(404, {
-        'access-control-allow-origin': '*',
-        'cache-control': 'max-age=0',
-      });
-      res.end();
+      respond(404, { 'cache-control': 'max-age=0' });
       return;
     }
-
-    res.writeHead(200, {
-      'content-type': 'video/mp4',
-      'access-control-allow-origin': '*',
-      'cache-control': `max-age=${maxage}`,
-    });
-    res.write(segment);
-    res.end();
-    return;
-  }
-  if (prefix.endsWith('.m4s')) {
-    const type = prefix.slice(0, 5); // video/audio + _ + seq
-    const index = Number.parseInt(prefix.slice(6, -4), 10);
-    if (Number.isNaN(index)) {
-      res.writeHead(404, {
-        'access-control-allow-origin': '*',
-        'cache-control': 'max-age=0',
-      });
-      res.end();
-      return;
-    }
-
-    const segment = rtmp_to_dash.segment(type, index);
-    if (segment == null) {
-      res.writeHead(404, {
-        'access-control-allow-origin': '*',
-        'cache-control': 'max-age=0',
-      });
-      res.end();
-      return;
-    }
-
-    res.writeHead(200, {
-      'content-type': 'video/mp4',
-      'access-control-allow-origin': '*',
-      'cache-control': `max-age=${maxage}`,
-    });
-    res.write(segment);
-    res.end();
+    respond(200, { 'content-type': 'video/mp4', 'cache-control': `max-age=${maxage}` }, segment);
     return;
   }
 
-  notfound();
+  respond(404, {});
 });
 web_server.listen({ port: web });

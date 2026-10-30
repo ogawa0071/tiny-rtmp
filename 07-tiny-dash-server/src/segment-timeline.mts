@@ -25,15 +25,14 @@ export default class SegmentTimeline {
   private prefix: string;
 
   private sequenceNumber: number = -1;
-  private orphanedNumber: number;
 
   private liveWindowLength: number;
   private orphanedWindowLength: number;
 
   private initializeSegment: Buffer;
   private currentSegment: Segment | null = null;
-  private segmentMap: Map<number, Segment> = new Map<number, Segment>();
-  private orphanedMap: Map<number, Segment> = new Map<number, Segment>();
+  private segmentMap: Map<number, Segment> = new Map<number, Segment>(); // MPD に載せるセグメント
+  private orphanedMap: Map<number, Segment> = new Map<number, Segment>(); // MPD から外れたが、まだ取得できるセグメント
 
   private minimumSegmentDuration: number;
   private timescale: number;
@@ -45,7 +44,6 @@ export default class SegmentTimeline {
     const option = SegmentTimelineOption.from(opt);
     this.liveWindowLength = option.liveWindowLength;
     this.orphanedWindowLength = option.orphanedWindowLength;
-    this.orphanedNumber = this.sequenceNumber - option.liveWindowLength;
     this.minimumSegmentDuration = option.minimumSegmentDuration;
   }
 
@@ -54,26 +52,20 @@ export default class SegmentTimeline {
       return;
     }
 
-    this.currentSegment?.complete(timestamp);
-    if (this.currentSegment) {
+    if (this.currentSegment != null) {
+      this.currentSegment.complete(timestamp);
       this.segmentMap.set(this.sequenceNumber, this.currentSegment);
     }
-    if (this.sequenceNumber - this.liveWindowLength >= 0) {
-      const sequenceNumber = this.sequenceNumber - this.liveWindowLength;
-      const segment = this.segmentMap.get(sequenceNumber);
-
-      if (segment) {
-        this.orphanedMap.set(sequenceNumber, segment);
-        this.segmentMap.delete(sequenceNumber);
-      }
+    // ライブウィンドウから外れたセグメントは、MPD を取得済みの視聴者のために少しの間だけ残しておく
+    const orphaned = this.sequenceNumber - this.liveWindowLength;
+    const orphanedSegment = this.segmentMap.get(orphaned);
+    if (orphanedSegment != null) {
+      this.orphanedMap.set(orphaned, orphanedSegment);
+      this.segmentMap.delete(orphaned);
     }
-    if (this.orphanedNumber - this.orphanedWindowLength >= 0) {
-      const sequenceNumber = this.orphanedNumber - this.orphanedWindowLength;
-      this.orphanedMap.delete(sequenceNumber);
-    }
+    this.orphanedMap.delete(orphaned - this.orphanedWindowLength);
 
     this.sequenceNumber += 1;
-    this.orphanedNumber += 1;
     this.currentSegment = new Segment(timestamp, this.timescale);
   }
 
@@ -82,15 +74,17 @@ export default class SegmentTimeline {
   }
 
   public segment_template(): XMLNode {
+    const begin = Math.max(0, this.sequenceNumber - this.liveWindowLength);
     const template = XMLNode.from('SegmentTemplate', {
       timescale: `${this.timescale}`,
       media: `${this.prefix}_$Number$.m4s`,
       initialization: `${this.prefix}_init.mp4`,
-      startNumber: `${Math.max(0, this.sequenceNumber - this.liveWindowLength)}`,
+      startNumber: `${begin}`,
     });
 
+    // 各セグメントの開始時刻 (t) と長さ (d) の一覧
     const timeline = XMLNode.from('SegmentTimeline');
-    for (let i = Math.max(0, this.sequenceNumber - this.liveWindowLength); i < this.sequenceNumber; i++) {
+    for (let i = begin; i < this.sequenceNumber; i++) {
       const segment = this.segmentMap.get(i)!;
       const S = XMLNode.from('S', { t: `${segment.begin()}`, d: `${segment.duration()!}` });
       timeline.children.push(S);
