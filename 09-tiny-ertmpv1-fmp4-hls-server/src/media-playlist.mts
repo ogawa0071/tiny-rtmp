@@ -21,19 +21,19 @@ export const MediaPlaylistOption = {
   },
 };
 
+// HLS (04-tiny-hls-server) の MediaPlaylist の、セグメントが fMP4 になったもの
 export default class MediaPlaylist {
   public published: Promise<boolean>;
   private publishedNotify: (success: boolean) => void;
 
   private sequenceNumber: number = -1;
-  private orphanedNumber: number;
 
   private liveWindowLength: number;
   private orphanedWindowLength: number;
 
   private currentSegment: Segment | null = null;
-  private segmentMap: Map<number, Segment> = new Map<number, Segment>();
-  private orphanedMap: Map<number, Segment> = new Map<number, Segment>();
+  private segmentMap: Map<number, Segment> = new Map<number, Segment>(); // プレイリストに載せるセグメント
+  private orphanedMap: Map<number, Segment> = new Map<number, Segment>(); // プレイリストから外れたが、まだ取得できるセグメント
 
   private minimumSegmentDuration: number;
   private targetduration: number | null = null;
@@ -42,7 +42,6 @@ export default class MediaPlaylist {
     const option = MediaPlaylistOption.from(opt);
     this.liveWindowLength = option.liveWindowLength;
     this.orphanedWindowLength = option.orphanedWindowLength;
-    this.orphanedNumber = this.sequenceNumber - option.liveWindowLength;
     this.minimumSegmentDuration = option.minimumSegmentDuration;
 
     const { promise: published, resolve: publishedNotify } = Promise.withResolvers<boolean>();
@@ -55,29 +54,22 @@ export default class MediaPlaylist {
       return;
     }
 
-    this.currentSegment?.complete(timestamp);
-    if (this.currentSegment) {
+    if (this.currentSegment != null) {
+      this.currentSegment.complete(timestamp);
       this.segmentMap.set(this.sequenceNumber, this.currentSegment);
+      // EXT-X-TARGETDURATION は全てのセグメントの長さ以上である必要があるので、一番長いセグメントに合わせる
+      this.targetduration = Math.max(this.targetduration ?? 0, Math.ceil(this.currentSegment.extinf()!));
     }
-    if (this.currentSegment?.extinf() != null && this.targetduration == null) {
-      this.targetduration = Math.ceil(this.currentSegment.extinf()!);
+    // ライブウィンドウから外れたセグメントは、プレイリストを取得済みの視聴者のために少しの間だけ残しておく
+    const orphaned = this.sequenceNumber - this.liveWindowLength;
+    const orphanedSegment = this.segmentMap.get(orphaned);
+    if (orphanedSegment != null) {
+      this.orphanedMap.set(orphaned, orphanedSegment);
+      this.segmentMap.delete(orphaned);
     }
-    if (this.sequenceNumber - this.liveWindowLength >= 0) {
-      const sequenceNumber = this.sequenceNumber - this.liveWindowLength;
-      const segment = this.segmentMap.get(sequenceNumber);
-
-      if (segment) {
-        this.orphanedMap.set(sequenceNumber, segment);
-        this.segmentMap.delete(sequenceNumber);
-      }
-    }
-    if (this.orphanedNumber - this.orphanedWindowLength >= 0) {
-      const sequenceNumber = this.orphanedNumber - this.orphanedWindowLength;
-      this.orphanedMap.delete(sequenceNumber);
-    }
+    this.orphanedMap.delete(orphaned - this.orphanedWindowLength);
 
     this.sequenceNumber += 1;
-    this.orphanedNumber += 1;
     this.currentSegment = new Segment(timestamp, timescale);
 
     if (this.segmentMap.size >= MINIMUM_LIVE_WINDOW_LENGTH) {
@@ -89,18 +81,24 @@ export default class MediaPlaylist {
     this.currentSegment?.feed(data);
   }
 
+  // 配信の終了時に呼ぶ (プレイリストを公開できるまで待っている視聴者に、公開できなかったことを伝える)
+  public end(): void {
+    this.publishedNotify(false);
+  }
+
   public m3u8(): string {
+    const begin = Math.max(0, this.sequenceNumber - this.liveWindowLength);
+
     let m3u8 = '';
     m3u8 += '#EXTM3U\n';
-    m3u8 += '#EXT-X-VERSION:3\n';
-    m3u8 += `#EXT-X-MEDIA-SEQUENCE:${Math.max(0, this.sequenceNumber - this.liveWindowLength)}\n`;
+    m3u8 += '#EXT-X-VERSION:6\n'; // EXT-X-MAP を使うには version 6 以上が必要
+    m3u8 += `#EXT-X-MEDIA-SEQUENCE:${begin}\n`;
     m3u8 += `#EXT-X-TARGETDURATION:${this.targetduration}\n`;
+    // fMP4 のセグメントは moof + mdat だけなので、デコードに必要な初期化セグメント (ftyp + moov) を指定する
+    m3u8 += '#EXT-X-MAP:URI="init.mp4"\n';
     m3u8 += '\n';
-    for (let i = Math.max(0, this.sequenceNumber - this.liveWindowLength); i < this.sequenceNumber; i++) {
+    for (let i = begin; i < this.sequenceNumber; i++) {
       const segment = this.segmentMap.get(i)!;
-      if (i === (this.sequenceNumber - this.liveWindowLength)) {
-        m3u8 += '#EXT-X-MAP:URI="init.mp4"\n';
-      }
       m3u8 += `#EXTINF:${segment.extinf()!.toFixed(6)}\n`;
       m3u8 += `${i}.m4s\n`;
     }

@@ -2,31 +2,11 @@ import { MessageType } from '../../01-tiny-rtmp-server/src/message.mts';
 import type { Message } from '../../01-tiny-rtmp-server/src/message.mts';
 import ByteReader from '../../01-tiny-rtmp-server/src/byte-reader.mts';
 
-type VideoMessage = Message & {
-  message_type_id: (typeof MessageType.Video);
-};
-type AudioMessage = Message & {
-  message_type_id: (typeof MessageType.Audio);
-};
-type AMF0DataMessage = Message & {
-  message_type_id: (typeof MessageType.DataAMF0);
-};
+// 従来の FLV の映像 (AVC) と音声、データの扱いは HTTP-TS 配信 (03-tiny-http-ts-server) と同じものを使う
+import { handle_amf0_data, handle_audio, handle_video as handle_legacy_video, FrameType } from '../../03-tiny-http-ts-server/src/rtmp-handler.mts';
+import type { ActionScriptData, AudioData, AVCData } from '../../03-tiny-http-ts-server/src/rtmp-handler.mts';
 
-export const VideoCodecType = {
-  AVC: 7,
-} as const;
-
-export const AudioCodecType = {
-  AAC: 10,
-} as const;
-
-export const FrameType = {
-  KEY_FRAME: 1,
-  INTER_FRAME: 2,
-  DISPOSABLE_INTER_FRAME: 3,
-  GENERATED_KEY_FRAME: 4,
-  VIDEO_INFO_OR_COMMAND: 5,
-} as const;
+export { FrameType };
 
 export const PacketType = {
   SequenceStart: 0,
@@ -37,16 +17,6 @@ export const PacketType = {
   MPEG2TSSequenceStart: 5,
 } as const;
 
-export type AVCData = {
-  codec: 'AVC';
-} & ({
-  packetType: typeof PacketType.SequenceStart;
-  avcDecoderConfigurationRecord: Buffer;
-} | {
-  packetType: typeof PacketType.CodedFrames;
-  compositionTimeOffset: number;
-  data: Buffer;
-});
 export type HEVCData = {
   codec: 'HEVC';
 } & ({
@@ -61,51 +31,6 @@ export type VideoData = (AVCData | HEVCData) & {
   timestamp: number;
   frameType: number;
   kind: 'Video';
-};
-
-export const AACPacketType = {
-  SequenceHeader: 0,
-  Raw: 1,
-} as const;
-export type AACData = {
-  codec: 'AAC';
-} & ({
-  packetType: typeof AACPacketType.SequenceHeader;
-  audioSpecificConfig: Buffer;
-} | {
-  packetType: typeof AACPacketType.Raw;
-  data: Buffer;
-});
-export type AudioData = AACData & {
-  timestamp: number;
-  kind: 'Audio';
-};
-
-export type ActionScriptData = {
-  timestamp: number;
-  kind: 'Data';
-  values: any[];
-};
-
-const handle_avc = (reader: ByteReader): AVCData | null => {
-  const packetType = reader.readU8();
-  const compositionTimeOffset = reader.readI24BE();
-
-  switch (packetType) {
-    case PacketType.SequenceStart: return {
-      codec: 'AVC',
-      packetType,
-      avcDecoderConfigurationRecord: reader.read(),
-    };
-    case PacketType.CodedFrames: return {
-      codec: 'AVC',
-      packetType,
-      compositionTimeOffset,
-      data: reader.read(),
-    };
-    default:
-      return null;
-  }
 };
 
 const handle_hevc = (packetType: number, reader: ByteReader): HEVCData | null => {
@@ -137,89 +62,35 @@ const handle_hevc = (packetType: number, reader: ByteReader): HEVCData | null =>
   }
 };
 
-export const handle_video = (message: VideoMessage): VideoData | null => {
+export const handle_video = (message: { timestamp: number; data: Buffer; }): VideoData | null => {
   const reader = new ByteReader(message.data);
 
   const meta = reader.readU8();
+  // 先頭 1bit (IsExHeader) が立っていなければ、従来の FLV の VideoTagHeader
   const isExHeader = (meta & 0x80) !== 0;
-  const frameType = (meta & 0xF0) >> 4;
+  if (!isExHeader) { return handle_legacy_video(message); }
 
-  if (!isExHeader) {
-    const codec = (meta & 0x0F) >> 0;
+  // Enhanced RTMP の ExVideoTagHeader: IsExHeader (1bit), FrameType (3bit), PacketType (4bit), FourCC (32bit)
+  const frameType = (meta & 0x70) >> 4;
+  const packetType = meta & 0x0F;
+  const fourcc = reader.read(4).toString('ascii');
 
-    switch (codec) {
-      case VideoCodecType.AVC: {
-        const avc = handle_avc(reader);
-        if (avc == null) { return null; }
-        return { kind: 'Video', frameType, timestamp: message.timestamp, ... avc };
-      }
-      default:
-        return null;
-    }
-  } else {
-    const packetType = (meta & 0x0F) >> 0;
-    const fourcc = reader.read(4).toString('ascii');
-
-    switch (fourcc) {
-      case 'hvc1': {
-        const hevc = handle_hevc(packetType, reader);
-        if (hevc == null) { return null; }
-        return { kind: 'Video', frameType, timestamp: message.timestamp, ... hevc };
-      }
-      default:
-        return null;
-    }
-  }
-};
-
-const handle_aac = (reader: ByteReader): AACData | null => {
-  const packetType = reader.readU8();
-  switch (packetType) {
-    case AACPacketType.SequenceHeader: return {
-      codec: 'AAC',
-      packetType,
-      audioSpecificConfig: reader.read(),
-    };
-    case AACPacketType.Raw: return {
-      codec: 'AAC',
-      packetType,
-      data: reader.read(),
-    };
-    default:
-      return null;
-  }
-};
-
-export const handle_audio = (message: AudioMessage): AudioData | null => {
-  const reader = new ByteReader(message.data);
-
-  const meta = reader.readU8();
-  const codec = (meta & 0xF0) >> 4;
-  const rate = (meta & 0x0C) >> 2;
-  const size = (meta & 0x02) >> 1;
-  const type = (meta & 0x01) >> 0;
-
-  switch (codec) {
-    case AudioCodecType.AAC: {
-      // In AAC: rate, size, type are derived in AudioSpecificConfig
-      const aac = handle_aac(reader);
-      if (aac == null) { return null; }
-      return { kind: 'Audio', timestamp: message.timestamp, ... aac };
+  switch (fourcc) {
+    case 'hvc1': {
+      const hevc = handle_hevc(packetType, reader);
+      if (hevc == null) { return null; }
+      return { kind: 'Video', frameType, timestamp: message.timestamp, ... hevc };
     }
     default:
       return null;
   }
-};
-
-export const handle_amf0_data = (message: AMF0DataMessage): ActionScriptData | null => {
-  return { kind: 'Data', timestamp: message.timestamp, values: message.data };
 };
 
 export default (message: Message): VideoData | AudioData | ActionScriptData | null => {
   switch (message.message_type_id) {
-    case MessageType.Video: return handle_video(message as VideoMessage);
-    case MessageType.Audio: return handle_audio(message as AudioMessage);
-    case MessageType.DataAMF0: return handle_amf0_data(message as AMF0DataMessage);
+    case MessageType.Video: return handle_video(message);
+    case MessageType.Audio: return handle_audio(message);
+    case MessageType.DataAMF0: return handle_amf0_data(message);
     default: return null;
   }
 };

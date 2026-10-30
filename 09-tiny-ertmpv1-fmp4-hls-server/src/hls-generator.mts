@@ -1,14 +1,14 @@
-import { isAMF0Object } from '../../01-tiny-rtmp-server/src/amf0-reader.mts';
 import type { AMF0Object } from '../../01-tiny-rtmp-server/src/amf0-reader.mts';
 import type { Message } from '../../01-tiny-rtmp-server/src/message.mts';
 
+import { AACPacketType, read_onmetadata } from '../../03-tiny-http-ts-server/src/rtmp-handler.mts';
 import { PlaylistTimestamp } from '../../04-tiny-hls-server/src/playlist-timestamp.mts';
 
 import { fragment, initialize, make } from '../../06-tiny-http-fmp4-server/src/fmp4.mts';
 import { write_mp4_avc_track_information } from '../../06-tiny-http-fmp4-server/src/avc.mts';
 import { write_mp4_aac_track_information } from '../../06-tiny-http-fmp4-server/src/aac.mts';
 
-import handle_rtmp_payload, { FrameType } from './rtmp-handler.mts';
+import handle_rtmp_payload, { FrameType, PacketType } from './rtmp-handler.mts';
 import MediaPlaylist from './media-playlist.mts';
 
 type VideoInformation = {
@@ -24,6 +24,8 @@ type AudioInformation = {
 };
 
 const RTMP_TIMESCALE = 1000;
+const VIDEO_TRACK_ID = 1;
+const AUDIO_TRACK_ID = 2;
 
 export default class HLSGenerator {
   private videoTrack: Buffer | null = null;
@@ -57,74 +59,67 @@ export default class HLSGenerator {
     return this.playlist.m3u8();
   }
 
+  public end(): void {
+    this.playlist.end();
+  }
+
   public feed(message: Message): void {
     const payload = handle_rtmp_payload(message);
     if (payload == null) { return; }
 
+    // 初期化セグメントに必要な情報を集める
     switch (payload.kind) {
       case 'Video':
-        if (payload.packetType !== 0) { break; }
+        if (payload.packetType !== PacketType.SequenceStart) { break; }
         switch (payload.codec) {
           case 'AVC':
-            this.videoTrack = write_mp4_avc_track_information(1, RTMP_TIMESCALE, payload.avcDecoderConfigurationRecord);
+            this.videoTrack = write_mp4_avc_track_information(VIDEO_TRACK_ID, RTMP_TIMESCALE, payload.avcDecoderConfigurationRecord);
             break;
           case 'HEVC':
             // TODO
-            //this.videoTrack = write_mp4_hevc_track_information(1, RTMP_TIMESCALE, payload.hevcDecoderConfigurationRecord);
+            //this.videoTrack = write_mp4_hevc_track_information(VIDEO_TRACK_ID, RTMP_TIMESCALE, payload.hevcDecoderConfigurationRecord);
             break;
         }
         return;
       case 'Audio':
-        if (payload.packetType !== 0) { break; }
-        switch (payload.codec) {
-          case 'AAC':
-            this.audioTrack = write_mp4_aac_track_information(2, RTMP_TIMESCALE, payload.audioSpecificConfig);
-            break;
-        }
+        if (payload.packetType !== AACPacketType.SequenceHeader) { break; }
+        this.audioTrack = write_mp4_aac_track_information(AUDIO_TRACK_ID, RTMP_TIMESCALE, payload.audioSpecificConfig);
         return;
       case 'Data': {
-        const command = payload.values;
-        if (command.length !== 3 || command[0] !== '@setDataFrame' || command[1] !== 'onMetaData' || !isAMF0Object(command[2])) {
-          return;
-        }
-        this.onMetadata = command[2];
+        const metadata = read_onmetadata(payload.values);
+        if (metadata != null) { this.onMetadata = metadata; }
         return;
       }
-      default:
-        return;
     }
 
+    // onMetaData に書かれている全てのトラックの初期化情報が揃うまでは何もしない
     if (this.onMetadata == null) { return; }
-
     const has_video = this.videoTrack != null;
     const has_audio = this.audioTrack != null;
-    const video_ready = this.onMetadata.videocodecid == null || has_video;
-    const audio_ready = this.onMetadata.audiocodecid == null || has_audio;
-    if (!video_ready || !audio_ready) { return; }
+    if (this.onMetadata.videocodecid != null && !has_video) { return; }
+    if (this.onMetadata.audiocodecid != null && !has_audio) { return; }
 
-    if (has_video && payload.kind === 'Video' && payload.frameType === FrameType.KEY_FRAME) {
-      this.playlist.append(PlaylistTimestamp.fromRTMP(payload.timestamp));
-    } else if (has_audio && payload.kind === 'Audio') {
-      this.playlist.append(PlaylistTimestamp.fromRTMP(payload.timestamp));
-    }
-
-    if (this.initialization == null) {
-      this.initialization = make((vector) => {
-        initialize(RTMP_TIMESCALE, [... (has_video ? [1] : []), ... (has_audio ? [2] : [])], vector, (vector) => {
-          if (this.videoTrack != null) { vector.write(this.videoTrack); }
-          if (this.audioTrack != null) { vector.write(this.audioTrack); }
-        });
+    this.initialization ??= make((vector) => {
+      initialize(RTMP_TIMESCALE, [... (has_video ? [VIDEO_TRACK_ID] : []), ... (has_audio ? [AUDIO_TRACK_ID] : [])], vector, (vector) => {
+        if (this.videoTrack != null) { vector.write(this.videoTrack); }
+        if (this.audioTrack != null) { vector.write(this.audioTrack); }
       });
-    }
+    });
 
     switch (payload.kind) {
       case 'Video':
+        if (!has_video) { return; }
+        // フレームの長さ (duration) は次のフレームとの差でわかるので、1 つ前のフレームをここで書き出す
         if (this.previousVideoInformation != null) {
           const { frameType: type, dts, cto, data } = this.previousVideoInformation;
           const duration = payload.timestamp - dts;
           this.playlist.feed(make((vector) => {
-            fragment({ track_id: 1, keyframe: type === FrameType.KEY_FRAME, duration, dts, cto }, data, vector);
+            fragment({ track_id: VIDEO_TRACK_ID, keyframe: type === FrameType.KEY_FRAME, duration, dts, cto }, data, vector);
           }));
+        }
+        // 1 つ前のフレームを今のセグメントに書き出してから、キーフレームで新しいセグメントを始める
+        if (payload.frameType === FrameType.KEY_FRAME) {
+          this.playlist.append(PlaylistTimestamp.fromRTMP(payload.timestamp));
         }
         this.previousVideoInformation = {
           frameType: payload.frameType,
@@ -134,13 +129,18 @@ export default class HLSGenerator {
         };
         return;
       case 'Audio':
+        if (!has_audio) { return; }
         // FIXME: これは手抜き 各音声コーデックで sample 数から duration を厳密に求めるべき
         if (this.previousAudioInformation != null) {
           const { dts, data } = this.previousAudioInformation;
           const duration = payload.timestamp - dts;
           this.playlist.feed(make((vector) => {
-            fragment({ track_id: 2, keyframe: true, duration, dts, cto: 0 }, data, vector);
+            fragment({ track_id: AUDIO_TRACK_ID, keyframe: true, duration, dts, cto: 0 }, data, vector);
           }));
+        }
+        // 映像がある時は映像のキーフレームで区切るので、音声だけの時に限って音声で新しいセグメントを始める
+        if (!has_video) {
+          this.playlist.append(PlaylistTimestamp.fromRTMP(payload.timestamp));
         }
         this.previousAudioInformation = {
           dts: payload.timestamp,
