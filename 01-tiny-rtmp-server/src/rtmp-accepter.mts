@@ -1,8 +1,7 @@
 import { randomBytes } from 'node:crypto';
-import { Readable, Writable } from 'node:stream';
-import type { Duplex } from 'node:stream';
-import { setTimeout as wait } from 'node:timers/promises';
-import { setTimeout } from 'node:timers';
+import { Readable } from 'node:stream';
+import type { Duplex, Writable } from 'node:stream';
+import { setInterval } from 'node:timers/promises';
 
 import AsyncByteReader from './async-byte-reader.mts';
 import read_message from './message-reader.mts';
@@ -15,9 +14,11 @@ import FLVWriter from './flv-writer.mts';
 import { logger } from './logger.mts';
 import { load, store, initialized } from './rtmp-session.mts';
 import AckCounter from './ack-counter.mts';
-import { AuthResult, collect_query, strip_query, type AuthConfiguration } from './auth.mts';
+import { AuthResult, collect_query, strip_query, type AuthConfiguration, type AuthResultWithDescription } from './auth.mts';
 
-const handle_handshake = async (reader: AsyncByteReader, connection: Duplex): Promise<boolean> => {
+export type Handshake = (reader: AsyncByteReader, connection: Duplex) => Promise<boolean>;
+
+const handle_handshake: Handshake = async (reader, connection) => {
   // C0/S0
   await reader.readU8(); // Read C0
   connection.write(Buffer.from([0x03])); // Write S0 (Version: 3)
@@ -43,23 +44,35 @@ const STATE = {
   PUBLISHED: 'PUBLISHED',
   DISCONNECTED: 'DISCONNECTED',
 } as const;
+type State = (typeof STATE)[keyof typeof STATE];
 
 const PUBLISH_MESSAGE_STREAM = 1;
 const WINDOW_ACKNOWLEDGE_SIZE = 2500000;
-const need_yield = (state: (typeof STATE)[keyof typeof STATE], message: Message): boolean => {
+const need_yield = (state: State, message: Message): boolean => {
   if (state !== STATE.PUBLISHED) { return false; }
   if (message.message_stream_id !== PUBLISH_MESSAGE_STREAM) { return false; }
 
   switch (message.message_type_id) {
-    case MessageType.Audio: return true;
-    case MessageType.Video: return true;
-    case MessageType.DataAMF0: return true;
-    default: return false;
+    case MessageType.Audio:
+    case MessageType.Video:
+    case MessageType.DataAMF0:
+      return true;
+    default:
+      return false;
   }
 };
+// 認証処理は同期・非同期のどちらでも書けて、例外も投げうるので Promise.try でまとめて扱う
+const authenticate = (name: string, fn: () => AuthResultWithDescription | Promise<AuthResultWithDescription>): Promise<AuthResultWithDescription> => {
+  return Promise.try(fn).catch((): AuthResultWithDescription => {
+    // 認証で不測のエラーが起きた場合は切断する
+    logger.error(`${name} Auth Failed`);
+    return [AuthResult.DISCONNECT, null];
+  });
+};
 type MaybePromise<T,> = T | Promise<T>;
+type Transition = (message: Message, writer: MessageWriter, auth: AuthConfiguration) => MaybePromise<State>;
 const TRANSITION = {
-  [STATE.WAITING_CONNECT]: async (message: Message, writer: MessageWriter, auth: AuthConfiguration) => {
+  [STATE.WAITING_CONNECT]: async (message, writer, auth) => {
     if (message.message_stream_id !== 0) { return STATE.WAITING_CONNECT; }
     if (message.message_type_id !== MessageType.CommandAMF0) { return STATE.WAITING_CONNECT; }
     const command = message.data;
@@ -72,15 +85,7 @@ const TRANSITION = {
     const app = command[2]['app'];
     if (!isAMF0String(app)) { return STATE.WAITING_CONNECT; }
 
-    const [authResult, description] = await (async () => {
-      try {
-        return await auth.connect(strip_query(app), collect_query(app));
-      } catch {
-        // 認証で不測のエラーが起きた場合は切断する
-        logger.error('Connect Auth Failed');
-        return [AuthResult.DISCONNECT, null];
-      }
-    })();
+    const [authResult, description] = await authenticate('Connect', () => auth.connect(strip_query(app), collect_query(app)));
     const connectAccepted = authResult === AuthResult.OK;
 
     // Connect を伝達する前に WindowAcknowledgementSize, SetPeerBandwidth, StreamBegin を伝達する
@@ -122,11 +127,11 @@ const TRANSITION = {
       [AuthResult.OK]: STATE.WAITING_CREATESTREAM,
       [AuthResult.RETRY]: STATE.WAITING_CONNECT,
       [AuthResult.DISCONNECT]: STATE.DISCONNECTED,
-    } as const satisfies Record<(typeof AuthResult)[keyof typeof AuthResult], (typeof STATE)[keyof typeof STATE]>;
+    } as const satisfies Record<AuthResult, State>;
 
     return next[authResult];
   },
-  [STATE.WAITING_CREATESTREAM]: (message: Message, writer: MessageWriter, auth: AuthConfiguration) => {
+  [STATE.WAITING_CREATESTREAM]: (message, writer) => {
     if (message.message_stream_id !== 0) { return STATE.WAITING_CREATESTREAM; }
     if (message.message_type_id !== MessageType.CommandAMF0) { return STATE.WAITING_CREATESTREAM; }
     const command = message.data;
@@ -146,7 +151,7 @@ const TRANSITION = {
 
     return STATE.WAITING_PUBLISH;
   },
-  [STATE.WAITING_PUBLISH]: async (message: Message, writer: MessageWriter, auth: AuthConfiguration) => {
+  [STATE.WAITING_PUBLISH]: async (message, writer, auth) => {
     if (message.message_stream_id !== PUBLISH_MESSAGE_STREAM) { return STATE.WAITING_PUBLISH; }
     if (message.message_type_id !== MessageType.CommandAMF0) { return STATE.WAITING_PUBLISH; }
     const command = message.data;
@@ -158,15 +163,8 @@ const TRANSITION = {
     if (!isAMF0String(command[3])) { return STATE.WAITING_PUBLISH; }
     const stream = command[3];
 
-    const [authResult, description] = await (async () => {
-      try {
-        return await auth.publish(load()!.app!, strip_query(stream), collect_query(stream));
-      } catch {
-        // 認証で不測のエラーが起きた場合は切断する
-        logger.error('Publish Auth Failed');
-        return [AuthResult.DISCONNECT, null];
-      }
-    })();
+    // WAITING_PUBLISH なら connect が成功しているので app は必ず存在する
+    const [authResult, description] = await authenticate('Publish', () => auth.publish(load()!.app!, strip_query(stream), collect_query(stream)));
     const publishAccepted = authResult === AuthResult.OK;
 
     if (publishAccepted) {
@@ -180,7 +178,7 @@ const TRANSITION = {
       description: description ?? 'Publish Accepted',
     } : {
       level: 'error', // 異常系
-      code: 'NetStream.Publish.Failed', // Permision Denied
+      code: 'NetStream.Publish.Failed', // Permission Denied
       description: description ?? 'Publish Failed',
     };
 
@@ -200,11 +198,11 @@ const TRANSITION = {
       [AuthResult.OK]: STATE.PUBLISHED,
       [AuthResult.RETRY]: STATE.WAITING_PUBLISH,
       [AuthResult.DISCONNECT]: STATE.DISCONNECTED,
-    } as const satisfies Record<(typeof AuthResult)[keyof typeof AuthResult], (typeof STATE)[keyof typeof STATE]>;
+    } as const satisfies Record<AuthResult, State>;
 
     return next[authResult];
   },
-  [STATE.PUBLISHED]: (message: Message, writer: MessageWriter, auth: AuthConfiguration) => {
+  [STATE.PUBLISHED]: (message) => {
     if (message.message_stream_id !== 0) { return STATE.PUBLISHED; }
     if (message.message_type_id !== MessageType.CommandAMF0) { return STATE.PUBLISHED; }
     const command = message.data;
@@ -216,14 +214,14 @@ const TRANSITION = {
 
     return STATE.DISCONNECTED;
   },
-  [STATE.DISCONNECTED]: (message: Message, writer: MessageWriter, auth: AuthConfiguration) => {
+  [STATE.DISCONNECTED]: () => {
     return STATE.DISCONNECTED;
   },
-} as const satisfies Record<(typeof STATE)[keyof typeof STATE], (message: Message, builder: MessageWriter, auth: AuthConfiguration) => MaybePromise<(typeof STATE)[keyof typeof STATE]>>;
+} satisfies Record<State, Transition>;
 
 const KEEPALIVE_INTERVAL = 10 * 1000; // MEMO: アプリケーション変数
 
-async function* handle_rtmp(connection: Duplex, auth: AuthConfiguration): AsyncIterable<Message> {
+async function* handle_rtmp(connection: Duplex, auth: AuthConfiguration, handshake: Handshake): AsyncIterable<Message> {
   if (!initialized()) { throw new Error('RTMP session not initialized.'); }
 
   const controller = new AbortController();
@@ -234,64 +232,50 @@ async function* handle_rtmp(connection: Duplex, auth: AuthConfiguration): AsyncI
     writer.write(Acknowledgement.from({ sequence_number: bytes, timestamp: 0 }));
   });
   using reader = new AsyncByteReader({ signal: controller.signal });
-  connection.pipe(new Writable({
-    write(data, _, cb) {
-      reader.feed(data);
-      counter.feed(data.byteLength);
-      cb();
-    },
-  }));
-  const disconnected = controller.abort.bind(controller);
-  connection.addListener('close', disconnected);
-  connection.addListener('error', disconnected);
+  connection.on('data', (data: Buffer) => {
+    reader.feed(data);
+    counter.feed(data.byteLength);
+  });
+  connection.on('close', () => { controller.abort(new Error('Connection closed')); });
+  connection.on('error', (error) => { controller.abort(error); });
 
   try {
     /*
     * RTMPのハンドシェイクを処理する
     */
-    if (!await handle_handshake(reader, connection)) { return; }
+    if (!await handshake(reader, connection)) { return; }
 
     /*
     * RTMPのメッセージを処理する
     */
-    let state = STATE.WAITING_CONNECT as (typeof STATE)[keyof typeof STATE];
+    let state: State = STATE.WAITING_CONNECT;
 
     // abort 時に強制的に切断状態に移行する
-    if (controller.signal.aborted) {
-      state = STATE.DISCONNECTED;
-      return;
-    }
+    if (controller.signal.aborted) { return; }
     controller.signal.addEventListener('abort', () => {
       state = STATE.DISCONNECTED;
     }, { once: true });
     // 配信セッションの定期的な生存確認
     const keepalive_controller = new AbortController();
-    (async () => {
+    const keepalive = async (): Promise<void> => {
       const signal = AbortSignal.any([controller.signal, keepalive_controller.signal]);
-      while (state !== STATE.DISCONNECTED) {
-        try {
-          await wait(KEEPALIVE_INTERVAL, undefined, { signal });
-        } catch {
-          break;
-        }
+      for await (const _ of setInterval(KEEPALIVE_INTERVAL, undefined, { signal })) {
         if (state !== STATE.PUBLISHED) { continue; }
-        const keepalive = await (async () => {
-          try {
-            // PUBLISHED なら session 内であり app と stream は必ず存在する
-            const session = load()!;
-            return await auth.keepalive(session.app!, session.stream!, session.query);
-          } catch {
-            // keepalive 自体が不測の事態で失敗した場合は可用性を優先して切断しない
-            logger.error('Auth keepalive Failed');
-            return AuthResult.OK;
-          }
-        })();
-        if (keepalive === AuthResult.DISCONNECT) {
+        // PUBLISHED なら session 内であり app と stream は必ず存在する
+        const session = load()!;
+        const result = await Promise.try(() => auth.keepalive(session.app!, session.stream!, session.query)).catch(() => {
+          // keepalive 自体が不測の事態で失敗した場合は可用性を優先して切断しない
+          logger.error('Auth keepalive Failed');
+          return AuthResult.OK;
+        });
+        if (result === AuthResult.DISCONNECT) {
           controller.abort(new Error('keepalive check failed'));
-          break;
+          return;
         }
       }
-    })();
+    };
+    // 切断などで signal が abort されると setInterval は例外で終わるが、それは正常な終了なので無視する
+    keepalive().catch(() => {});
 
     // メッセージループ
     try {
@@ -325,20 +309,29 @@ async function* handle_rtmp(connection: Duplex, auth: AuthConfiguration): AsyncI
   }
 }
 
-export default async (connection: Duplex, auth: AuthConfiguration, output?: Writable): Promise<void> => {
-  using writer = output != null ? new FLVWriter(output) : null;
-  for await (const message of handle_rtmp(connection, auth)) {
-    switch (message.message_type_id) {
-      case MessageType.Audio:
-      case MessageType.Video:
-        writer?.write(message);
-        break;
-      case MessageType.DataAMF0: {
-        const command = message.data;
-        const data = write_amf0(... command.length === 3 && command[0] === '@setDataFrame' && command[1] === 'onMetaData' ? [command[1], command[2]] : command);
-        writer?.write({ ... message, data });
-        break;
+export default async (connection: Duplex, auth: AuthConfiguration, open_output?: () => Writable, handshake: Handshake = handle_handshake): Promise<void> => {
+  // FLV の出力先は配信が始まってから開く (認証で切断されるような接続では開かない)
+  let writer: FLVWriter | null = null;
+  try {
+    for await (const message of handle_rtmp(connection, auth, handshake)) {
+      if (open_output == null) { continue; }
+      writer ??= new FLVWriter(open_output());
+
+      switch (message.message_type_id) {
+        case MessageType.Audio:
+        case MessageType.Video:
+          writer.write(message);
+          break;
+        case MessageType.DataAMF0: {
+          // 配信ソフトは @setDataFrame 付きで onMetaData を送ってくるので、FLV には @setDataFrame を除いて書き込む
+          const [name, ... values] = message.data;
+          const data = write_amf0(... (name === '@setDataFrame' ? values : message.data));
+          writer.write({ ... message, data });
+          break;
+        }
       }
     }
+  } finally {
+    writer?.close();
   }
 };

@@ -1,63 +1,37 @@
-class LinkedListNode<T,> {
-  prev: LinkedListNode<T> | null = null;
-  next: LinkedListNode<T> | null = null;
-  elem: T | null;
+type LinkedListNode<T,> = {
+  elem: T;
+  next: LinkedListNode<T> | null;
+};
 
-  public constructor(elem?: T) {
-    this.elem = elem ?? null;
-  }
-}
-
+// 先頭からの取り出しと末尾への追加が O(1) でできる FIFO キュー (単方向連結リスト)
 export default class Queue<T,> {
-  private begin: LinkedListNode<T>;
-  private end: LinkedListNode<T>;
-
-  public constructor() {
-    this.begin = new LinkedListNode<T>();
-    this.end = new LinkedListNode<T>();
-
-    // 先端と終端は自分自身を持つ
-    this.begin.prev = this.begin;
-    this.end.next = this.end;
-
-    // 連結
-    this.begin.next = this.end;
-    this.end.prev = this.begin;
-  }
+  private head: LinkedListNode<T> | null = null;
+  private tail: LinkedListNode<T> | null = null;
 
   public empty(): boolean {
-    return this.begin.next === this.end;
+    return this.head == null;
   }
 
   public push(elem: T): void {
-    const node = new LinkedListNode(elem);
-    const prev = this.end.prev!;
-
-    // node からみて前の更新
-    prev.next = node;
-    node.prev = prev;
-
-    // node から見て後の更新
-    this.end.prev = node;
-    node.next = this.end;
+    const node = { elem, next: null };
+    if (this.tail == null) {
+      this.head = node;
+    } else {
+      this.tail.next = node;
+    }
+    this.tail = node;
   }
 
   public peek(): T | null {
-    return this.begin.next?.elem ?? null;
+    return this.head?.elem ?? null;
   }
 
   public pop(): T | null {
-    const node = this.begin.next!;
-    if (node === this.end) { return null; }
-    const next = node.next!;
+    const node = this.head;
+    if (node == null) { return null; }
 
-    // 付け替え
-    this.begin.next = node.next;
-    next.prev = this.begin;
-
-    // クリーンアップ
-    node.next = node.prev = null;
-
+    this.head = node.next;
+    if (this.head == null) { this.tail = null; }
     return node.elem;
   }
 }

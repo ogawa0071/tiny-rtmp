@@ -1,6 +1,6 @@
 import crypto, { randomBytes } from 'node:crypto';
 
-import { AuthResult } from '../../01-tiny-rtmp-server/src/auth.mts';
+import { AuthResult, PublishLock } from '../../01-tiny-rtmp-server/src/auth.mts';
 import type { AuthResultWithDescription, AuthConfiguration } from '../../01-tiny-rtmp-server/src/auth.mts';
 
 const MAX_SESSIONS = 1000; // MEMO: アプリケーション変数
@@ -15,7 +15,7 @@ export type AdobeAuthInformation = {
 export default class AdobeAuth implements AuthConfiguration {
   private passwordFn: (user: string) => Promise<string | null> | (string | null);
   private sessions = new Map<string, AdobeAuthInformation>();
-  private lock = new Set<string>();
+  private lock = new PublishLock();
 
   constructor(passwordFn: (user: string) => Promise<string | null> | (string | null)) {
     this.passwordFn = passwordFn;
@@ -38,11 +38,8 @@ export default class AdobeAuth implements AuthConfiguration {
     return accepted ? [AuthResult.OK, null] : [AuthResult.DISCONNECT, 'authmod=adobe :?reason=authfailed'];
   }
 
-  public publish(app: string, stream: string): [authResult: (typeof AuthResult)[keyof typeof AuthResult], description: string | null] {
-    const key = `${app}/${stream}`;
-    if (this.lock.has(key)) { return [AuthResult.DISCONNECT, null]; }
-    this.lock.add(key);
-    return [AuthResult.OK, null];
+  public publish(app: string, stream: string): AuthResultWithDescription {
+    return [this.lock.acquire(app, stream) ? AuthResult.OK : AuthResult.DISCONNECT, null];
   }
 
   public keepalive(): typeof AuthResult.OK | typeof AuthResult.DISCONNECT {
@@ -50,8 +47,7 @@ export default class AdobeAuth implements AuthConfiguration {
   }
 
   public disconnect(app: string, stream: string): void {
-    const key = `${app}/${stream}`;
-    this.lock.delete(key);
+    this.lock.release(app, stream);
   }
 
   private query(user: string): string {
@@ -77,14 +73,15 @@ export default class AdobeAuth implements AuthConfiguration {
     // FFmpeg (8.0.1) 内臓の Adobe Auth は response の計算に opaque があったら challenge の代わりに opaque を使う
     // Wirecast の Adobe Auth は response の計算に challenge を使う
     // 仕様上は challenge を用いることになっているが、実装的に揺れたりしている
-    // FFmepg のコミットメッセージには opaque も challenge も実世界では同じ値 と言っている
+    // FFmpeg のコミットメッセージには opaque も challenge も実世界では同じ値 と言っている
     // なので opaque に challenge と同じ値を入れておけば、どっちが優先されようとも計算は同じ
-    return Object.entries(({
+    // (base64 の '+' や '/' を URL エンコードせずにそのまま送る必要があるので URLSearchParams は使わない)
+    return Object.entries({
       user,
       salt: salt.toString('base64'),
       challenge: challenge_base64,
       opaque: challenge_base64,
-    })).map(([k, v]) => `${k}=${v}`).join('&');
+    }).map(([k, v]) => `${k}=${v}`).join('&');
   }
 
   private async verify(user: string, response: string, challenge: string, opaque: string): Promise<boolean> {

@@ -36,7 +36,7 @@ describe('Regression Test', () => {
 
     const flv = new AsyncByteReader();
     run(() => {
-      handle_rtmp(connection, AuthConfiguration.noAuth(), new Writable({
+      handle_rtmp(connection, AuthConfiguration.noAuth(), () => new Writable({
         write(chunk, _, cb) {
           flv.feed(chunk);
           cb();

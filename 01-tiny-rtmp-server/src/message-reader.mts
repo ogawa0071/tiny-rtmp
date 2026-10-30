@@ -35,6 +35,25 @@ export type MessageReaderOption = Partial<{
   highWaterMark: number;
 }>;
 
+// 壊れたメッセージはログに残して null を返す (チャンクとしては正しく読めているので、後続のメッセージは読める)
+const decode_message = (information: MessageInformation, data: Buffer): Message | null => {
+  try {
+    const message = Message.from({
+      message_type_id: information.message_type_id,
+      message_stream_id: information.message_stream_id,
+      timestamp: information.timestamp,
+      data,
+    });
+    if (message == null) {
+      logger.error('Message Decoding Failed, ignore it', information);
+    }
+    return message;
+  } catch (e) {
+    logger.error('Message Decoding Failed, ignore it', { ... information, error: e });
+    return null;
+  }
+};
+
 export default async function* read_message(reader: AsyncByteReader, option?: MessageReaderOption): AsyncIterable<Message> {
   const highWaterMark = option?.highWaterMark ?? Number.POSITIVE_INFINITY;
   let buffered = 0;
@@ -44,12 +63,13 @@ export default async function* read_message(reader: AsyncByteReader, option?: Me
   const chunks = new Map<number, ByteBuilder>();
 
   while (true) {
+    // Chunk Basic Header
     const basic = await reader.readU8();
     const fmt = (basic & 0b11000000) >> 6;
-    let cs_id = (basic & 0b00111111) >> 0;
+    let cs_id = basic & 0b00111111;
     switch (cs_id) {
-      case 0: cs_id = 64 + await reader.readU8(); break;
-      case 1: cs_id = 64 + await reader.readU16LE(); break;
+      case 0: cs_id = 64 + await reader.readU8(); break; // 2 byte 形式
+      case 1: cs_id = 64 + await reader.readU16LE(); break; // 3 byte 形式
     }
     if (fmt !== 3 || !chunks.has(cs_id)) {
       buffered -= chunks.get(cs_id)?.byteLength() ?? 0;
@@ -57,6 +77,7 @@ export default async function* read_message(reader: AsyncByteReader, option?: Me
     }
     const chunk_builder = chunks.get(cs_id)!;
 
+    // Chunk Message Header (fmt によって省略されたフィールドは、同じ cs_id の前回の値を引き継ぐ)
     let information = informations.get(cs_id);
     let timestamp = fmt !== 3 ? await reader.readU24BE() : information?.timestamp;
     const message_length = fmt === 0 || fmt === 1 ? await reader.readU24BE() : information?.message_length;
@@ -66,7 +87,7 @@ export default async function* read_message(reader: AsyncByteReader, option?: Me
     const is_extended_timestamp = fmt !== 3 ? timestamp === 0xFFFFFF : information?.is_extended_timestamp;
     // チャンクに必要な情報がない時は何もできないしパースもできず、そのあとが保証できないので、例外で通知する
     if (timestamp == null || message_length == null || message_type_id == null || message_stream_id == null || is_extended_timestamp == null) {
-      throw new InsufficientChunkError('Insufficient Chunk Information in RTMP Message Recieving');
+      throw new InsufficientChunkError('Insufficient Chunk Information in RTMP Message Receiving');
     }
     const extended_timestamp = is_extended_timestamp ? await reader.readU32BE() : null;
 
@@ -74,12 +95,14 @@ export default async function* read_message(reader: AsyncByteReader, option?: Me
     if (fmt === 1 || fmt === 2) {
       if (information?.timestamp == null) {
         // チャンクに必要な情報がない時は何もできないしパースもできず、そのあとが保証できないので、例外で通知する
-        throw new InsufficientChunkError('Insufficient Chunk Information in RTMP Message Recieving');
+        throw new InsufficientChunkError('Insufficient Chunk Information in RTMP Message Receiving');
       }
-      timestamp_delta = extended_timestamp ?? timestamp; // // if fmt === 1 or fmt === 2, timestamp is delta
+      timestamp_delta = extended_timestamp ?? timestamp; // fmt === 1 or fmt === 2 の timestamp は差分
       timestamp = information.timestamp + timestamp_delta;
     } else if (fmt === 3) {
-      timestamp_delta = extended_timestamp ?? information?.timestamp_delta ?? timestamp; // fmt === 3, timestamp is previous
+      // fmt === 3 は前回の差分を引き継ぐ (直前が fmt === 0 なら、その timestamp を差分とみなす)
+      timestamp_delta = extended_timestamp ?? information?.timestamp_delta ?? timestamp;
+      // 同じメッセージの続きのチャンクなら timestamp は変わらない
       timestamp += (chunk_builder.byteLength() > 0) ? 0 : timestamp_delta;
     } else {
       timestamp = extended_timestamp ?? timestamp;
@@ -100,39 +123,23 @@ export default async function* read_message(reader: AsyncByteReader, option?: Me
     if (length === message_length) {
       const data = chunk_builder.build();
 
-      let message = null;
-      try {
-        message = Message.from({
-          message_type_id: information.message_type_id,
-          message_stream_id: information.message_stream_id,
-          timestamp: information.timestamp,
-          data,
-        });
-      } catch (e) {
-        const message = e instanceof Error ? e.message : String(e);
-        const record = e instanceof Error ? { stack: e.stack, ... information } : information;
-        logger.error(`Message Decoding error: ${message}`, record);
-      }
-
+      const message = decode_message(information, data);
       if (message != null) {
         switch (message.message_type_id) {
           case MessageType.SetChunkSize:
             chunk_maximum_size = message.data.chunk_size;
             break;
           case MessageType.Abort: {
-            const cs_id = message.data.chunk_stream_id;
-            buffered -= chunks.get(cs_id)?.byteLength() ?? 0;
-            chunks.delete(cs_id);
-            informations.delete(cs_id);
+            const aborted_cs_id = message.data.chunk_stream_id;
+            buffered -= chunks.get(aborted_cs_id)?.byteLength() ?? 0;
+            chunks.delete(aborted_cs_id);
+            informations.delete(aborted_cs_id);
             break;
           }
-          default: {
+          default:
             yield message;
             break;
-          }
         }
-      } else {
-        logger.error('Message Decoding Failed, ignore it', information);
       }
 
       chunks.delete(cs_id);

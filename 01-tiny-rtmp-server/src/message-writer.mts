@@ -1,6 +1,5 @@
 import ByteBuilder from './byte-builder.mts';
-import { Message } from './message.mts';
-import { MessageType } from './message.mts';
+import { Message, MessageType } from './message.mts';
 import Queue from './queue.mts';
 
 export type MessageWithTrack = Message & {
@@ -18,7 +17,7 @@ export const MessageWithTrack = {
 type SendingMessage = Message & {
   chunk_stream_id: number;
   binary: Buffer;
-  offset: number;
+  offset: number; // binary のうち送信済みのバイト数
 };
 
 export type MessageWriterOption = Partial<{
@@ -26,251 +25,212 @@ export type MessageWriterOption = Partial<{
   highWaterMark: number;
 }>;
 
+const is_system_message = ({ message_type_id }: Message): boolean => {
+  // Protocol Control Message と User Control Message は cs_id は必ず 2 を使う
+  switch (message_type_id) {
+    // Protocol Control Message
+    case MessageType.SetChunkSize:
+    case MessageType.Abort:
+    case MessageType.Acknowledgement:
+    case MessageType.WindowAcknowledgementSize:
+    case MessageType.SetPeerBandwidth:
+    // User Control Message
+    case MessageType.UserControl:
+      return true;
+    default:
+      return false;
+  }
+};
+
+const is_input_order_sensitive = (message: Message): boolean => {
+  // 映像・音声データの伝送を確立するためのメッセージは順序を維持するようにする
+  if (is_system_message(message)) { return true; }
+  switch (message.message_type_id) {
+    case MessageType.CommandAMF0:
+    case MessageType.CommandAMF3:
+      return true;
+    default:
+      return false;
+  }
+};
+
+const write_basic_header = (builder: ByteBuilder, fmt: number, cs_id: number): void => {
+  if (cs_id >= 320) {
+    // 3 byte 形式 (cs_id: 320 ~ 65599)
+    builder.writeU8((fmt << 6) | 1);
+    builder.writeU16LE(cs_id - 64);
+  } else if (cs_id >= 64) {
+    // 2 byte 形式 (cs_id: 64 ~ 319)
+    builder.writeU8((fmt << 6) | 0);
+    builder.writeU8(cs_id - 64);
+  } else {
+    // 1 byte 形式 (cs_id: 2 ~ 63)
+    builder.writeU8((fmt << 6) | cs_id);
+  }
+};
+
 export default class MessageWriter {
   private highWaterMark: number;
   private chunk_maximum_size = 128;
   private next_cs_id = 3;
-  private cs_id_map = new Map<number, number>();
-  private cs_id_timestamp_information = new Map<number, number>();
+  private cs_id_map = new Map<string, number>();
+  private previous_timestamps = new Map<number, number>(); // cs_id ごとに、最後に送り切ったメッセージの timestamp
 
-  private sending_controller: AbortController = new AbortController();
-  private sending_signal: AbortSignal;
-  private sending_promise: Promise<void>;
-  private sending_notify: () => void;
+  private controller = new AbortController();
+  private signal: AbortSignal;
+  private wakeup = Promise.withResolvers<void>(); // 送信ループを待機から起こすための通知
   private sending_ordering_queue = new Queue<SendingMessage>();
   private sending_cs_id_queues = new Map<number, Queue<SendingMessage>>();
-  private sending_bytes: number = 0;
+  private sending_bytes = 0;
 
-  private ended_boolean: boolean;
-  private ended_promise: Promise<void>;
-  private ended_notify: () => void;
+  private ended_boolean = false;
+  private ended_resolvers = Promise.withResolvers<void>();
 
   public constructor(option?: MessageWriterOption) {
     this.highWaterMark = option?.highWaterMark ?? Number.POSITIVE_INFINITY;
-    this.sending_signal = AbortSignal.any([this.sending_controller.signal, option?.signal ?? AbortSignal.any([])]);
-    {
-      const { promise, resolve } = Promise.withResolvers<void>();
-      this.sending_promise = promise;
-      this.sending_notify = resolve;
+    this.signal = AbortSignal.any([this.controller.signal, option?.signal].filter((signal) => signal != null));
+    // 既に中断済みの signal が渡された場合は abort イベントが来ないので、ここで終了状態にする
+    if (this.signal.aborted) {
+      this.terminate();
+    } else {
+      this.signal.addEventListener('abort', () => { this.terminate(); }, { once: true });
     }
-    {
-      this.ended_boolean = false;
-      const { promise, resolve } = Promise.withResolvers<void>();
-      this.ended_promise = promise;
-      this.ended_notify = resolve;
-    }
-    this.sending_signal.addEventListener('abort', () => {
-      this.ended_boolean = true;
-      this.ended_notify();
-    }, { once: true });
   }
 
-  private static cs_id_hash(message: MessageWithTrack): number {
-    const { message_stream_id, message_type_id } = message;
-    if (MessageWriter.use_system_cs_id(message)) {
-      // システムのメッセージの場合は track による cs_id の多重化はしない
-      return message_stream_id * (2 ** 16) + message_type_id * (2 ** 8) + 0;
-    }
-    return message_stream_id * (2 ** 16) + message_type_id * (2 ** 8) + (message.track ?? 0);
+  private terminate(): void {
+    this.ended_boolean = true;
+    this.ended_resolvers.resolve();
+    this.notify();
   }
-  private static use_system_cs_id({ message_type_id }: MessageWithTrack): boolean {
-    // Protocol Control Message と User Control Message は cs_id は必ず 2 を使う
-    switch (message_type_id) {
-      // Protocol Control Message
-      case MessageType.SetChunkSize:
-      case MessageType.Abort:
-      case MessageType.Acknowledgement:
-      case MessageType.WindowAcknowledgementSize:
-      case MessageType.SetPeerBandwidth:
-      // User Control Message
-      case MessageType.UserControl:
-        return true;
-    }
-    return false;
+
+  private notify(): void {
+    this.wakeup.resolve();
   }
-  private static is_input_order_sensitive({ message_type_id }: MessageWithTrack): boolean {
-    // 映像・音声データの伝送を確立するためのメッセージは順序を維持するようにする
-    switch (message_type_id) {
-      // Protocol Control Message
-      case MessageType.SetChunkSize:
-      case MessageType.Abort:
-      case MessageType.Acknowledgement:
-      case MessageType.WindowAcknowledgementSize:
-      case MessageType.SetPeerBandwidth:
-      // User Control Message
-      case MessageType.UserControl:
-      // Command AMF
-      case MessageType.CommandAMF0:
-      case MessageType.CommandAMF3:
-        return true;
-    }
-    return false;
+
+  private async wait(): Promise<void> {
+    await this.wakeup.promise;
+    this.wakeup = Promise.withResolvers<void>();
   }
 
   private get_cs_id(message: MessageWithTrack): number {
-    const hash = MessageWriter.cs_id_hash(message);
-    if (this.cs_id_map.has(hash)) {
-      return this.cs_id_map.get(hash)!;
-    }
-    const cs_id = MessageWriter.use_system_cs_id(message) ? 2 : this.next_cs_id++;
-    this.cs_id_map.set(hash, cs_id);
+    if (is_system_message(message)) { return 2; }
+
+    // システムのメッセージ以外は Message Stream ID, Message Type ID, track ごとに cs_id を割り当てる
+    const key = `${message.message_stream_id}/${message.message_type_id}/${message.track ?? 0}`;
+    const cs_id = this.cs_id_map.get(key) ?? this.next_cs_id++;
+    this.cs_id_map.set(key, cs_id);
     return cs_id;
   }
 
-  private get_timestamp(message: SendingMessage): number | undefined {
-    return this.cs_id_timestamp_information.get(message.chunk_stream_id);
+  private build_chunk(message: SendingMessage, length: number): Buffer {
+    const previous = this.previous_timestamps.get(message.chunk_stream_id);
+    // 同じ cs_id で直前に送ったメッセージからの差分で表せるなら差分 (fmt = 1)、表せないなら絶対値 (fmt = 0) で送る
+    const is_absolute = previous == null || message.timestamp < previous;
+    const timestamp = is_absolute ? message.timestamp : message.timestamp - previous;
+    const is_extended_timestamp = timestamp >= 0xFFFFFF;
+    // 2 つ目以降のチャンクは Message Header を省略する (fmt = 3)
+    const fmt = message.offset > 0 ? 3 : is_absolute ? 0 : 1;
+
+    const builder = new ByteBuilder();
+    write_basic_header(builder, fmt, message.chunk_stream_id);
+    if (fmt === 0 || fmt === 1) {
+      builder.writeU24BE(is_extended_timestamp ? 0xFFFFFF : timestamp); // timestamp (fmt = 1 では timestamp delta)
+      builder.writeU24BE(message.binary.byteLength); // message length
+      builder.writeU8(message.message_type_id); // message type id
+    }
+    if (fmt === 0) {
+      builder.writeU32LE(message.message_stream_id); // message stream id (Little Endian)
+    }
+    if (is_extended_timestamp) {
+      builder.writeU32BE(timestamp % (2 ** 32)); // extended timestamp
+    }
+    builder.write(message.binary.subarray(message.offset, message.offset + length));
+    return builder.build();
   }
-  private static use_absolute_timestamp(message: SendingMessage, previous?: number): boolean {
-    if (previous == null) { return true; }
-    if (message.timestamp < previous) { return true; }
-    return false;
-  }
-  private static calculate_timestamp(message: SendingMessage, previous?: number): number {
-    const diff = (message.timestamp - (previous ?? 0));
-    return diff >= 0 ? diff : message.timestamp;
-  }
-  private set_timestamp_information(message: SendingMessage): void {
-    this.cs_id_timestamp_information.set(message.chunk_stream_id, message.timestamp);
-  }
-  private delete_timestamp_information(cs_id: number): void {
-    this.cs_id_timestamp_information.delete(cs_id);
+
+  private complete(message: SendingMessage): void {
+    if (message.message_type_id === MessageType.SetChunkSize) {
+      this.chunk_maximum_size = message.data.chunk_size;
+    }
+
+    if (message.message_type_id === MessageType.Abort) {
+      this.previous_timestamps.delete(message.data.chunk_stream_id);
+    } else {
+      this.previous_timestamps.set(message.chunk_stream_id, message.timestamp);
+    }
   }
 
   public async *retrieve(): AsyncIterable<Buffer> {
-    while (true) {
-      if (this.sending_signal.aborted) { return; }
+    while (!this.signal.aborted) {
+      if (this.sending_cs_id_queues.size === 0) {
+        // 終了要求が来ていて、送るものが全てなくなったら終了
+        if (this.ended_boolean) { break; }
+        // 送るものがないので、書き込み (または終了要求) が来るまで待つ
+        await this.wait();
+        continue;
+      }
 
-      await this.sending_promise;
-      const { promise, resolve } = Promise.withResolvers<void>();
-      this.sending_promise = promise;
-      this.sending_notify = resolve;
-
-      let all_empty = true;
-      const empty_set = new Set<number>();
-      for (const [cs_id, queue] of this.sending_cs_id_queues.entries()) {
-        if (queue.empty()) { empty_set.add(cs_id); continue; }
-        all_empty = false;
-
+      // 各 Chunk Stream から 1 チャンクずつ送ることで、複数のメッセージを多重化して送る
+      for (const [cs_id, queue] of this.sending_cs_id_queues) {
         const message = queue.peek()!;
-        const previous = this.get_timestamp(message);
-        const timestamp = MessageWriter.calculate_timestamp(message, previous);
-        const is_absolute = MessageWriter.use_absolute_timestamp(message, previous);
-        const is_extended_timestamp = timestamp >= 0xFFFFFF;
-
-        const builder = new ByteBuilder();
-        const next_offset = Math.min(message.binary.byteLength, message.offset + this.chunk_maximum_size);
-        const is_complete = next_offset >= message.binary.byteLength;
+        const length = Math.min(message.binary.byteLength - message.offset, this.chunk_maximum_size);
+        const is_last_chunk = message.offset + length >= message.binary.byteLength;
         // 投入順に完成するように、投入順とは違う完成は防ぐ
-        if (is_complete && MessageWriter.is_input_order_sensitive(message) && this.sending_ordering_queue.peek() !== message) {
+        if (is_last_chunk && is_input_order_sensitive(message) && this.sending_ordering_queue.peek() !== message) {
           continue;
         }
-        const chunk = message.binary.subarray(message.offset, next_offset);
 
-        const fmt = message.offset !== 0 ? 3 : !is_absolute ? 1 : 0;
-        if (message.chunk_stream_id >= 320) {
-          builder.writeU8((fmt << 6) | 1);
-          builder.writeU16LE(message.chunk_stream_id - 64);
-        } else if (message.chunk_stream_id >= 64) {
-          builder.writeU8((fmt << 6) | 0);
-          builder.writeU8(message.chunk_stream_id - 64);
-        } else {
-          builder.writeU8((fmt << 6) | message.chunk_stream_id);
+        yield this.build_chunk(message, length);
+        this.sending_bytes -= length;
+        message.offset += length;
+
+        if (!is_last_chunk) { continue; }
+        queue.pop();
+        if (is_input_order_sensitive(message)) {
+          this.sending_ordering_queue.pop();
         }
-
-        if (fmt === 3 || fmt === 1) {
-          if (fmt === 1) {
-            builder.writeU24BE(is_extended_timestamp ? 0xFFFFFF : timestamp);
-            builder.writeU24BE(message.binary.byteLength);
-            builder.writeU8(message.message_type_id);
-          }
-          if (is_extended_timestamp) {
-            builder.writeU32BE(timestamp % (2 ** 32));
-          }
-          builder.write(chunk);
-        } else {
-          builder.writeU24BE(is_extended_timestamp ? 0xFFFFFF : timestamp);
-          builder.writeU24BE(message.binary.byteLength);
-          builder.writeU8(message.message_type_id);
-          builder.writeU32LE(message.message_stream_id);
-          if (is_extended_timestamp) {
-            builder.writeU32BE(timestamp % (2 ** 32));
-          }
-          builder.write(chunk);
+        this.complete(message);
+        // yield している間に同じ cs_id へ書き込まれていることもあるので、空かどうかは今確認する
+        if (queue.empty()) {
+          this.sending_cs_id_queues.delete(cs_id);
         }
-
-        yield builder.build();
-        this.sending_bytes -= next_offset - message.offset;
-
-        if (next_offset < (message.binary.byteLength)) {
-          message.offset = next_offset;
-        } else {
-          if (MessageWriter.is_input_order_sensitive(message)) {
-            this.sending_ordering_queue.pop();
-          }
-          queue.pop();
-
-          if (message.message_type_id === MessageType.SetChunkSize) {
-            this.chunk_maximum_size = message.data.chunk_size;
-          }
-
-          if (message.message_type_id === MessageType.Abort) {
-            this.delete_timestamp_information(message.data.chunk_stream_id);
-          } else {
-            this.set_timestamp_information(message);
-          }
-        }
-      }
-
-      // 消しこみ
-      for (const cs_id of empty_set) {
-        this.sending_cs_id_queues.delete(cs_id);
-      }
-
-      // 終了要求が来ていて、追加がない状態で全部なくなったら終了
-      if (all_empty && this.ended_boolean) {
-        this.ended_notify();
-        return;
-      }
-
-      // 残りがあるなら継続する
-      if (!all_empty) {
-        this.sending_notify();
       }
     }
+
+    this.ended_resolvers.resolve();
   }
 
   public write(message: MessageWithTrack): void {
     if (this.highWaterMark < this.sending_bytes) {
       this.abort(new Error('Buffer overflow: highWaterMark exceeded'));
     }
-    if (this.sending_signal.aborted) {
-      throw this.sending_signal.reason;
+    if (this.signal.aborted) {
+      throw this.signal.reason;
     } else if (this.ended_boolean) {
       throw new Error('Cannot write to MessageWriter after end');
     }
 
     const cs_id = this.get_cs_id(message);
-    if (!this.sending_cs_id_queues.has(cs_id)) {
-      this.sending_cs_id_queues.set(cs_id, new Queue<SendingMessage>());
-    }
-    const queue = this.sending_cs_id_queues.get(cs_id)!;
     const sending = {
       ... message,
       binary: Message.into(message).data,
       chunk_stream_id: cs_id,
       offset: 0,
     } satisfies SendingMessage;
+
+    const queue = this.sending_cs_id_queues.get(cs_id) ?? new Queue<SendingMessage>();
     queue.push(sending);
-    if (MessageWriter.is_input_order_sensitive(sending)) {
+    this.sending_cs_id_queues.set(cs_id, queue);
+    if (is_input_order_sensitive(sending)) {
       this.sending_ordering_queue.push(sending);
     }
     this.sending_bytes += sending.binary.byteLength;
-    this.sending_notify();
+    this.notify();
   }
 
   public end(): void {
     this.ended_boolean = true;
-    this.sending_notify();
+    this.notify();
   }
 
   public [Symbol.dispose](): void {
@@ -278,10 +238,10 @@ export default class MessageWriter {
   }
 
   public ended(): Promise<void> {
-    return this.ended_promise;
+    return this.ended_resolvers.promise;
   }
 
   public abort(reason?: unknown): void {
-    this.sending_controller.abort(reason);
+    this.controller.abort(reason);
   }
 }

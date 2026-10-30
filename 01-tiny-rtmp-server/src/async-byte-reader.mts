@@ -3,63 +3,80 @@ export type AsyncByteReaderOption = Partial<{
   highWaterMark: number;
 }>;
 
+type PendingRead = PromiseWithResolvers<Buffer> & {
+  byteLength: number;
+};
+
 export default class AsyncByteReader {
   private buffers: Buffer[] = [];
-  private offset = 0;
-  private reserved = 0;
-  private totals = 0;
+  private offset = 0; // buffers[0] のうち読み取り済みのバイト数
+  private totals = 0; // buffers に溜まっている未読のバイト数
+  private reserved = 0; // 待機中の read で要求されているバイト数の合計
   private eof = false;
-  private promises: [byteLength: number, resolve: (result: Buffer) => void, reject: (error: Error) => void][] = [];
+  private pendings: PendingRead[] = [];
   private controller = new AbortController();
   private signal: AbortSignal;
   private highWaterMark: number;
 
   public constructor(option?: AsyncByteReaderOption) {
-    this.signal = AbortSignal.any([this.controller.signal, option?.signal ?? AbortSignal.any([])]);
-    this.signal.addEventListener('abort', this.abort.bind(this), { once: true });
+    this.signal = AbortSignal.any([this.controller.signal, option?.signal].filter((signal) => signal != null));
     this.highWaterMark = option?.highWaterMark ?? Number.POSITIVE_INFINITY;
+    // 既に中断済みの signal が渡された場合は abort イベントが来ないので、ここで EOF にする
+    if (this.signal.aborted) {
+      this.reachEOF();
+    } else {
+      this.signal.addEventListener('abort', () => { this.reachEOF(); }, { once: true });
+    }
+  }
+
+  // buffers の先頭から length バイトを切り出す (呼び出し側で totals >= length を保証する)
+  private take(length: number): Buffer {
+    const chunks: Buffer[] = [];
+    let remains = length;
+    while (remains > 0) {
+      const buffer = this.buffers[0];
+      const available = buffer.byteLength - this.offset;
+
+      if (available > remains) {
+        chunks.push(buffer.subarray(this.offset, this.offset + remains));
+        this.offset += remains;
+        break;
+      }
+
+      chunks.push(buffer.subarray(this.offset));
+      this.buffers.shift();
+      this.offset = 0;
+      remains -= available;
+    }
+
+    this.totals -= length;
+    this.reserved -= length;
+    return chunks.length === 1 ? chunks[0] : Buffer.concat(chunks);
   }
 
   private fulfill(): void {
-    while (this.promises.length > 0) {
-      const [length, resolve] = this.promises[0];
-      if (this.totals < length) { break; }
-
-      const drained = [];
-      let remains = length;
-      while (this.buffers.length > 0) {
-        const buffer = this.buffers[0];
-        const capacity = buffer.byteLength - this.offset;
-
-        if (capacity > remains) {
-          drained.push(buffer.subarray(this.offset, this.offset + remains));
-          this.offset += remains;
-          break;
-        }
-
-        drained.push(buffer.subarray(this.offset));
-        this.buffers.shift();
-        this.offset = 0;
-        remains -= capacity;
-      }
-
-      this.totals -= length;
-      this.reserved -= length;
-      resolve(drained.length === 1 ? drained[0] : Buffer.concat(drained));
-      this.promises.shift();
+    // 要求された順に、必要なバイト数が溜まっている read を解決する
+    while (this.pendings.length > 0 && this.pendings[0].byteLength <= this.totals) {
+      const { byteLength, resolve } = this.pendings.shift()!;
+      resolve(this.take(byteLength));
     }
 
+    // EOF ならこれ以上データは来ないので、満たせなかった read は全て失敗させる
     if (!this.eof) { return; }
-    while (this.promises.length > 0) {
-      const [,,reject] = this.promises[0];
-      reject(this.signal.reason ?? new Error('EOF Detected'));
-      this.promises.shift();
+    for (const { reject } of this.pendings.splice(0)) {
+      reject(this.signal.reason);
     }
+  }
+
+  private reachEOF(): void {
+    this.eof = true;
+    this.fulfill();
   }
 
   public feed(buffer: Buffer): void {
     if (this.eof) { return; }
-    if (this.highWaterMark < Math.max(0, this.totals - this.reserved)) {
+    // 誰にも要求されていないデータが highWaterMark を超えて溜まっていたら、溢れたとして終了する
+    if (this.highWaterMark < this.totals - this.reserved) {
       this.feedEOF(new Error('Buffer overflow: highWaterMark exceeded'));
       return;
     }
@@ -68,27 +85,24 @@ export default class AsyncByteReader {
     this.fulfill();
   }
 
-  private abort(): void {
-    this.eof = true;
-    this.fulfill();
-  }
-  public feedEOF(reason?: any): void {
+  public feedEOF(reason: unknown = new Error('EOF Detected')): void {
     this.controller.abort(reason);
   }
+
   public [Symbol.dispose](): void {
     this.feedEOF();
   }
 
   public read(size: number): Promise<Buffer> {
     if (this.eof && (this.reserved + Math.max(1, size)) > this.totals) {
-      return Promise.reject(this.signal.reason ?? new Error('EOF Detected'));
+      return Promise.reject(this.signal.reason);
     }
 
-    const { promise, resolve, reject } = Promise.withResolvers<Buffer>();
+    const pending = { byteLength: size, ... Promise.withResolvers<Buffer>() };
     this.reserved += size;
-    this.promises.push([size, resolve, reject]);
+    this.pendings.push(pending);
     this.fulfill();
-    return promise;
+    return pending.promise;
   }
 
   public async readUIntBE(length: number): Promise<number> {

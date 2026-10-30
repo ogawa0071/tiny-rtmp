@@ -61,26 +61,14 @@ const is_valid_user_control_event_type = (event_type: number): event_type is All
 };
 
 export type UserControl = {
-  event_type: typeof UserControlType.StreamBegin;
-  message_stream_id: number;
-} | {
-  event_type: typeof UserControlType.StreamEOF;
-  message_stream_id: number;
-} | {
-  event_type: typeof UserControlType.StreamDry;
+  event_type: typeof UserControlType.StreamBegin | typeof UserControlType.StreamEOF | typeof UserControlType.StreamDry | typeof UserControlType.StreamIsRecorded;
   message_stream_id: number;
 } | {
   event_type: typeof UserControlType.SetBufferLength;
   message_stream_id: number;
   buffer_length: number;
 } | {
-  event_type: typeof UserControlType.StreamIsRecorded;
-  message_stream_id: number;
-} | {
-  event_type: typeof UserControlType.PingRequest;
-  event_timestamp: number;
-} | {
-  event_type: typeof UserControlType.PingResponse;
+  event_type: typeof UserControlType.PingRequest | typeof UserControlType.PingResponse;
   event_timestamp: number;
 };
 const UserControl = {
@@ -91,17 +79,13 @@ const UserControl = {
 
     switch (event_type) {
       case UserControlType.StreamBegin:
-        return { event_type, message_stream_id: reader.readU32BE() };
       case UserControlType.StreamEOF:
-        return { event_type, message_stream_id: reader.readU32BE() };
       case UserControlType.StreamDry:
+      case UserControlType.StreamIsRecorded:
         return { event_type, message_stream_id: reader.readU32BE() };
       case UserControlType.SetBufferLength:
         return { event_type, message_stream_id: reader.readU32BE(), buffer_length: reader.readU32BE() };
-      case UserControlType.StreamIsRecorded:
-        return { event_type, message_stream_id: reader.readU32BE() };
       case UserControlType.PingRequest:
-        return { event_type, event_timestamp: reader.readU32BE() };
       case UserControlType.PingResponse:
         return { event_type, event_timestamp: reader.readU32BE() };
       default:
@@ -113,24 +97,16 @@ const UserControl = {
     builder.writeU16BE(control.event_type);
     switch (control.event_type) {
       case UserControlType.StreamBegin:
-        builder.writeU32BE(control.message_stream_id);
-        break;
       case UserControlType.StreamEOF:
-        builder.writeU32BE(control.message_stream_id);
-        break;
       case UserControlType.StreamDry:
+      case UserControlType.StreamIsRecorded:
         builder.writeU32BE(control.message_stream_id);
         break;
       case UserControlType.SetBufferLength:
         builder.writeU32BE(control.message_stream_id);
         builder.writeU32BE(control.buffer_length);
         break;
-      case UserControlType.StreamIsRecorded:
-        builder.writeU32BE(control.message_stream_id);
-        break;
       case UserControlType.PingRequest:
-        builder.writeU32BE(control.event_timestamp);
-        break;
       case UserControlType.PingResponse:
         builder.writeU32BE(control.event_timestamp);
         break;
@@ -171,11 +147,8 @@ export type Message = Omit<SerializedMessage, 'message_type_id' | 'data'> & ({
     limit_type: number;
   };
 } | {
-  message_type_id: typeof MessageType.CommandAMF0;
-  data: ReturnType<typeof read_amf0>;
-} | {
-  message_type_id: typeof MessageType.DataAMF0;
-  data: ReturnType<typeof read_amf0>;
+  message_type_id: AMF0MessageType;
+  data: AMF0Value[];
 } | {
   message_type_id: Exclude<AllMessageType, ControlMessageType | AMF0MessageType>;
   data: Buffer;
@@ -191,7 +164,7 @@ export const Message = {
           ... message,
           message_type_id,
           data: {
-            chunk_size: Math.max(1, reader.readU32BE() % 2 ** 31),
+            chunk_size: Math.max(1, reader.readU32BE() % 2 ** 31), // 先頭 1bit は 0 なので 31bit で扱う
           },
         };
       case MessageType.Abort:
@@ -237,11 +210,6 @@ export const Message = {
           },
         };
       case MessageType.DataAMF0:
-        return {
-          ... message,
-          message_type_id,
-          data: read_amf0(reader.read()),
-        };
       case MessageType.CommandAMF0:
         return {
           ... message,
@@ -279,8 +247,6 @@ export const Message = {
         builder.writeU8(data.limit_type);
         break;
       case MessageType.DataAMF0:
-        builder.write(write_amf0(... data));
-        break;
       case MessageType.CommandAMF0:
         builder.write(write_amf0(... data));
         break;
@@ -356,95 +322,47 @@ export const SetPeerBandwidth = {
     };
   },
 };
+// User Control Message は Message Stream ID 0 で送り、対象の Message Stream ID はデータ内に入れる
+const user_control = (data: UserControl, timestamp: number): Message => {
+  return {
+    message_stream_id: 0,
+    message_type_id: MessageType.UserControl,
+    timestamp,
+    data,
+  };
+};
 export const StreamBegin = {
   from({ message_stream_id, timestamp }: { message_stream_id: number; timestamp: number; }): Message {
-    return {
-      message_stream_id: 0,
-      message_type_id: MessageType.UserControl,
-      timestamp,
-      data: {
-        event_type: UserControlType.StreamBegin,
-        message_stream_id,
-      },
-    };
+    return user_control({ event_type: UserControlType.StreamBegin, message_stream_id }, timestamp);
   },
 };
 export const StreamEOF = {
   from({ message_stream_id, timestamp }: { message_stream_id: number; timestamp: number; }): Message {
-    return {
-      message_stream_id: 0,
-      message_type_id: MessageType.UserControl,
-      timestamp,
-      data: {
-        event_type: UserControlType.StreamEOF,
-        message_stream_id,
-      },
-    };
+    return user_control({ event_type: UserControlType.StreamEOF, message_stream_id }, timestamp);
   },
 };
 export const StreamDry = {
   from({ message_stream_id, timestamp }: { message_stream_id: number; timestamp: number; }): Message {
-    return {
-      message_stream_id: 0,
-      message_type_id: MessageType.UserControl,
-      timestamp,
-      data: {
-        event_type: UserControlType.StreamDry,
-        message_stream_id,
-      },
-    };
+    return user_control({ event_type: UserControlType.StreamDry, message_stream_id }, timestamp);
   },
 };
 export const SetBufferLength = {
   from({ message_stream_id, buffer_length, timestamp }: { message_stream_id: number; buffer_length: number; timestamp: number; }): Message {
-    return {
-      message_stream_id: 0,
-      message_type_id: MessageType.UserControl,
-      timestamp,
-      data: {
-        event_type: UserControlType.SetBufferLength,
-        message_stream_id,
-        buffer_length,
-      },
-    };
+    return user_control({ event_type: UserControlType.SetBufferLength, message_stream_id, buffer_length }, timestamp);
   },
 };
 export const StreamIsRecorded = {
   from({ message_stream_id, timestamp }: { message_stream_id: number; timestamp: number; }): Message {
-    return {
-      message_stream_id: 0,
-      message_type_id: MessageType.UserControl,
-      timestamp,
-      data: {
-        event_type: UserControlType.StreamIsRecorded,
-        message_stream_id,
-      },
-    };
+    return user_control({ event_type: UserControlType.StreamIsRecorded, message_stream_id }, timestamp);
   },
 };
 export const PingRequest = {
   from({ event_timestamp, timestamp }: { event_timestamp: number; timestamp: number; }): Message {
-    return {
-      message_stream_id: 0,
-      message_type_id: MessageType.UserControl,
-      timestamp,
-      data: {
-        event_type: UserControlType.PingRequest,
-        event_timestamp,
-      },
-    };
+    return user_control({ event_type: UserControlType.PingRequest, event_timestamp }, timestamp);
   },
 };
 export const PingResponse = {
   from({ event_timestamp, timestamp }: { event_timestamp: number; timestamp: number; }): Message {
-    return {
-      message_stream_id: 0,
-      message_type_id: MessageType.UserControl,
-      timestamp,
-      data: {
-        event_type: UserControlType.PingResponse,
-        event_timestamp,
-      },
-    };
+    return user_control({ event_type: UserControlType.PingResponse, event_timestamp }, timestamp);
   },
 };
