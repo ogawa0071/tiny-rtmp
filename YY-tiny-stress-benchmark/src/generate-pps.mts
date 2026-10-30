@@ -1,10 +1,5 @@
 import EBSPBitBuilder from './ebsp-bit-builder.mts';
 
-const rbsp_trailing_bit = (writer: EBSPBitBuilder): void => {
-  writer.writeBits(1, 1); // rbsp_stop_one_bit
-  writer.writeByteAlign(0); // rbsp_alignment_zero_bit
-};
-
 const pic_parameter_set_data = (writer: EBSPBitBuilder): void => {
   writer.writeUEG(0); // pic_parameter_set_id
   writer.writeUEG(0); // seq_parameter_set_id
@@ -27,7 +22,7 @@ export default (): Buffer => {
   const writer = new EBSPBitBuilder();
 
   pic_parameter_set_data(writer);
-  rbsp_trailing_bit(writer);
+  writer.writeRBSPTrailingBits();
 
   return writer.build();
 };

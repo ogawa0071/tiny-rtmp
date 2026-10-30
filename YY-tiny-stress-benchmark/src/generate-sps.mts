@@ -1,10 +1,5 @@
 import EBSPBitBuilder from './ebsp-bit-builder.mts';
 
-const rbsp_trailing_bit = (writer: EBSPBitBuilder): void => {
-  writer.writeBits(1, 1); // rbsp_stop_one_bit
-  writer.writeByteAlign(0); // rbsp_alignment_zero_bit
-};
-
 const seq_parameter_set_data = (width: number, height: number, writer: EBSPBitBuilder): void => {
   const right_offset = Math.floor((Math.ceil(width / 16) * 16 - width) / 2); // この送り方では CropUnitX = 2
   const bottom_offset = Math.floor((Math.ceil(height / 16) * 16 - height) / 2); // この送り方では CropUnitY = 2
@@ -38,7 +33,7 @@ export default (width: number, height: number): Buffer => {
   const writer = new EBSPBitBuilder();
 
   seq_parameter_set_data(width, height, writer);
-  rbsp_trailing_bit(writer);
+  writer.writeRBSPTrailingBits();
 
   return writer.build();
 };
