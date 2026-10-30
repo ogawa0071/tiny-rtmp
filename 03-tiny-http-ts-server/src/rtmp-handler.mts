@@ -1,17 +1,7 @@
 import { MessageType } from '../../01-tiny-rtmp-server/src/message.mts';
 import type { Message } from '../../01-tiny-rtmp-server/src/message.mts';
 import ByteReader from '../../01-tiny-rtmp-server/src/byte-reader.mts';
-import read_amf0 from '../../01-tiny-rtmp-server/src/amf0-reader.mts';
-
-type VideoMessage = Message & {
-  message_type_id: (typeof MessageType.Video);
-};
-type AudioMessage = Message & {
-  message_type_id: (typeof MessageType.Audio);
-};
-type AMF0DataMessage = Message & {
-  message_type_id: (typeof MessageType.DataAMF0);
-};
+import { isAMF0Object, type AMF0Object, type AMF0Value } from '../../01-tiny-rtmp-server/src/amf0-reader.mts';
 
 export const VideoCodecType = {
   AVC: 7,
@@ -72,7 +62,7 @@ export type AudioData = AACData & {
 export type ActionScriptData = {
   timestamp: number;
   kind: 'Data';
-  values: ReturnType<typeof read_amf0>;
+  values: AMF0Value[];
 };
 
 const handle_avc = (reader: ByteReader): AVCData | null => {
@@ -96,18 +86,18 @@ const handle_avc = (reader: ByteReader): AVCData | null => {
   }
 };
 
-export const handle_video = (message: VideoMessage): VideoData | null => {
-  const reader = new ByteReader(message.data);
+export const handle_video = ({ timestamp, data }: { timestamp: number; data: Buffer; }): VideoData | null => {
+  const reader = new ByteReader(data);
 
   const meta = reader.readU8();
   const frameType = (meta & 0xF0) >> 4;
-  const codec = (meta & 0x0F) >> 0;
+  const codec = meta & 0x0F;
 
   switch (codec) {
     case VideoCodecType.AVC: {
       const avc = handle_avc(reader);
       if (avc == null) { return null; }
-      return { kind: 'Video', frameType, timestamp: message.timestamp, ... avc };
+      return { kind: 'Video', frameType, timestamp, ... avc };
     }
     default:
       return null;
@@ -132,36 +122,40 @@ const handle_aac = (reader: ByteReader): AACData | null => {
   }
 };
 
-export const handle_audio = (message: AudioMessage): AudioData | null => {
-  const reader = new ByteReader(message.data);
+export const handle_audio = ({ timestamp, data }: { timestamp: number; data: Buffer; }): AudioData | null => {
+  const reader = new ByteReader(data);
 
   const meta = reader.readU8();
-  const codec = (meta & 0xF0) >> 4;
-  const rate = (meta & 0x0C) >> 2;
-  const size = (meta & 0x02) >> 1;
-  const type = (meta & 0x01) >> 0;
+  const codec = (meta & 0xF0) >> 4; // SoundFormat
+  // 残りの SoundRate (2bit), SoundSize (1bit), SoundType (1bit) は、AAC では AudioSpecificConfig の値を使う
 
   switch (codec) {
     case AudioCodecType.AAC: {
-      // In AAC: rate, size, type are derived in AudioSpecificConfig
       const aac = handle_aac(reader);
       if (aac == null) { return null; }
-      return { kind: 'Audio', timestamp: message.timestamp, ... aac };
+      return { kind: 'Audio', timestamp, ... aac };
     }
     default:
       return null;
   }
 };
 
-export const handle_amf0_data = (message: AMF0DataMessage): ActionScriptData | null => {
-  return { kind: 'Data', timestamp: message.timestamp, values: message.data };
+export const handle_amf0_data = ({ timestamp, data }: { timestamp: number; data: AMF0Value[]; }): ActionScriptData => {
+  return { kind: 'Data', timestamp, values: data };
+};
+
+// 配信ソフトは onMetaData を @setDataFrame 付きで送ってくる (['@setDataFrame', 'onMetaData', { ... }])
+export const read_onmetadata = (values: AMF0Value[]): AMF0Object | null => {
+  const [command, name, metadata] = values;
+  if (command !== '@setDataFrame' || name !== 'onMetaData' || !isAMF0Object(metadata)) { return null; }
+  return metadata;
 };
 
 export default (message: Message): VideoData | AudioData | ActionScriptData | null => {
   switch (message.message_type_id) {
-    case MessageType.Video: return handle_video(message as VideoMessage);
-    case MessageType.Audio: return handle_audio(message as AudioMessage);
-    case MessageType.DataAMF0: return handle_amf0_data(message as AMF0DataMessage);
+    case MessageType.Video: return handle_video(message);
+    case MessageType.Audio: return handle_audio(message);
+    case MessageType.DataAMF0: return handle_amf0_data(message);
     default: return null;
   }
 };

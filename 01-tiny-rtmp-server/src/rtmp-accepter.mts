@@ -18,7 +18,7 @@ import { AuthResult, collect_query, strip_query, type AuthConfiguration, type Au
 
 export type Handshake = (reader: AsyncByteReader, connection: Duplex) => Promise<boolean>;
 
-const handle_handshake: Handshake = async (reader, connection) => {
+export const handle_handshake: Handshake = async (reader, connection) => {
   // C0/S0
   await reader.readU8(); // Read C0
   connection.write(Buffer.from([0x03])); // Write S0 (Version: 3)
@@ -37,18 +37,18 @@ const handle_handshake: Handshake = async (reader, connection) => {
   return s1_random.equals(c2_random_echo);
 };
 
-const STATE = {
+export const STATE = {
   WAITING_CONNECT: 'WAITING_CONNECT',
   WAITING_CREATESTREAM: 'WAITING_CREATESTREAM',
   WAITING_PUBLISH: 'WAITING_PUBLISH',
   PUBLISHED: 'PUBLISHED',
   DISCONNECTED: 'DISCONNECTED',
 } as const;
-type State = (typeof STATE)[keyof typeof STATE];
+export type State = (typeof STATE)[keyof typeof STATE];
 
 const PUBLISH_MESSAGE_STREAM = 1;
 const WINDOW_ACKNOWLEDGE_SIZE = 2500000;
-const need_yield = (state: State, message: Message): boolean => {
+export const need_yield = (state: State, message: Message): boolean => {
   if (state !== STATE.PUBLISHED) { return false; }
   if (message.message_stream_id !== PUBLISH_MESSAGE_STREAM) { return false; }
 
@@ -71,7 +71,7 @@ const authenticate = (name: string, fn: () => AuthResultWithDescription | Promis
 };
 type MaybePromise<T,> = T | Promise<T>;
 type Transition = (message: Message, writer: MessageWriter, auth: AuthConfiguration) => MaybePromise<State>;
-const TRANSITION = {
+export const TRANSITION = {
   [STATE.WAITING_CONNECT]: async (message, writer, auth) => {
     if (message.message_stream_id !== 0) { return STATE.WAITING_CONNECT; }
     if (message.message_type_id !== MessageType.CommandAMF0) { return STATE.WAITING_CONNECT; }

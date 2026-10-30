@@ -25,8 +25,8 @@ export const read_avc_decoder_configuration_record = (avcDecoderConfigurationRec
   });
   const numOfPictureParameterSets = reader.readU8();
   const PictureParameterSets = Array.from({ length: numOfPictureParameterSets }, () => {
-    const sequenceParameterSetLength = reader.readU16BE();
-    return reader.read(sequenceParameterSetLength);
+    const pictureParameterSetLength = reader.readU16BE();
+    return reader.read(pictureParameterSetLength);
   });
   return {
     configurationVersion,
@@ -39,6 +39,8 @@ export const read_avc_decoder_configuration_record = (avcDecoderConfigurationRec
   };
 };
 
+// 長さ付きの NAL Unit 列 (AVCC 形式) を、Start Code 区切り (Annex B 形式) に変換する
+// MPEG-TS では SPS/PPS も映像データに含める必要があるので、IDR の前に入れる
 export const write_annexb_avc = (sizedNalus: Buffer, avcDecoderConfigurationRecord: AVCDecoderConfigurationRecord): Buffer => {
   const reader = new ByteReader(sizedNalus);
 
@@ -67,6 +69,7 @@ export const write_annexb_avc = (sizedNalus: Buffer, avcDecoderConfigurationReco
     }
     annexb.push(startcode, nalu);
   }
+  // MPEG-TS では Access Unit Delimiter (AUD) が必須なので、なければ先頭に足す
   const aud = hasAUD ? [] : [startcode, Buffer.from([0x09, 0xF0])];
   return Buffer.concat([... aud, ... annexb]);
 };

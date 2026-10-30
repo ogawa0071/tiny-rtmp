@@ -5,7 +5,7 @@ import { parseArgs } from 'node:util';
 import type { ParseArgsOptionsConfig } from 'node:util';
 
 import { run } from '../../01-tiny-rtmp-server/src/rtmp-session.mts';
-import { logger } from '../../01-tiny-rtmp-server/src/logger.mts';
+import { ConsoleLogger, logger, registerLogger } from '../../01-tiny-rtmp-server/src/logger.mts';
 
 import handle_rtmp from '../../02-tiny-http-flv-server/src/rtmp-accepter.mts';
 import { AuthConfiguration } from '../../01-tiny-rtmp-server/src/auth.mts';
@@ -34,11 +34,12 @@ const options = {
     type: 'string',
   },
 } as const satisfies ParseArgsOptionsConfig;
-const { values: args } = parseArgs({ options, tokens: true });
-if (Number.isNaN(Number.parseInt(args.rtmp, 10))) {
-  console.error('Please Specify valid port number'); process.exit(1);
-}
-if (Number.isNaN(Number.parseInt(args.web, 10))) {
+const { values: args } = parseArgs({ options });
+const port = Number.parseInt(args.rtmp, 10);
+const web = Number.parseInt(args.web, 10);
+const highWaterMark = args.highWaterMark != null ? Number.parseInt(args.highWaterMark, 10) : undefined;
+const bandwidth = args.bandwidth != null ? Number.parseInt(args.bandwidth, 10) : undefined;
+if (Number.isNaN(port) || Number.isNaN(web)) {
   console.error('Please Specify valid port number'); process.exit(1);
 }
 if (args.app == null) {
@@ -47,76 +48,74 @@ if (args.app == null) {
 if (args.streamKey == null) {
   console.error('Please Specify valid streamKey'); process.exit(1);
 }
-if (args.highWaterMark != null && Number.isNaN(Number.parseInt(args.highWaterMark, 10))) {
+if (Number.isNaN(highWaterMark)) {
   console.error('Please Specify valid highwatermark'); process.exit(1);
 }
-if (args.bandwidth != null && Number.isNaN(Number.parseInt(args.bandwidth, 10))) {
+if (Number.isNaN(bandwidth)) {
   console.error('Please Specify valid bandwidth'); process.exit(1);
 }
-const port = Number.parseInt(args.rtmp, 10);
-const web = Number.parseInt(args.web, 10);
 const app = args.app;
 const streamKey = args.streamKey;
-const highWaterMark = args.highWaterMark != null ? Number.parseInt(args.highWaterMark, 10) : undefined;
-const bandwidth = args.bandwidth != null ? Number.parseInt(args.bandwidth, 10) : undefined;
 const auth = AuthConfiguration.simpleAuth(app, streamKey);
+registerLogger(new ConsoleLogger());
 
-type StreamingHandlers = [writeFn: (buffer: Buffer) => void, exitFn: () => void];
-const streaming = new Map<number, StreamingHandlers>();
+type Viewer = {
+  write: (buffer: Buffer) => void;
+  exit: () => void;
+};
+const viewers = new Set<Viewer>();
+
 const handle = async (connection: Duplex) => {
   const rtmp_to_mpegts = new MPEGTSTransmuxer();
+  let published = false;
+
   try {
     for await (const message of handle_rtmp(connection, { auth, limit: { bandwidth } })) {
+      published = true;
       for (const packet of rtmp_to_mpegts.feed(message)) {
-        for (const [write, _] of streaming.values()) { write(packet); }
+        for (const viewer of viewers) { viewer.write(packet); }
       }
     }
   } catch (e) {
-    const message = e instanceof Error ? e.message : String(e);
-    logger.error(`RTMP session error: ${message}`, e instanceof Error ? { stack: e.stack } : undefined);
+    logger.error('RTMP session error', { error: e });
   } finally {
-    for (const [_, end] of streaming.values()) { end(); }
+    // 配信していた接続が終わったら視聴も終わらせる (認証に失敗した接続などでは何もしない)
+    if (published) {
+      for (const viewer of viewers) { viewer.exit(); }
+    }
   }
 };
 
-const rtmp_server = net.createServer({ noDelay: true }, async (connection) => {
-  await run(async () => {
-    await handle(connection);
-  });
+const rtmp_server = net.createServer({ noDelay: true }, (connection) => {
+  run(() => handle(connection));
 });
 rtmp_server.listen(port);
 
-let viewers = 0;
 const web_server = http.createServer({ highWaterMark }, (req, res) => {
-  if (req.url == null) {
-    res.writeHead(404, { 'access-control-allow-origin': '*' });
-    res.end();
-    return;
-  }
-  const url = new URL(req.url, `http://localhost:${web}`);
+  const url = new URL(req.url ?? '/', `http://localhost:${web}`);
   if (!(req.method === 'GET' && url.pathname === `/${app}/${streamKey}`)) {
     res.writeHead(404, { 'access-control-allow-origin': '*' });
     res.end();
     return;
   }
-  const viewer = viewers++;
   res.writeHead(200, {
     'content-type': 'video/mp2t',
     'access-control-allow-origin': '*',
   });
 
-  const write = (chunk: Buffer) => {
-    if (res.closed) { return; }
-    if (!res.write(chunk) && highWaterMark != null) { res.destroy(); }
+  const viewer: Viewer = {
+    write: (chunk: Buffer) => {
+      if (res.closed) { return; }
+      // highWaterMark を超えて送信が詰まっている視聴者は切断する
+      if (!res.write(chunk) && highWaterMark != null) { res.destroy(); }
+    },
+    exit: () => { res.end(); viewers.delete(viewer); },
   };
+  viewers.add(viewer);
 
-  const exit = () => { res.end(); streaming.delete(viewer); };
-  const entry = [write, exit] satisfies StreamingHandlers;
-  streaming.set(viewer, entry);
-
-  req.on('close', exit);
-  res.on('close', exit);
-  req.on('error', exit);
-  res.on('error', exit);
+  req.on('close', viewer.exit);
+  res.on('close', viewer.exit);
+  req.on('error', viewer.exit);
+  res.on('error', viewer.exit);
 });
 web_server.listen({ port: web });
