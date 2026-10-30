@@ -8,7 +8,7 @@
 - mpegts.mts - MPEG-TSフォーマットのパケット生成
 - aac.mts / avc.mts - AACとAVCコーデックの処理
 - bit-reader.mts / bit-builder.mts - ビットレベルでのデータ操作ユーティリティ
-- rtmp-handler.mts - RTMP接続ハンドリング
+- rtmp-handler.mts - RTMPの映像/音声/データメッセージの中身の解析
 
 ## 実行方法
 

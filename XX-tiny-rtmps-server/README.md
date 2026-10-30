@@ -6,8 +6,8 @@
 ```diff
 -import net from 'node:net';
 +import tls from 'node:tls';
--import handle_rtmp from './rtmp-handler.mts';
-+import handle_rtmp from '../../01-tiny-rtmp-server/src/rtmp-handler.mts';
+-import handle_rtmp from './rtmp-accepter.mts';
++import handle_rtmp from '../../01-tiny-rtmp-server/src/rtmp-accepter.mts';
 
 const options = {
 // 省略
@@ -32,8 +32,8 @@ const options = {
 +const key = fs.readFileSync(args.key);
 +const cert = fs.readFileSync(args.cert);
 
--const server = net.createServer({ noDelay: true }, async (connection) => {
-+const server = tls.createServer({ noDelay: true, key, cert }, async (connection) => {
+-const server = net.createServer({ noDelay: true }, (connection) => {
++const server = tls.createServer({ noDelay: true, key, cert }, (connection) => {
 ```
 
 ## 主要コンポーネント

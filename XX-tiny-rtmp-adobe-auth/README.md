@@ -6,8 +6,7 @@ Adobe Auth に対応したRTMP受信サーバの実装です。
 
 ## 主要コンポーネント
 
-- rtmp-session.mts - RTMPセッション管理
-- auth-session.mts - Adobe Auth 処理
+- adobe-auth.mts - Adobe Auth 処理
 
 
 ## 実行方法

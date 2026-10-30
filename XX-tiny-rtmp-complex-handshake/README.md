@@ -6,7 +6,7 @@ RTMP Complex Handshake に対応したRTMP受信サーバの実装です。
 
 ## 主要コンポーネント
 
-- rtmp-session.mts - RTMPセッション管理とComplex Handshake処理
+- rtmp-accepter.mts - Complex Handshake の処理 (ハンドシェイク以外は[RTMP受信サーバ](../01-tiny-rtmp-server/)の処理を使う)
 
 
 ## 実行方法

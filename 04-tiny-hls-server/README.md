@@ -4,7 +4,7 @@
 
 ## 主要コンポーネント
 
-- hls-generator.mts - HLSプレイリストとセグメント生成処理
+- hls-generator.mts - [HTTP-TS配信](../03-tiny-http-ts-server/)のMPEG-TSをキーフレームで区切り、HLSのセグメントにする処理
 - media-playlist.mts - M3U8プレイリストファイル生成
 - segment.mts - MPEG-TSセグメント管理
 - index.mts - RTMPとHTTPサーバの統合管理

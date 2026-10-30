@@ -21,11 +21,14 @@ node src/index.mts
 # カスタムポートでサーバーを起動
 node src/index.mts --port 8080
 
-# FLVファイルに出力
+# FLVファイルに出力 (配信が始まるたびに作り直します)
 node src/index.mts --flv output.flv
 
 # 標準出力にFLVデータを出力
 node src/index.mts --flv -
+
+# 送受信したRTMPのメッセージを標準エラー出力にログとして出力
+node src/index.mts --intercept
 ```
 
 また、vite を使ってバンドルして javascript にまとめられます。
