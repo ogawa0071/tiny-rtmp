@@ -17,11 +17,16 @@ export const AMF0Marker = {
   LongString: 0x0C,
 } as const;
 
-const scriptend: unique symbol = Symbol();
 export type AMF0Object = {
   [key: string]: AMF0Value;
 };
-export type AMF0Value = number | boolean | string | null | undefined | typeof scriptend | Date | AMF0Object | AMF0Value[];
+export type AMF0Value = number | boolean | string | null | undefined | Date | AMF0Object | AMF0Value[];
+
+// Object の終端を表す ObjectEnd マーカーを読んだことを示す値
+const scriptend: unique symbol = Symbol('ObjectEnd');
+// ECMA Array も JavaScript では Object と同じ形で表すので、ECMA Array として読んだ Object をここで覚えておく
+// (書き戻す時に元の型で書けるようにするため: 例えば FLV の onMetaData は ECMA Array と決まっている)
+export const ecma_arrays = new WeakSet<object>();
 export const isAMF0Null = (data: AMF0Value): data is null => {
   return data === null;
 };
@@ -67,7 +72,7 @@ const object = (reader: ByteReader): AMF0Object => {
   // key と value の組が続き、空文字列の key と ObjectEnd で終わる
   while (true) {
     const key = string(reader);
-    const val = value(reader);
+    const val = value_or_end(reader);
     if (val === scriptend) { return object; }
     object[key] = val;
   }
@@ -75,7 +80,9 @@ const object = (reader: ByteReader): AMF0Object => {
 
 const ecma_array = (reader: ByteReader): AMF0Object => {
   reader.readU32BE(); // 要素数 (ObjectEnd で終端が分かるので使わない)
-  return object(reader);
+  const array = object(reader);
+  ecma_arrays.add(array);
+  return array;
 };
 
 const strict_array = (reader: ByteReader): AMF0Value[] => {
@@ -89,7 +96,8 @@ const date = (reader: ByteReader): Date => {
   return new Date(timestamp);
 };
 
-const value = (reader: ByteReader): AMF0Value => {
+// 値を 1 つ読む (Object の中では、値の代わりに終端を表す ObjectEnd が来る)
+const value_or_end = (reader: ByteReader): AMF0Value | typeof scriptend => {
   const marker = reader.readU8();
   switch (marker) {
     case AMF0Marker.Number: return reader.readF64BE();
@@ -107,6 +115,13 @@ const value = (reader: ByteReader): AMF0Value => {
     case AMF0Marker.LongString: return long_string(reader);
     default: throw new Error(`Invalid Marker: ${marker}`);
   }
+};
+
+// ObjectEnd は Object (と ECMA Array) の終端にしか現れないので、それ以外の場所にあるなら壊れている
+const value = (reader: ByteReader): AMF0Value => {
+  const val = value_or_end(reader);
+  if (val === scriptend) { throw new Error('Unexpected ObjectEnd Marker'); }
+  return val;
 };
 
 export default (data: Buffer): AMF0Value[] => {

@@ -229,3 +229,41 @@ describe('Regression Test', () => {
     }
   });
 });
+
+describe('Chunk Header', () => {
+  test('Timestamp delta wraps around at 2^32', async () => {
+    const reader = new AsyncByteReader();
+    const gen = read_message(reader)[Symbol.asyncIterator]();
+
+    // fmt 0 (cs_id: 4): timestamp 0xFFFFFFF0 (Extended Timestamp), length 1, Audio, Message Stream ID 1
+    reader.feed(Buffer.from('04ffffff00000108' + '01000000' + 'fffffff0' + 'aa', 'hex'));
+    // fmt 1 (cs_id: 4): timestamp delta 0x20, length 1, Audio
+    reader.feed(Buffer.from('4400002000000108' + 'bb', 'hex'));
+    // fmt 3 (cs_id: 4): 前回の timestamp delta (0x20) を引き継ぐ新しいメッセージ
+    reader.feed(Buffer.from('c4' + 'cc', 'hex'));
+
+    expect((await gen.next()).value).toMatchObject({ timestamp: 0xFFFFFFF0, data: Buffer.from('aa', 'hex') });
+    expect((await gen.next()).value).toMatchObject({ timestamp: 0x10, data: Buffer.from('bb', 'hex') });
+    expect((await gen.next()).value).toMatchObject({ timestamp: 0x30, data: Buffer.from('cc', 'hex') });
+  });
+
+  test('Abort discards only the partial message, not the header state', async () => {
+    const reader = new AsyncByteReader();
+    const gen = read_message(reader)[Symbol.asyncIterator]();
+
+    // fmt 0 (cs_id: 6): timestamp 100, length 200, Video, Message Stream ID 1 (最初の 128 byte だけ送る)
+    reader.feed(Buffer.from('060000640000c809' + '01000000', 'hex'));
+    reader.feed(Buffer.alloc(128));
+    // Abort (cs_id: 2): cs_id 6 の受信途中のメッセージを捨てる
+    reader.feed(Buffer.from('020000000000040200000000' + '00000006', 'hex'));
+    // fmt 1 (cs_id: 6): timestamp delta 33, length 2, Video (Message Stream ID は Abort 前のものを引き継ぐ)
+    reader.feed(Buffer.from('4600002100000209' + '1701', 'hex'));
+
+    expect((await gen.next()).value).toMatchObject({
+      message_type_id: 9,
+      message_stream_id: 1,
+      timestamp: 133,
+      data: Buffer.from('1701', 'hex'),
+    });
+  });
+});

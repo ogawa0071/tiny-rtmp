@@ -12,7 +12,8 @@ const simple_handshake_C1S1C2S2 = async (c1: Buffer, reader: AsyncByteReader, co
   const s1 = Buffer.concat([Buffer.alloc(8), s1_random]);
   connection.write(s1); // write S1
 
-  const s2 = Buffer.concat([Buffer.alloc(8), c1_random]);
+  // S2 は C1 のエコー (time は C1 の time、time2 は C1 を読んだ時刻 (0 で省略)、random は C1 の random)
+  const s2 = Buffer.concat([c1.subarray(0, 4), Buffer.alloc(4), c1_random]);
   connection.write(s2); // write S2
   const c2 = await reader.read(1536); // read C2
   const c2_random_echo = c2.subarray(8);

@@ -28,8 +28,8 @@ export const handle_handshake: Handshake = async (reader, connection) => {
   const s1_random = randomBytes(1536 - 8);
   const s1 = Buffer.concat([Buffer.alloc(8), s1_random]);
   connection.write(s1); // write S1
-  // C2/S2
-  const s2 = Buffer.concat([Buffer.alloc(8), c1_random]);
+  // C2/S2 (S2 は C1 のエコー: time は C1 の time、time2 は C1 を読んだ時刻 (0 で省略)、random は C1 の random)
+  const s2 = Buffer.concat([c1.subarray(0, 4), Buffer.alloc(4), c1_random]);
   connection.write(s2); // write S2
   const c2 = await reader.read(1536); // read C2
   const c2_random_echo = c2.subarray(8);
@@ -158,8 +158,6 @@ export const TRANSITION = {
 
     const name = command[0];
     if (name !== 'publish') { return STATE.WAITING_PUBLISH; }
-    if (!isAMF0Number(command[1])) { return STATE.WAITING_PUBLISH; }
-    const transaction_id = command[1];
     if (!isAMF0String(command[3])) { return STATE.WAITING_PUBLISH; }
     const stream = command[3];
 
@@ -182,12 +180,12 @@ export const TRANSITION = {
       description: description ?? 'Publish Failed',
     };
 
-    // Publish のレスポンスを返す
+    // Publish のレスポンスを onStatus で返す (onStatus の Transaction ID は 0 と決まっている)
     writer.write({
       message_type_id: MessageType.CommandAMF0,
       message_stream_id: message.message_stream_id,
       timestamp: 0,
-      data: ['onStatus', transaction_id, null, info],
+      data: ['onStatus', 0, null, info],
     });
 
     if (publishAccepted) {
@@ -228,8 +226,13 @@ async function* handle_rtmp(connection: Duplex, auth: AuthConfiguration, handsha
   using writer = new MessageWriter({ signal: controller.signal });
   Readable.from(writer.retrieve()).pipe(connection);
   const counter = new AckCounter((bytes: number) => {
-    // MEMO: システム系はあんま timestamp に意味ない? らしい...? ので 0 にしてる
-    writer.write(Acknowledgement.from({ sequence_number: bytes, timestamp: 0 }));
+    try {
+      // MEMO: システム系はあんま timestamp に意味ない? らしい...? ので 0 にしてる
+      writer.write(Acknowledgement.from({ sequence_number: bytes, timestamp: 0 }));
+    } catch {
+      // 切断処理が始まった後に届いたデータには Acknowledgement を返せない (writer は例外を投げる)
+      // ソケットの data イベントの中で例外を投げるとプロセスごと落ちるので、ここで握りつぶす
+    }
   });
   using reader = new AsyncByteReader({ signal: controller.signal });
   connection.on('data', (data: Buffer) => {

@@ -1,4 +1,4 @@
-import { AMF0Marker } from './amf0-reader.mts';
+import { AMF0Marker, ecma_arrays } from './amf0-reader.mts';
 import ByteBuilder from './byte-builder.mts';
 
 // Object の key などで使う、長さ 16bit の UTF-8 文字列 (型マーカーなし)
@@ -22,8 +22,15 @@ const string = (dst: ByteBuilder, data: string): void => {
 };
 
 const object = (dst: ByteBuilder, data: object): void => {
-  dst.writeU8(AMF0Marker.Object);
-  for (const [k, v] of Object.entries(data)) {
+  const entries = Object.entries(data);
+  // ECMA Array として読んだものは ECMA Array (要素数から始まる) として書き戻す
+  if (ecma_arrays.has(data)) {
+    dst.writeU8(AMF0Marker.ECMAArray);
+    dst.writeU32BE(entries.length);
+  } else {
+    dst.writeU8(AMF0Marker.Object);
+  }
+  for (const [k, v] of entries) {
     utf8(dst, k);
     value(dst, v);
   }

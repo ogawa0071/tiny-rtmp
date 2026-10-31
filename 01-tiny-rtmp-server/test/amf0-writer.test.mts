@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'vitest';
 import write_amf0 from '../src/amf0-writer.mts';
+import read_amf0 from '../src/amf0-reader.mts';
 
 describe('Unit Test', () => {
   test.each([
@@ -26,6 +27,12 @@ describe('Unit Test', () => {
 
   test('object (complex)', () => {
     expect(write_amf0({ value: 'key', test: 'ok' })).toStrictEqual(Buffer.from('03000576616c75650200036b65790004746573740200026f6b000009', 'hex'));
+  });
+
+  test('ECMA array is written back as ECMA array', () => {
+    // onMetaData の例: ['onMetaData', ECMA Array { duration: 0 }] (Object ではなく ECMA Array のまま書き戻す)
+    const binary = Buffer.from('02000a6f6e4d65746144617461' + '0800000001' + '00086475726174696f6e' + '000000000000000000' + '000009', 'hex');
+    expect(write_amf0(... read_amf0(binary))).toStrictEqual(binary);
   });
 
   test('string (complex)', () => {

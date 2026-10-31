@@ -184,7 +184,7 @@ describe('Regression Test', () => {
       const data = (await gen.next()).value.data;
       const expected = [
         'onStatus',
-        5,
+        0,
         null,
         {
           code: 'NetStream.Publish.Start',
@@ -371,7 +371,7 @@ describe('Regression Test', () => {
         const data = (await gen.next()).value.data;
         const expected = [
           'onStatus',
-          5,
+          0,
           null,
           i === 0 ? {
             code: 'NetStream.Publish.Start',
@@ -561,7 +561,7 @@ describe('Regression Test', () => {
         const data = (await gen.next()).value.data;
         const expected = [
           'onStatus',
-          5,
+          0,
           null,
           {
             code: 'NetStream.Publish.Start',
@@ -719,7 +719,7 @@ describe('Regression Test', () => {
       const data = (await gen.next()).value.data;
       const expected = [
         'onStatus',
-        5,
+        0,
         null,
         {
           code: 'NetStream.Publish.Failed',

@@ -46,7 +46,12 @@ export default async function* handle_rtmp(connection: Duplex, option?: RTMPOpti
   using writer = new MessageWriter({ signal: controller.signal, highWaterMark });
   Readable.from(writer.retrieve()).pipe(connection);
   const counter = new AckCounter((bytes: number) => {
-    writer.write(Acknowledgement.from({ sequence_number: bytes, timestamp: 0 }));
+    try {
+      writer.write(Acknowledgement.from({ sequence_number: bytes, timestamp: 0 }));
+    } catch {
+      // 切断処理が始まった後に届いたデータには Acknowledgement を返せない (writer は例外を投げる)
+      // ソケットの data イベントの中で例外を投げるとプロセスごと落ちるので、ここで握りつぶす
+    }
   });
   using reader = new AsyncByteReader({ signal: controller.signal, highWaterMark });
   // 帯域の制限を超えて送ってくる配信は切断する

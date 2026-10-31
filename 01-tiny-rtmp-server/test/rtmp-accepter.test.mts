@@ -49,8 +49,9 @@ describe('Regression Test', () => {
     {
       // C0/S0
       client.write(Buffer.from([0x03]));
+      const c1_time = Buffer.from('0001e240', 'hex');
       const c1_random = Buffer.alloc(1536 - 8);
-      const c1 = Buffer.concat([Buffer.alloc(8), c1_random]);
+      const c1 = Buffer.concat([c1_time, Buffer.alloc(4), c1_random]);
       client.write(c1);
       const s0 = await reader.read(1);
       expect(s0.equals(Buffer.from([0x03]))).toStrictEqual(true);
@@ -61,6 +62,8 @@ describe('Regression Test', () => {
       const c2 = Buffer.concat([Buffer.alloc(8), s1_random]);
       client.write(c2); // write S2
       const s2 = await reader.read(1536); // read C2
+      // S2 は C1 の time と random のエコー
+      expect(s2.subarray(0, 4).equals(c1_time)).toStrictEqual(true);
       const s2_random_echo = s2.subarray(8);
       expect(s2_random_echo.equals(c1_random)).toStrictEqual(true);
     }
@@ -190,7 +193,7 @@ describe('Regression Test', () => {
       const data = (await gen.next()).value.data;
       const expected = [
         'onStatus',
-        5,
+        0,
         null,
         {
           code: 'NetStream.Publish.Start',

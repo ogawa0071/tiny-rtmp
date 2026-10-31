@@ -100,12 +100,12 @@ export default async function* read_message(reader: AsyncByteReader, option?: Me
         throw new InsufficientChunkError('Insufficient Chunk Information in RTMP Message Receiving');
       }
       timestamp_delta = extended_timestamp ?? timestamp; // fmt === 1 or fmt === 2 の timestamp は差分
-      timestamp = information.timestamp + timestamp_delta;
+      timestamp = (information.timestamp + timestamp_delta) % 2 ** 32; // timestamp は 32bit で一周する
     } else if (fmt === 3) {
       // fmt === 3 は前回の差分を引き継ぐ (直前が fmt === 0 なら、その timestamp を差分とみなす)
       timestamp_delta = extended_timestamp ?? information?.timestamp_delta ?? timestamp;
       // 同じメッセージの続きのチャンクなら timestamp は変わらない
-      timestamp += (chunk_builder.byteLength() > 0) ? 0 : timestamp_delta;
+      timestamp = (timestamp + ((chunk_builder.byteLength() > 0) ? 0 : timestamp_delta)) % 2 ** 32;
     } else {
       timestamp = extended_timestamp ?? timestamp;
     }
@@ -132,10 +132,10 @@ export default async function* read_message(reader: AsyncByteReader, option?: Me
             chunk_maximum_size = message.data.chunk_size;
             break;
           case MessageType.Abort: {
+            // 受信途中のメッセージだけを捨てる (ヘッダの情報は送信側が引き続き省略に使うので残す)
             const aborted_cs_id = message.data.chunk_stream_id;
             buffered -= chunks.get(aborted_cs_id)?.byteLength() ?? 0;
             chunks.delete(aborted_cs_id);
-            informations.delete(aborted_cs_id);
             break;
           }
           default:
