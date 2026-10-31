@@ -6,6 +6,7 @@ import type { ParseArgsOptionsConfig } from 'node:util';
 
 import { MessageType } from '../../01-tiny-rtmp-server/src/message.mts';
 import write_amf0 from '../../01-tiny-rtmp-server/src/amf0-writer.mts';
+import { isAMF0Object } from '../../01-tiny-rtmp-server/src/amf0-reader.mts';
 import { write_flv_header, write_flv_tag } from '../../01-tiny-rtmp-server/src/flv-writer.mts';
 import { run } from '../../01-tiny-rtmp-server/src/rtmp-session.mts';
 import { ConsoleLogger, logger, registerLogger } from '../../01-tiny-rtmp-server/src/logger.mts';
@@ -63,7 +64,7 @@ registerLogger(new ConsoleLogger());
 type Viewer = {
   write: (buffer: Buffer) => void;
   exit: () => void;
-  initialized: boolean; // 途中から視聴を始めた時に必要な、メタデータとコーデックの初期化情報を送ったか
+  initialized: boolean; // FLV Header と、途中から視聴を始めた時に必要なメタデータとコーデックの初期化情報を送ったか
 };
 const viewers = new Set<Viewer>();
 
@@ -72,6 +73,9 @@ const handle = async (connection: Duplex) => {
   let onMetaData: Buffer | null = null;
   let avcConfig: Buffer | null = null;
   let aacConfig: Buffer | null = null;
+  // FLV Header に書く、音声・映像があるかどうか (onMetaData が届くまでは両方あるとみなす)
+  let has_audio = true;
+  let has_video = true;
   let published = false;
 
   try {
@@ -79,15 +83,22 @@ const handle = async (connection: Duplex) => {
       published = true;
 
       let tag: Buffer;
+      let keyframe = false;
       switch (message.message_type_id) {
         case MessageType.Video: {
+          if (message.data.byteLength < 2) { continue; }
           const [header, packetType] = message.data;
-          if ((header & 0x0F) !== 7) { continue; } // AVC (CodecID: 7) のみ受け付ける
+          // AVC (CodecID: 7) の映像のフレーム (FrameType: 1〜4) のみ受け付ける
+          // (FrameType 5 は AVCPacketType を持たないコマンドで、先頭 1bit が立っていれば Enhanced RTMP の別の形式)
+          const frameType = header >> 4;
+          if ((header & 0x0F) !== 7 || frameType < 1 || frameType > 4) { continue; }
           tag = write_flv_tag(message);
           if (packetType === 0) { avcConfig = tag; } // AVC sequence header
+          keyframe = frameType === 1 && packetType === 1; // キーフレームの AVC NALU
           break;
         }
         case MessageType.Audio: {
+          if (message.data.byteLength < 2) { continue; }
           const [header, packetType] = message.data;
           if ((header >> 4) !== 10) { continue; } // AAC (SoundFormat: 10) のみ受け付ける
           tag = write_flv_tag(message);
@@ -95,11 +106,14 @@ const handle = async (connection: Duplex) => {
           break;
         }
         case MessageType.DataAMF0: {
-          const [command, name, metadata] = message.data;
-          if (command !== '@setDataFrame' || name !== 'onMetaData') { continue; }
+          // 配信ソフトは @setDataFrame 付きで送ってくるが、付いていない onMetaData もあるので、どちらも受け付ける
+          const [name, metadata] = message.data[0] === '@setDataFrame' ? message.data.slice(1) : message.data;
+          if (name !== 'onMetaData' || !isAMF0Object(metadata)) { continue; }
           // FLV には @setDataFrame を除いた onMetaData を書き込む
           tag = write_flv_tag({ ... message, data: write_amf0(name, metadata) });
           onMetaData = tag;
+          has_audio = metadata.audiocodecid != null;
+          has_video = metadata.videocodecid != null;
           break;
         }
         default: continue;
@@ -107,6 +121,9 @@ const handle = async (connection: Duplex) => {
 
       for (const viewer of viewers) {
         if (!viewer.initialized) {
+          // 映像がある時はキーフレームから送り始める (それより前のフレームは、参照するフレームがないのでデコードできない)
+          if (avcConfig != null && !keyframe) { continue; }
+          viewer.write(write_flv_header(has_audio, has_video));
           for (const initial of [onMetaData, avcConfig, aacConfig]) {
             if (initial != null) { viewer.write(initial); }
           }
@@ -140,11 +157,11 @@ const web_server = http.createServer({ highWaterMark }, (req, res) => {
     res.end();
     return;
   }
+  // FLV Header は、配信のメタデータが分かってから (視聴者の初期化時に) 送る
   res.writeHead(200, {
-    'content-type': 'application/octet-stream',
+    'content-type': 'video/x-flv',
     'access-control-allow-origin': '*',
   });
-  res.write(write_flv_header(true, true));
 
   const viewer: Viewer = {
     write: (chunk: Buffer) => {

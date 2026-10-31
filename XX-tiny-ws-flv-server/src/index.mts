@@ -8,6 +8,7 @@ import type { ParseArgsOptionsConfig } from 'node:util';
 import AsyncByteReader from '../../01-tiny-rtmp-server/src/async-byte-reader.mts';
 import { MessageType } from '../../01-tiny-rtmp-server/src/message.mts';
 import write_amf0 from '../../01-tiny-rtmp-server/src/amf0-writer.mts';
+import { isAMF0Object } from '../../01-tiny-rtmp-server/src/amf0-reader.mts';
 import { write_flv_header, write_flv_tag } from '../../01-tiny-rtmp-server/src/flv-writer.mts';
 import { run } from '../../01-tiny-rtmp-server/src/rtmp-session.mts';
 import { ConsoleLogger, logger, registerLogger } from '../../01-tiny-rtmp-server/src/logger.mts';
@@ -58,7 +59,7 @@ registerLogger(new ConsoleLogger());
 type Viewer = {
   write: (buffer: Buffer) => void;
   exit: () => void;
-  initialized: boolean; // 途中から視聴を始めた時に必要な、メタデータとコーデックの初期化情報を送ったか
+  initialized: boolean; // FLV Header と、途中から視聴を始めた時に必要なメタデータとコーデックの初期化情報を送ったか
 };
 const viewers = new Set<Viewer>();
 
@@ -67,6 +68,9 @@ const handle = async (connection: Duplex) => {
   let onMetaData: Buffer | null = null;
   let avcConfig: Buffer | null = null;
   let aacConfig: Buffer | null = null;
+  // FLV Header に書く、音声・映像があるかどうか (onMetaData が届くまでは両方あるとみなす)
+  let has_audio = true;
+  let has_video = true;
   let published = false;
 
   try {
@@ -74,15 +78,22 @@ const handle = async (connection: Duplex) => {
       published = true;
 
       let tag: Buffer;
+      let keyframe = false;
       switch (message.message_type_id) {
         case MessageType.Video: {
+          if (message.data.byteLength < 2) { continue; }
           const [header, packetType] = message.data;
-          if ((header & 0x0F) !== 7) { continue; } // AVC (CodecID: 7) のみ受け付ける
+          // AVC (CodecID: 7) の映像のフレーム (FrameType: 1〜4) のみ受け付ける
+          // (FrameType 5 は AVCPacketType を持たないコマンドで、先頭 1bit が立っていれば Enhanced RTMP の別の形式)
+          const frameType = header >> 4;
+          if ((header & 0x0F) !== 7 || frameType < 1 || frameType > 4) { continue; }
           tag = write_flv_tag(message);
           if (packetType === 0) { avcConfig = tag; } // AVC sequence header
+          keyframe = frameType === 1 && packetType === 1; // キーフレームの AVC NALU
           break;
         }
         case MessageType.Audio: {
+          if (message.data.byteLength < 2) { continue; }
           const [header, packetType] = message.data;
           if ((header >> 4) !== 10) { continue; } // AAC (SoundFormat: 10) のみ受け付ける
           tag = write_flv_tag(message);
@@ -90,11 +101,14 @@ const handle = async (connection: Duplex) => {
           break;
         }
         case MessageType.DataAMF0: {
-          const [command, name, metadata] = message.data;
-          if (command !== '@setDataFrame' || name !== 'onMetaData') { continue; }
+          // 配信ソフトは @setDataFrame 付きで送ってくるが、付いていない onMetaData もあるので、どちらも受け付ける
+          const [name, metadata] = message.data[0] === '@setDataFrame' ? message.data.slice(1) : message.data;
+          if (name !== 'onMetaData' || !isAMF0Object(metadata)) { continue; }
           // FLV には @setDataFrame を除いた onMetaData を書き込む
           tag = write_flv_tag({ ... message, data: write_amf0(name, metadata) });
           onMetaData = tag;
+          has_audio = metadata.audiocodecid != null;
+          has_video = metadata.videocodecid != null;
           break;
         }
         default: continue;
@@ -102,6 +116,9 @@ const handle = async (connection: Duplex) => {
 
       for (const viewer of viewers) {
         if (!viewer.initialized) {
+          // 映像がある時はキーフレームから送り始める (それより前のフレームは、参照するフレームがないのでデコードできない)
+          if (avcConfig != null && !keyframe) { continue; }
+          viewer.write(write_flv_header(has_audio, has_video));
           for (const initial of [onMetaData, avcConfig, aacConfig]) {
             if (initial != null) { viewer.write(initial); }
           }
@@ -163,7 +180,12 @@ const pingpong = async (reader: AsyncByteReader, socket: Duplex): Promise<void> 
     const opcode = first & 0x0F;
 
     const second = await reader.readU8(); // MASK (1bit), Payload Length (7bit)
-    const mask = (second & 0x80) !== 0;
+    // クライアントから届くフレームは必ずマスクされていて、されていなければ切断する (RFC 6455 5.1)
+    if ((second & 0x80) === 0) {
+      write_frame(socket, Opcode.Close, Buffer.from([0x03, 0xEA])); // 1002: Protocol Error
+      socket.end();
+      return;
+    }
     let length = second & 0x7F;
     if (length === 126) {
       length = await reader.readU16BE();
@@ -177,7 +199,7 @@ const pingpong = async (reader: AsyncByteReader, socket: Duplex): Promise<void> 
     }
 
     // クライアントから届くフレームはマスクされているので、マスクを外す
-    const maskingKey = mask ? await reader.read(4) : Buffer.alloc(4);
+    const maskingKey = await reader.read(4);
     const payload = await reader.read(length);
     for (let i = 0; i < payload.length; i++) {
       payload[i] = payload[i] ^ maskingKey[i % 4];
@@ -197,7 +219,7 @@ const pingpong = async (reader: AsyncByteReader, socket: Duplex): Promise<void> 
 };
 
 const web_server = http.createServer();
-web_server.addListener('upgrade', (req, socket, _) => {
+web_server.addListener('upgrade', (req, socket, head) => {
   // upgrade 後のソケットのエラーは http サーバが処理しないので最初にリスナーを付ける (付けないと 404 を返した後の ECONNRESET などでプロセスごと落ちる)
   socket.on('error', () => { socket.destroy(); });
   const response = (status: number, message: string, headers?: Record<string, string>) => {
@@ -217,10 +239,17 @@ web_server.addListener('upgrade', (req, socket, _) => {
     return;
   }
 
-  // Websocket
+  // Websocket のハンドシェイク (RFC 6455 4.2.1)
+  // Upgrade: websocket と、16 byte の乱数を base64 にした Sec-WebSocket-Key が必要
   const key = req.headers['sec-websocket-key'];
-  if (key == null) {
+  if (req.headers['upgrade']?.toLowerCase() !== 'websocket' || key == null || Buffer.from(key, 'base64').byteLength !== 16) {
     response(400, 'Bad Request', { 'access-control-allow-origin': '*' });
+    socket.end();
+    return;
+  }
+  // 対応しているバージョン (13) 以外なら、対応しているバージョンを伝えて断る (RFC 6455 4.4)
+  if (req.headers['sec-websocket-version'] !== '13') {
+    response(426, 'Upgrade Required', { 'Sec-WebSocket-Version': '13', 'access-control-allow-origin': '*' });
     socket.end();
     return;
   }
@@ -231,11 +260,11 @@ web_server.addListener('upgrade', (req, socket, _) => {
     'Connection': 'Upgrade',
     'Sec-WebSocket-Accept': accept,
   });
-  // FLV Header
-  write_frame(socket, Opcode.Binary, write_flv_header(true, true));
+  // FLV Header は、配信のメタデータが分かってから (視聴者の初期化時に) 送る
 
   // receive prepare
   const reader = new AsyncByteReader();
+  reader.feed(head); // ハンドシェイクと一緒に届いていたフレームのデータ
   socket.on('data', (chunk) => {
     reader.feed(chunk);
   });
@@ -250,7 +279,12 @@ web_server.addListener('upgrade', (req, socket, _) => {
       if (socket.closed) { return; }
       write_frame(socket, Opcode.Binary, chunk);
     },
-    exit: () => { socket.end(); viewers.delete(viewer); },
+    exit: () => {
+      // こちらから切断する時は Close フレーム (1000: Normal Closure) を送ってから切断する (送らないと異常終了になる)
+      if (socket.writable) { write_frame(socket, Opcode.Close, Buffer.from([0x03, 0xE8])); }
+      socket.end();
+      viewers.delete(viewer);
+    },
     initialized: false,
   };
   viewers.add(viewer);
