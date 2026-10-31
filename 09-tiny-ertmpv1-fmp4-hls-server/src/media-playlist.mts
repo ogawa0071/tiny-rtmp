@@ -24,7 +24,9 @@ export default class MediaPlaylist {
   public published: Promise<boolean>;
   private publishedNotify: (success: boolean) => void;
 
-  private sequenceNumber: number = -1;
+  // 配信し直しても URI (セグメント名など) が前の配信と重ならないように、番号を現在時刻 (秒) から始める
+  // (前の配信の同じ URI のセグメントがキャッシュから使われないようにする: FFmpeg の -hls_start_number_source epoch と同じ考え方)
+  private sequenceNumber: number = Math.floor(Date.now() / 1000) - 1;
 
   private liveWindowLength: number;
 
