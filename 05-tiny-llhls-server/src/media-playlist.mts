@@ -86,7 +86,8 @@ export default class MediaPlaylist {
   }
 
   public feed(data: Iterable<Buffer>, { timestamp, timescale }: PlaylistTimestamp, keyframe: boolean = false) {
-    if (this.currentSegment != null && (timestamp - this.currentSegment.latestBegin()) > (this.partialSegmentDuration * timescale)) {
+    // パーシャルセグメントの境界ちょうどのタイムスタンプのデータは、次のパーシャルセグメントに入れる
+    if (this.currentSegment != null && (timestamp - this.currentSegment.latestBegin()) >= (this.partialSegmentDuration * timescale)) {
       this.currentSegment.partialComplete(this.currentSegment.latestBegin() + (this.partialSegmentDuration * timescale), timescale);
     }
 
@@ -120,7 +121,7 @@ export default class MediaPlaylist {
       for (const [index, part] of segment.enumerate()) {
         m3u8 += `#EXT-X-PART:DURATION=${part.extinf()!.toFixed(6)},URI="${i}_${index}.ts"` + (part.independent() ? ',INDEPENDENT=YES' : '') + '\n';
       }
-      m3u8 += `#EXTINF:${segment.extinf()!.toFixed(6)}\n`;
+      m3u8 += `#EXTINF:${segment.extinf()!.toFixed(6)},\n`; // #EXTINF:<duration>,[<title>] (タイトルは省略できるがカンマは必要)
       m3u8 += `${i}.ts\n`;
     }
 

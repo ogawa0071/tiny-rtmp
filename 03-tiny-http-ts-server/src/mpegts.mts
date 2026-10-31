@@ -132,7 +132,8 @@ const write_timestamp = (builder: BitBuilder, prefix: number, timestamp: number)
 };
 
 export const write_pes = (data: Buffer, stream_id: number, pts: number | null, dts: number | null, omit_length = false) => {
-  if (pts == null) { dts = null; }
+  // DTS は PTS があり、かつ PTS と値が異なる時だけ書く (H.222.0 2.7.5)
+  if (pts == null || dts === pts) { dts = null; }
 
   const builder = new BitBuilder();
   const PES_header_data_length = (pts != null ? 5 : 0) + (dts != null ? 5 : 0);

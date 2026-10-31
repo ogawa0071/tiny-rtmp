@@ -11,23 +11,36 @@ export type AudioSpecificConfig = {
   samplingFrequencyIndex: number;
   samplingFrequency: number;
   channelConfiguration: number;
+  coreAudioObjectType: number; // HE-AAC の時は、SBR/PS で拡張される元の AAC の Audio Object Type
+};
+
+const read_audio_object_type = (reader: BitReader): number => {
+  const audioObjectType = reader.readBits(5);
+  return audioObjectType === 31 ? 32 + reader.readBits(6) : audioObjectType;
 };
 
 export const read_audio_specific_config = (audioSpecificConfig: Buffer): AudioSpecificConfig => {
   const reader = new BitReader(audioSpecificConfig);
 
-  let audioObjectType = reader.readBits(5);
-  if (audioObjectType === 31) { audioObjectType = 32 + reader.readBits(6); }
-
+  const audioObjectType = read_audio_object_type(reader);
   const samplingFrequencyIndex = reader.readBits(4);
   const samplingFrequency = samplingFrequencyIndex === 0x0f ? reader.readBits(24) : samplingFrequencyTable[samplingFrequencyIndex];
   const channelConfiguration = reader.readBits(4);
+
+  // HE-AAC (5: SBR, 29: SBR+PS) は、拡張後のサンプリング周波数の後ろに元の AAC の Audio Object Type が続く
+  let coreAudioObjectType = audioObjectType;
+  if (audioObjectType === 5 || audioObjectType === 29) {
+    const extensionSamplingFrequencyIndex = reader.readBits(4);
+    if (extensionSamplingFrequencyIndex === 0x0f) { reader.readBits(24); } // extensionSamplingFrequency
+    coreAudioObjectType = read_audio_object_type(reader);
+  }
 
   return {
     audioObjectType,
     samplingFrequencyIndex,
     samplingFrequency,
     channelConfiguration,
+    coreAudioObjectType,
   };
 };
 
@@ -35,14 +48,15 @@ export const write_adts_aac = (data: Buffer, audioSpecificConfig: AudioSpecificC
   const builder = new BitBuilder();
 
   // TODO: AAC-LC or Main で samplingFrequencyIndex !== 0x0F なものに絞るべき
-  const { audioObjectType, samplingFrequencyIndex, channelConfiguration } = audioSpecificConfig;
+  // ADTS には SBR/PS を書く場所がないので、HE-AAC は元の AAC として書く (デコーダが SBR/PS を見つけて拡張する)
+  const { coreAudioObjectType, samplingFrequencyIndex, channelConfiguration } = audioSpecificConfig;
   const frameLength = 7 + data.byteLength;
 
   builder.writeBits(0xFFF, 12); // syncword
-  builder.writeBits(1, 1); // mpeg_version
+  builder.writeBits(0, 1); // ID (0: MPEG-4 AAC, 1: MPEG-2 AAC)
   builder.writeBits(0, 2); // layer
   builder.writeBits(1, 1); // protection_absent (protected = 0)
-  builder.writeBits(audioObjectType - 1, 2); // profile
+  builder.writeBits(coreAudioObjectType - 1, 2); // profile (Audio Object Type - 1)
   builder.writeBits(samplingFrequencyIndex, 4); // sampling_frequency_index
   builder.writeBits(0, 1); // private_bit
   builder.writeBits(channelConfiguration, 3); // channel_configuration
