@@ -42,7 +42,7 @@ node src/index.mts --app myapp --streamKey mystreamkey --encryptionScheme cenc -
 また、vite を使ってバンドルして javascript にまとめられます。
 
 ```bash
-# dist/index.cjs, dist/index.mjs にバンドルした結果を出力
+# dist/tiny-dash-widevine-testing-server.js (CommonJS), dist/tiny-dash-widevine-testing-server.mjs (ES Modules) にバンドルした結果を出力
 yarn build
 ```
 

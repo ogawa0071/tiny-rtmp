@@ -29,7 +29,7 @@ node src/index.mts --app myapp --streamKey mystreamkey --partDuration 0.3
 また、vite を使ってバンドルして javascript にまとめられます。
 
 ```bash
-# dist/index.cjs, dist/index.mjs にバンドルした結果を出力
+# dist/tiny-llhls-server.js (CommonJS), dist/tiny-llhls-server.mjs (ES Modules) にバンドルした結果を出力
 yarn build
 ```
 

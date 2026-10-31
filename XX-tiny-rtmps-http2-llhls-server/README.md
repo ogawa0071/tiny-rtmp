@@ -64,7 +64,7 @@ node src/index.mts --rtmp 1935 --web 8000 --key server.key --cert server.crt --a
 また、vite を使ってバンドルして javascript にまとめられます。
 
 ```bash
-# dist/tiny-rtmps-http2-llhls-server.mjs にバンドルした結果を出力
+# dist/tiny-rtmps-http2-llhls-server.js (CommonJS), dist/tiny-rtmps-http2-llhls-server.mjs (ES Modules) にバンドルした結果を出力
 yarn build
 ```
 

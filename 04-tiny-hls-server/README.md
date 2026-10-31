@@ -27,7 +27,7 @@ node src/index.mts --app myapp --streamKey mystreamkey --bandwidth 2000000
 また、vite を使ってバンドルして javascript にまとめられます。
 
 ```bash
-# dist/index.cjs, dist/index.mjs にバンドルした結果を出力
+# dist/tiny-hls-server.js (CommonJS), dist/tiny-hls-server.mjs (ES Modules) にバンドルした結果を出力
 yarn build
 ```
 

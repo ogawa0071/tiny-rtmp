@@ -26,7 +26,7 @@ export default class BandwidthEstimator {
   private timer: NodeJS.Timeout;
   private estimates: number[] = [];
   private totalBytes: number = 0;
-  private previousTime: DOMHighResTimeStamp = performance.now();
+  private previousTime: number = performance.now(); // 前回の計測時刻 (ミリ秒、時計を合わせても巻き戻らない)
 
   public constructor(limit: number, controller: AbortController, option?: Partial<BandwidthEstimatorOption>) {
     const { intervalMillis, movingAverageLength } = BandwidthEstimatorOption.from(option);

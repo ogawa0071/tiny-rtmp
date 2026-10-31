@@ -1,5 +1,6 @@
 import { describe, expect, test, vi } from 'vitest';
-import { Duplex, PassThrough, Readable } from 'stream';
+import { Readable, duplexPair } from 'node:stream';
+import type { Duplex } from 'node:stream';
 
 import AsyncByteReader from '../../01-tiny-rtmp-server/src/async-byte-reader.mts';
 import { isAMF0Array, isAMF0Object, type AMF0Value } from '../../01-tiny-rtmp-server/src/amf0-reader.mts';
@@ -27,13 +28,12 @@ const strip = (value: AMF0Value): AMF0Value => {
 
 describe('Regression Test', () => {
   test('Publish Success', async () => {
-    const input = new PassThrough();
-    const output = new PassThrough();
-    const connection = Duplex.from({ readable: input, writable: output });
+    // duplexPair は仮想的なソケットの両端: connection をサーバ (handle_rtmp) に渡し、client 側でクライアントとして読み書きする
+    const [connection, client] = duplexPair();
     using reader = new AsyncByteReader();
-    output.on('data', (chunk) => { reader.feed(chunk); });
+    client.on('data', (chunk) => { reader.feed(chunk); });
     using writer = new MessageWriter();
-    Readable.from(writer.retrieve()).pipe(input);
+    Readable.from(writer.retrieve()).pipe(client);
 
     const auth = AuthConfiguration.simpleAuth('app', 'key');
     run(() => {
@@ -47,10 +47,10 @@ describe('Regression Test', () => {
      */
     {
       // C0/S0
-      input.write(Buffer.from([0x03]));
+      client.write(Buffer.from([0x03]));
       const c1_random = Buffer.alloc(1536 - 8);
       const c1 = Buffer.concat([Buffer.alloc(8), c1_random]);
-      input.write(c1);
+      client.write(c1);
       const s0 = await reader.read(1);
       expect(s0.equals(Buffer.from([0x03]))).toStrictEqual(true);
       // C1/S1
@@ -58,7 +58,7 @@ describe('Regression Test', () => {
       const s1_random = s1.subarray(8);
       // C2/S2
       const c2 = Buffer.concat([Buffer.alloc(8), s1_random]);
-      input.write(c2); // write S2
+      client.write(c2); // write S2
       const s2 = await reader.read(1536); // read C2
       const s2_random_echo = s2.subarray(8);
       expect(s2_random_echo.equals(c1_random)).toStrictEqual(true);
@@ -200,13 +200,11 @@ describe('Regression Test', () => {
     const auth = AuthConfiguration.simpleAuth('app', 'key');
 
     // Connection 1
-    const input_1 = new PassThrough();
-    const output_1 = new PassThrough();
-    const connection_1 = Duplex.from({ readable: input_1, writable: output_1 });
+    const [connection_1, client_1] = duplexPair();
     using reader_1 = new AsyncByteReader();
-    output_1.on('data', (chunk) => { reader_1.feed(chunk); });
+    client_1.on('data', (chunk) => { reader_1.feed(chunk); });
     using writer_1 = new MessageWriter();
-    Readable.from(writer_1.retrieve()).pipe(input_1);
+    Readable.from(writer_1.retrieve()).pipe(client_1);
 
     run(() => {
       const handler_1 = handle_rtmp(connection_1, { auth });
@@ -214,32 +212,30 @@ describe('Regression Test', () => {
     });
 
     // Connection 2
-    const input_2 = new PassThrough();
-    const output_2 = new PassThrough();
-    const connection_2 = Duplex.from({ readable: input_2, writable: output_2 });
+    const [connection_2, client_2] = duplexPair();
     using reader_2 = new AsyncByteReader();
-    output_2.on('data', (chunk) => { reader_2.feed(chunk); });
+    client_2.on('data', (chunk) => { reader_2.feed(chunk); });
     using writer_2 = new MessageWriter();
-    Readable.from(writer_2.retrieve()).pipe(input_2);
+    Readable.from(writer_2.retrieve()).pipe(client_2);
 
     run(() => {
       const handler_2 = handle_rtmp(connection_2, { auth });
       (async () => { for await (const _ of handler_2) {} })(); // do background
     });
 
-    const inout = [[input_1, reader_1, writer_1], [input_2, reader_2, writer_2]] satisfies [PassThrough, AsyncByteReader, MessageWriter][];
+    const inout = [[client_1, reader_1, writer_1], [client_2, reader_2, writer_2]] satisfies [Duplex, AsyncByteReader, MessageWriter][];
 
     for (let i = 0; i < inout.length; i++) {
-      const [input, reader, writer] = inout[i];
+      const [client, reader, writer] = inout[i];
       /*
       * Simple handshake
       */
       {
         // C0/S0
-        input.write(Buffer.from([0x03]));
+        client.write(Buffer.from([0x03]));
         const c1_random = Buffer.alloc(1536 - 8);
         const c1 = Buffer.concat([Buffer.alloc(8), c1_random]);
-        input.write(c1);
+        client.write(c1);
         const s0 = await reader.read(1);
         expect(s0.equals(Buffer.from([0x03]))).toStrictEqual(true);
         // C1/S1
@@ -247,7 +243,7 @@ describe('Regression Test', () => {
         const s1_random = s1.subarray(8);
         // C2/S2
         const c2 = Buffer.concat([Buffer.alloc(8), s1_random]);
-        input.write(c2); // write S2
+        client.write(c2); // write S2
         const s2 = await reader.read(1536); // read C2
         const s2_random_echo = s2.subarray(8);
         expect(s2_random_echo.equals(c1_random)).toStrictEqual(true);
@@ -394,13 +390,11 @@ describe('Regression Test', () => {
 
   test('Parallel Streaming for distinct StreamKey', async () => {
     // Connection 1
-    const input_1 = new PassThrough();
-    const output_1 = new PassThrough();
-    const connection_1 = Duplex.from({ readable: input_1, writable: output_1 });
+    const [connection_1, client_1] = duplexPair();
     using reader_1 = new AsyncByteReader();
-    output_1.on('data', (chunk) => { reader_1.feed(chunk); });
+    client_1.on('data', (chunk) => { reader_1.feed(chunk); });
     using writer_1 = new MessageWriter();
-    Readable.from(writer_1.retrieve()).pipe(input_1);
+    Readable.from(writer_1.retrieve()).pipe(client_1);
     const auth_1 = AuthConfiguration.simpleAuth('app', 'key0');
 
     run(() => {
@@ -409,13 +403,11 @@ describe('Regression Test', () => {
     });
 
     // Connection 2
-    const input_2 = new PassThrough();
-    const output_2 = new PassThrough();
-    const connection_2 = Duplex.from({ readable: input_2, writable: output_2 });
+    const [connection_2, client_2] = duplexPair();
     using reader_2 = new AsyncByteReader();
-    output_2.on('data', (chunk) => { reader_2.feed(chunk); });
+    client_2.on('data', (chunk) => { reader_2.feed(chunk); });
     using writer_2 = new MessageWriter();
-    Readable.from(writer_2.retrieve()).pipe(input_2);
+    Readable.from(writer_2.retrieve()).pipe(client_2);
     const auth_2 = AuthConfiguration.simpleAuth('app', 'key1');
 
     run(() => {
@@ -423,19 +415,19 @@ describe('Regression Test', () => {
       (async () => { for await (const _ of handler_2) {} })(); // do background
     });
 
-    const inout = [[input_1, reader_1, writer_1], [input_2, reader_2, writer_2]] satisfies [PassThrough, AsyncByteReader, MessageWriter][];
+    const inout = [[client_1, reader_1, writer_1], [client_2, reader_2, writer_2]] satisfies [Duplex, AsyncByteReader, MessageWriter][];
 
     for (let i = 0; i < inout.length; i++) {
-      const [input, reader, writer] = inout[i];
+      const [client, reader, writer] = inout[i];
       /*
       * Simple handshake
       */
       {
         // C0/S0
-        input.write(Buffer.from([0x03]));
+        client.write(Buffer.from([0x03]));
         const c1_random = Buffer.alloc(1536 - 8);
         const c1 = Buffer.concat([Buffer.alloc(8), c1_random]);
-        input.write(c1);
+        client.write(c1);
         const s0 = await reader.read(1);
         expect(s0.equals(Buffer.from([0x03]))).toStrictEqual(true);
         // C1/S1
@@ -443,7 +435,7 @@ describe('Regression Test', () => {
         const s1_random = s1.subarray(8);
         // C2/S2
         const c2 = Buffer.concat([Buffer.alloc(8), s1_random]);
-        input.write(c2); // write S2
+        client.write(c2); // write S2
         const s2 = await reader.read(1536); // read C2
         const s2_random_echo = s2.subarray(8);
         expect(s2_random_echo.equals(c1_random)).toStrictEqual(true);
@@ -583,13 +575,11 @@ describe('Regression Test', () => {
   });
 
   test('Publish Failed (Invalid StreamKey)', async () => {
-    const input = new PassThrough();
-    const output = new PassThrough();
-    const connection = Duplex.from({ readable: input, writable: output });
+    const [connection, client] = duplexPair();
     using reader = new AsyncByteReader();
-    output.on('data', (chunk) => { reader.feed(chunk); });
+    client.on('data', (chunk) => { reader.feed(chunk); });
     using writer = new MessageWriter();
-    Readable.from(writer.retrieve()).pipe(input);
+    Readable.from(writer.retrieve()).pipe(client);
 
     const auth = AuthConfiguration.simpleAuth('app', 'key');
     run(() => {
@@ -603,10 +593,10 @@ describe('Regression Test', () => {
      */
     {
       // C0/S0
-      input.write(Buffer.from([0x03]));
+      client.write(Buffer.from([0x03]));
       const c1_random = Buffer.alloc(1536 - 8);
       const c1 = Buffer.concat([Buffer.alloc(8), c1_random]);
-      input.write(c1);
+      client.write(c1);
       const s0 = await reader.read(1);
       expect(s0.equals(Buffer.from([0x03]))).toStrictEqual(true);
       // C1/S1
@@ -614,7 +604,7 @@ describe('Regression Test', () => {
       const s1_random = s1.subarray(8);
       // C2/S2
       const c2 = Buffer.concat([Buffer.alloc(8), s1_random]);
-      input.write(c2); // write S2
+      client.write(c2); // write S2
       const s2 = await reader.read(1536); // read C2
       const s2_random_echo = s2.subarray(8);
       expect(s2_random_echo.equals(c1_random)).toStrictEqual(true);
@@ -742,13 +732,11 @@ describe('Regression Test', () => {
   });
 
   test('Connect Rejected (Invalid AppName)', async () => {
-    const input = new PassThrough();
-    const output = new PassThrough();
-    const connection = Duplex.from({ readable: input, writable: output });
+    const [connection, client] = duplexPair();
     using reader = new AsyncByteReader();
-    output.on('data', (chunk) => { reader.feed(chunk); });
+    client.on('data', (chunk) => { reader.feed(chunk); });
     using writer = new MessageWriter();
-    Readable.from(writer.retrieve()).pipe(input);
+    Readable.from(writer.retrieve()).pipe(client);
 
     run(() => {
       const handler = handle_rtmp(connection, { auth: AuthConfiguration.simpleAuth('app', 'key') });
@@ -761,10 +749,10 @@ describe('Regression Test', () => {
      */
     {
       // C0/S0
-      input.write(Buffer.from([0x03]));
+      client.write(Buffer.from([0x03]));
       const c1_random = Buffer.alloc(1536 - 8);
       const c1 = Buffer.concat([Buffer.alloc(8), c1_random]);
-      input.write(c1);
+      client.write(c1);
       const s0 = await reader.read(1);
       expect(s0.equals(Buffer.from([0x03]))).toStrictEqual(true);
       // C1/S1
@@ -772,7 +760,7 @@ describe('Regression Test', () => {
       const s1_random = s1.subarray(8);
       // C2/S2
       const c2 = Buffer.concat([Buffer.alloc(8), s1_random]);
-      input.write(c2); // write S2
+      client.write(c2); // write S2
       const s2 = await reader.read(1536); // read C2
       const s2_random_echo = s2.subarray(8);
       expect(s2_random_echo.equals(c1_random)).toStrictEqual(true);

@@ -1,5 +1,5 @@
 import { describe, expect, test, vi } from 'vitest';
-import { Duplex, PassThrough, Readable, Writable } from 'node:stream';
+import { Readable, Writable, duplexPair } from 'node:stream';
 
 import AsyncByteReader from '../src/async-byte-reader.mts';
 import { isAMF0Array, isAMF0Object, type AMF0Value } from '../src/amf0-reader.mts';
@@ -26,13 +26,12 @@ const strip = (value: AMF0Value): AMF0Value => {
 
 describe('Regression Test', () => {
   test('Publish Success', async () => {
-    const input = new PassThrough();
-    const output = new PassThrough();
-    const connection = Duplex.from({ readable: input, writable: output });
+    // connection はサーバに渡す側、client はテストがクライアントとして読み書きする側の端点
+    const [connection, client] = duplexPair();
     using reader = new AsyncByteReader();
-    output.on('data', (chunk) => { reader.feed(chunk); });
+    client.on('data', (chunk) => { reader.feed(chunk); });
     using writer = new MessageWriter();
-    Readable.from(writer.retrieve()).pipe(input);
+    Readable.from(writer.retrieve()).pipe(client);
 
     const flv = new AsyncByteReader();
     run(() => {
@@ -49,10 +48,10 @@ describe('Regression Test', () => {
      */
     {
       // C0/S0
-      input.write(Buffer.from([0x03]));
+      client.write(Buffer.from([0x03]));
       const c1_random = Buffer.alloc(1536 - 8);
       const c1 = Buffer.concat([Buffer.alloc(8), c1_random]);
-      input.write(c1);
+      client.write(c1);
       const s0 = await reader.read(1);
       expect(s0.equals(Buffer.from([0x03]))).toStrictEqual(true);
       // C1/S1
@@ -60,7 +59,7 @@ describe('Regression Test', () => {
       const s1_random = s1.subarray(8);
       // C2/S2
       const c2 = Buffer.concat([Buffer.alloc(8), s1_random]);
-      input.write(c2); // write S2
+      client.write(c2); // write S2
       const s2 = await reader.read(1536); // read C2
       const s2_random_echo = s2.subarray(8);
       expect(s2_random_echo.equals(c1_random)).toStrictEqual(true);

@@ -40,9 +40,13 @@
 
 ## 必要環境
 
-- Node.js v24
+- Node.js v26 (LTS)
+- Yarn v1 (Classic)
+    - Node.js v25 以降には Corepack が同梱されていないので、`npm install -g yarn` などでインストールしてください
 - Yarn Workspace で開発用の依存関係を管理しています
     - プロジェクトのルートディレクトリで `yarn` を実行してください
+    - 型チェック (`yarn tsc`) には TypeScript 7 (`@typescript/native`) を使っています
+    - ESLint (typescript-eslint) がまだ TypeScript 7 に対応していないので、`typescript` には TypeScript 6 の互換パッケージ (`@typescript/typescript6`) を入れています
 
 ## 参考資料
 

@@ -3,6 +3,9 @@
   "version": "0.0.1",
   "license": "MIT",
   "private": true,
+  "engines": {
+    "node": ">=26"
+  },
   "scripts": {
     "test": "vitest",
     "test:coverage": "vitest --coverage",
@@ -27,15 +30,17 @@
     "XX-tiny-rtmps-https-hls-server",
     "XX-tiny-rtmps-http2-llhls-server",
     "XX-tiny-dash-widevine-testing-server",
-    "XX-tiny-ws-flv-server"
+    "XX-tiny-ws-flv-server",
+    "YY-tiny-stress-benchmark"
   ],
   "devDependencies": {
     "@stylistic/eslint-plugin": "^5.10.0",
-    "@types/node": "^24",
+    "@types/node": "^26",
     "@typescript-eslint/parser": "^8.58.2",
+    "@typescript/native": "npm:typescript@^7.0.2",
     "@vitest/coverage-v8": "^4.1.4",
     "eslint": "^10.2.1",
-    "typescript": "^6.0.3",
+    "typescript": "npm:@typescript/typescript6@^6.0.2",
     "vite": "^8.0.8",
     "vitest": "^4.1.4"
   }

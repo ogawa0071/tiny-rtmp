@@ -61,7 +61,7 @@ node src/index.mts --key server.key --cert server.crt --port 1935 --flv -
 また、vite を使ってバンドルして javascript にまとめられます。
 
 ```bash
-# dist/tiny-rtmps-server.mjs にバンドルした結果を出力
+# dist/tiny-rtmps-server.js (CommonJS), dist/tiny-rtmps-server.mjs (ES Modules) にバンドルした結果を出力
 yarn build
 ```
 

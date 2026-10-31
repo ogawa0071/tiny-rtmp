@@ -2,6 +2,9 @@
   "compilerOptions": {
     /* Language and Environment */
     "target": "es2025",
+    /* es2025 に含まれない Node.js 26 の組み込み API の型を追加する */
+    /* esnext.collection: Map#getOrInsertComputed, esnext.temporal: Temporal, esnext.typedarrays: Uint8Array#toHex など */
+    "lib": ["es2025", "esnext.collection", "esnext.temporal", "esnext.typedarrays"],
     "module": "NodeNext",
     "moduleResolution": "nodenext",
     /* types */

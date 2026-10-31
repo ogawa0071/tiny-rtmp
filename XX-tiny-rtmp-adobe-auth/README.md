@@ -30,7 +30,7 @@ node src/index.mts --user myuser --password mypass --flv -
 また、vite を使ってバンドルして javascript にまとめられます。
 
 ```bash
-# dist/index.cjs, dist/index.mjs にバンドルした結果を出力
+# dist/tiny-rtmp-adobe-auth.js (CommonJS), dist/tiny-rtmp-adobe-auth.mjs (ES Modules) にバンドルした結果を出力
 yarn build
 ```
 

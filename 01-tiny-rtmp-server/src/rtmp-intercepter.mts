@@ -1,5 +1,5 @@
-import { Duplex, PassThrough } from 'node:stream';
-import type { Readable } from 'node:stream';
+import { duplexPair } from 'node:stream';
+import type { Duplex, Readable } from 'node:stream';
 import AsyncByteReader from './async-byte-reader.mts';
 import read_message from './message-reader.mts';
 import { logger } from './logger.mts';
@@ -49,15 +49,15 @@ const dump = async (stream: Readable, direction: string, handshake_prefix: 'C' |
 };
 
 export default (duplex: Duplex): Duplex => {
-  const input = new PassThrough();
-  const output = new PassThrough();
-  const proxy = Duplex.from({ readable: input, writable: output });
+  // duplexPair は仮想的なソケットの両端を作る (片方に書いたものがもう片方から読める)
+  // サーバの処理には proxy を渡し、relay と本物の接続 (duplex) の間でデータを中継する
+  const [proxy, relay] = duplexPair();
 
-  void dump(input, 'CLIENT -> SERVER', 'C');
-  void dump(output, 'SERVER -> CLIENT', 'S');
+  void dump(duplex, 'CLIENT -> SERVER', 'C');
+  void dump(relay, 'SERVER -> CLIENT', 'S');
 
-  duplex.pipe(input);
-  output.pipe(duplex);
+  duplex.pipe(relay);
+  relay.pipe(duplex);
 
   return proxy;
 };
