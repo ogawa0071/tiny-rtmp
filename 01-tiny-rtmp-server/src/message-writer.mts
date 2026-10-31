@@ -116,10 +116,9 @@ export default class MessageWriter {
     if (is_system_message(message)) { return 2; }
 
     // システムのメッセージ以外は Message Stream ID, Message Type ID, track ごとに cs_id を割り当てる
+    // まだ割り当てていない組み合わせの時だけコールバックが呼ばれ、新しい cs_id を払い出す
     const key = `${message.message_stream_id}/${message.message_type_id}/${message.track ?? 0}`;
-    const cs_id = this.cs_id_map.get(key) ?? this.next_cs_id++;
-    this.cs_id_map.set(key, cs_id);
-    return cs_id;
+    return this.cs_id_map.getOrInsertComputed(key, () => this.next_cs_id++);
   }
 
   private build_chunk(message: SendingMessage, length: number): Buffer {
@@ -218,9 +217,8 @@ export default class MessageWriter {
       offset: 0,
     } satisfies SendingMessage;
 
-    const queue = this.sending_cs_id_queues.get(cs_id) ?? new Queue<SendingMessage>();
+    const queue = this.sending_cs_id_queues.getOrInsertComputed(cs_id, () => new Queue<SendingMessage>());
     queue.push(sending);
-    this.sending_cs_id_queues.set(cs_id, queue);
     if (is_input_order_sensitive(sending)) {
       this.sending_ordering_queue.push(sending);
     }

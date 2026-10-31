@@ -71,11 +71,13 @@ export default async function* read_message(reader: AsyncByteReader, option?: Me
       case 0: cs_id = 64 + await reader.readU8(); break; // 2 byte 形式
       case 1: cs_id = 64 + await reader.readU16LE(); break; // 3 byte 形式
     }
-    if (fmt !== 3 || !chunks.has(cs_id)) {
+    // fmt 0/1/2 は新しいメッセージの先頭チャンクなので、受信途中のメッセージがあれば捨てる
+    if (fmt !== 3) {
       buffered -= chunks.get(cs_id)?.byteLength() ?? 0;
-      chunks.set(cs_id, new ByteBuilder());
+      chunks.delete(cs_id);
     }
-    const chunk_builder = chunks.get(cs_id)!;
+    // 受信途中のメッセージがあればその続きに、なければ新しいメッセージとして組み立てる
+    const chunk_builder = chunks.getOrInsertComputed(cs_id, () => new ByteBuilder());
 
     // Chunk Message Header (fmt によって省略されたフィールドは、同じ cs_id の前回の値を引き継ぐ)
     let information = informations.get(cs_id);

@@ -37,12 +37,12 @@ const flat = (obj: unknown): string => {
   });
 };
 
+// 実行環境のタイムゾーンでの現在日時を 2026/10/30 21:05:09.123 の形式で返す
 const datetime = (): string => {
-  const date = new Date();
-  const pad = (value: number, length: number = 2) => value.toString().padStart(length, '0');
-  const date_string = `${date.getFullYear()}/${date.getMonth() + 1}/${date.getDate()}`;
-  const time_string = `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}.${pad(date.getMilliseconds(), 3)}`;
-  return `${date_string} ${time_string}`;
+  const now = Temporal.Now.plainDateTimeISO();
+  // 時刻は ISO 8601 形式 (ゼロ埋めされた HH:mm:ss.sss) を、ミリ秒までに切り詰めて使う
+  const time = now.toPlainTime().toString({ smallestUnit: 'millisecond' });
+  return `${now.year}/${now.month}/${now.day} ${time}`; // Temporal の month は 1 始まり
 };
 
 type Level = keyof typeof LogLevel;
