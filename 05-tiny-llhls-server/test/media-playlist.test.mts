@@ -3,9 +3,10 @@ import { describe, expect, test } from 'vitest';
 import { PlaylistTimestamp } from '../../04-tiny-hls-server/src/playlist-timestamp.mts';
 import MediaPlaylist from '../src/media-playlist.mts';
 
-// fps の映像 (keyint フレームごとにキーフレーム) を frames フレーム分だけプレイリストに入れる
-const publish = (playlist: MediaPlaylist, fps: number, keyint: number, frames: number): void => {
+// fps の映像 (keyint フレームごとにキーフレーム) を frames フレーム分だけプレイリストに入れる (dropped が true になるフレームは欠けている)
+const publish = (playlist: MediaPlaylist, fps: number, keyint: number, frames: number, dropped: (i: number) => boolean = () => false): void => {
   for (let i = 0; i < frames; i++) {
+    if (dropped(i)) { continue; }
     const timestamp = PlaylistTimestamp.fromRTMP(Math.round(i * 1000 / fps)); // RTMP の timestamp はミリ秒
     const keyframe = i % keyint === 0;
     if (keyframe) { playlist.append(timestamp); }
@@ -35,23 +36,83 @@ const preload = (m3u8: string): [msn: number, part: number] => {
   return [Number(msn), Number(part)];
 };
 
-describe('Partial Segment', () => {
-  test.each([
-    ['30 fps', 30],
-    ['29.97 fps', 30000 / 1001],
-    ['25 fps', 25],
-  ])('%s: every part is at most PART-TARGET and the parts add up to the segment', (_, fps) => {
-    const playlist = new MediaPlaylist({ partialSegmentDuration: 1 });
-    publish(playlist, fps, 30, 30 * 8);
+// プレイリストの PART-TARGET (秒)
+const partTarget = (m3u8: string): number => {
+  return Number(/#EXT-X-PART-INF:PART-TARGET=([\d.]+)/.exec(m3u8)![1]);
+};
 
-    const list = segments(playlist.m3u8());
+describe('Partial Segment', () => {
+  // NTSC のフレームレート (29.97, 59.94, 23.976 fps) では、ミリ秒に丸めた timestamp の間隔が 1 ミリ秒ずつ揺れる
+  test.each([
+    ['30 fps, 1 s GOP, PART-TARGET 1', 30, 30, 1],
+    ['29.97 fps, 1 s GOP, PART-TARGET 1', 30000 / 1001, 30, 1],
+    ['25 fps, 2 s GOP, PART-TARGET 1', 25, 50, 1],
+    ['29.97 fps, 2 s GOP, PART-TARGET 0.5', 30000 / 1001, 60, 0.5],
+    ['29.97 fps, 2 s GOP, PART-TARGET 0.3', 30000 / 1001, 60, 0.3],
+    ['59.94 fps, 2 s GOP, PART-TARGET 1', 60000 / 1001, 120, 1],
+    ['23.976 fps, 2 s GOP, PART-TARGET 1', 24000 / 1001, 48, 1],
+  ])('%s: every part is at most PART-TARGET and the parts add up to the segment', (_, fps, keyint, target) => {
+    const playlist = new MediaPlaylist({ partialSegmentDuration: target });
+    publish(playlist, fps, keyint, keyint * 6);
+
+    const m3u8 = playlist.m3u8();
+    // どれもフレームの境目で 85% 以上に区切れるので、指定の PART-TARGET のまま
+    expect(partTarget(m3u8)).toStrictEqual(target);
+    const list = segments(m3u8);
     expect(list.length).toBeGreaterThan(0);
     for (const { parts, extinf } of list) {
       for (const duration of parts) {
         expect(duration).toBeGreaterThan(0);
-        expect(duration).toBeLessThanOrEqual(1);
+        expect(duration).toBeLessThanOrEqual(target);
       }
       expect(parts.reduce((total, duration) => total + duration, 0)).toBeCloseTo(extinf, 6);
+    }
+  });
+
+  test('a frame after a dropped frame does not make the part longer than PART-TARGET', () => {
+    const playlist = new MediaPlaylist({ partialSegmentDuration: 1 });
+    // 30 fps の映像 (60 フレームごとにキーフレーム) で、各 GOP の 1 秒の位置のフレームが欠けている (エンコードが間に合わなかった時など)
+    publish(playlist, 30, 60, 60 * 6, (i) => i % 60 === 30);
+
+    const list = segments(playlist.m3u8());
+    expect(list.length).toBeGreaterThan(0);
+    for (const { parts } of list) {
+      for (const duration of parts) {
+        expect(duration).toBeLessThanOrEqual(1);
+      }
+    }
+  });
+
+  test('a part that has reached PART-TARGET is completed without waiting for the next frame', () => {
+    const playlist = new MediaPlaylist({ partialSegmentDuration: 0.5 });
+    // 作成中のセグメントの最後に届いたフレームは、0.5 秒の位置のフレーム
+    publish(playlist, 30, 60, 60 * 4 + 16);
+
+    // このフレームはどれだけ長くても 0 番のパーシャルセグメントには入らないので、0 番はもう完成している
+    const [, part] = preload(playlist.m3u8());
+    expect(part).toStrictEqual(1);
+  });
+
+  test.each([
+    ['23.976 fps', 24000 / 1001, 48],
+    ['15 fps', 15, 30],
+    ['10 fps', 10, 20],
+  ])('%s with a 0.25 s PART-TARGET: PART-TARGET is adjusted so that parts are at least 85% of it', (_, fps, keyint) => {
+    const playlist = new MediaPlaylist({ partialSegmentDuration: 0.25 });
+    publish(playlist, fps, keyint, keyint * 8);
+
+    const m3u8 = playlist.m3u8();
+    const target = partTarget(m3u8);
+    const list = segments(m3u8);
+    expect(list.length).toBeGreaterThan(0);
+    for (const { parts } of list) {
+      for (const duration of parts) {
+        expect(duration).toBeLessThanOrEqual(target);
+      }
+      // 最初のパーシャルセグメント (キーフレームから始まるので INDEPENDENT=YES) とセグメントの最後のパーシャルセグメントは除く (RFC 8216bis 4.4.4.9)
+      for (const duration of parts.slice(1, -1)) {
+        expect(duration).toBeGreaterThanOrEqual(0.85 * target);
+      }
     }
   });
 

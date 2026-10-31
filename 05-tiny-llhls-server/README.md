@@ -58,3 +58,5 @@ http://localhost:8000/myapp/mystreamkey/{番号}.ts
 ```
 http://localhost:8000/myapp/mystreamkey/{セグメント番号}_{パート番号}.ts
 ```
+
+パーシャルセグメントは映像のフレームの境目で区切ります。パーシャルセグメントは PART-TARGET 以下で、INDEPENDENT=YES のものとセグメントの最後のもの以外は PART-TARGET の 85% 以上でなければならない (RFC 8216bis 4.4.4.9) ので、`--partDuration` がフレームの長さの整数倍に近くない時は、PART-TARGET を実際に区切った長さに合わせます (例: 15 fps で `--partDuration 0.25` なら、3 フレーム (0.2 秒) ごとに区切って PART-TARGET を 0.201 秒にします)。
