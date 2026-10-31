@@ -58,8 +58,11 @@ export default (duplex: Duplex): Duplex => {
 
   duplex.pipe(relay);
   relay.pipe(duplex);
-  // 本物の接続が閉じたら (切断や RST など)、サーバに渡した proxy も閉じてセッションを終わらせる
+  // 本物の接続が閉じたら、サーバに渡した proxy も閉じてセッションを終わらせる (pipe は close を伝えない)
   duplex.on('close', () => { proxy.destroy(); });
+  // 本物の接続のエラー (RST による ECONNRESET など) も proxy に伝える
+  // (pipe は自分のリスナーを外してエラーを投げ直すので、誰も受け取らないとプロセスごと落ちる)
+  duplex.on('error', (error) => { proxy.destroy(error); });
 
   return proxy;
 };

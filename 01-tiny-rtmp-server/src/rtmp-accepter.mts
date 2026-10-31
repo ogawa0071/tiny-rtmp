@@ -330,7 +330,10 @@ export default async (connection: Duplex, auth: AuthConfiguration, open_output?:
       }
       if (writer == null) { continue; }
       base ??= message.timestamp;
-      const timestamp = Math.max(0, message.timestamp - base); // 最初のタグより前の時刻は 0 に揃える
+      // RTMP の timestamp は 32bit で一周するので、差も 2^32 で一周させて求める
+      // 32bit の符号付き整数として負になる差 (最初のタグより前の時刻) は 0 に揃える
+      const elapsed = (message.timestamp - base + 2 ** 32) % 2 ** 32;
+      const timestamp = elapsed < 2 ** 31 ? elapsed : 0;
 
       switch (message.message_type_id) {
         case MessageType.Audio:

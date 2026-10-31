@@ -68,7 +68,7 @@ const handle = async (connection: Duplex) => {
   let onMetaData: Buffer | null = null;
   let avcConfig: Buffer | null = null;
   let aacConfig: Buffer | null = null;
-  // FLV Header に書く、音声・映像があるかどうか (onMetaData が届くまでは両方あるとみなす)
+  // FLV Header に書く、音声・映像を送るかどうか (onMetaData が届くまでは両方あるとみなす)
   let has_audio = true;
   let has_video = true;
   let published = false;
@@ -107,8 +107,10 @@ const handle = async (connection: Duplex) => {
           // FLV には @setDataFrame を除いた onMetaData を書き込む
           tag = write_flv_tag({ ... message, data: write_amf0(name, metadata) });
           onMetaData = tag;
-          has_audio = metadata.audiocodecid != null;
-          has_video = metadata.videocodecid != null;
+          // 中継するのは AAC (SoundFormat: 10) と AVC (CodecID: 7) だけなので、それ以外のコーデックなら送らないことを伝える
+          // (コーデックを 'mp4a' や 'avc1' の文字列で書く配信ソフトもある)
+          has_audio = metadata.audiocodecid === 10 || metadata.audiocodecid === 'mp4a';
+          has_video = metadata.videocodecid === 7 || metadata.videocodecid === 'avc1';
           break;
         }
         default: continue;
