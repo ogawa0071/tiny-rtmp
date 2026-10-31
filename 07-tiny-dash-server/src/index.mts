@@ -116,10 +116,11 @@ const web_server = http.createServer((req, res) => {
     res.end(body);
   };
 
-  const url = new URL(req.url ?? '/', `http://localhost:${web}`);
+  // new URL は解析できない URL (例: //[) だと例外を投げてサーバごと落ちるので、代わりに null を返す URL.parse を使う
+  const url = URL.parse(req.url ?? '/', `http://localhost:${web}`);
   const directory = `/${app}/${streamKey}/`;
   const generator = rtmp_to_dash;
-  if (!(req.method === 'GET' && url.pathname.startsWith(directory)) || generator == null) {
+  if (url == null || !(req.method === 'GET' && url.pathname.startsWith(directory)) || generator == null) {
     respond(404, {});
     return;
   }
@@ -133,16 +134,17 @@ const web_server = http.createServer((req, res) => {
     respond(200, { 'content-type': 'application/dash+xml', 'cache-control': 'max-age=0' }, generator.mpd());
     return;
   }
-  // 初期化セグメントは {video|audio}_init.mp4, セグメントは {video|audio}_{番号}.m4s
-  const mp4 = /^(video|audio)_(?:init\.mp4|(\d+)\.m4s)$/.exec(filename);
+  // 初期化セグメントは {video|audio}_{session}_init.mp4, セグメントは {video|audio}_{session}_{番号}.m4s
+  // (session は配信ごとに変わるので、前の配信で同じ URL をキャッシュした視聴者にも今の配信の中身が届く)
+  const mp4 = /^(video|audio)_(\d+)_(?:init\.mp4|(\d+)\.m4s)$/.exec(filename);
   if (mp4 != null) {
-    const [, type, msn] = mp4;
-    const segment = msn == null ? generator.initialize(type) : generator.segment(type, Number.parseInt(msn, 10));
+    const [, type, session, msn] = mp4;
+    const segment = session !== generator.session ? null : msn == null ? generator.initialize(type) : generator.segment(type, Number.parseInt(msn, 10));
     if (segment == null) {
       respond(404, { 'cache-control': 'max-age=0' });
       return;
     }
-    respond(200, { 'content-type': 'video/mp4', 'cache-control': `max-age=${maxage}` }, segment);
+    respond(200, { 'content-type': `${type}/mp4`, 'cache-control': `max-age=${maxage}` }, segment);
     return;
   }
 

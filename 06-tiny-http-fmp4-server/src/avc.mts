@@ -467,8 +467,10 @@ export const write_mp4_avc_track_information = (track_id: number, timescale: num
   const sps = SequenceParameterSets[0];
   const { resolution, vui_parameters: { source_aspect_ratio } } = read_seq_parameter_set_data(strip_nal_unit_header(sps));
 
+  // SAR が未定義 (aspect_ratio_idc が 0 や予約値、sar_width か sar_height が 0) の時は 1:1 とみなす
+  const [sar_width, sar_height] = source_aspect_ratio.every((value) => Number.isInteger(value) && value > 0) ? source_aspect_ratio : [1, 1];
   const presentation = [
-    Math.floor(resolution[0] * source_aspect_ratio[0] / source_aspect_ratio[1]),
+    Math.floor(resolution[0] * sar_width / sar_height),
     resolution[1],
   ];
 

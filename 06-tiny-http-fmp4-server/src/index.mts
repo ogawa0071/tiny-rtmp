@@ -78,13 +78,14 @@ const handle = async (connection: Duplex) => {
 
       for (const viewer of viewers) {
         // 視聴を始めた視聴者には、最初に初期化セグメントを送る
+        // 映像は、キーフレームから送り始める (それより前のフレームは、参照するフレームがないのでデコードできない)
         if (!viewer.initialized) {
           const initialize = rtmp_to_fmp4.initialize();
-          if (initialize == null) { continue; }
+          if (initialize == null || !fragment.independent) { continue; }
           viewer.write(initialize);
           viewer.initialized = true;
         }
-        viewer.write(fragment);
+        viewer.write(fragment.data);
       }
     }
   } catch (e) {
@@ -103,16 +104,19 @@ const rtmp_server = net.createServer({ noDelay: true }, (connection) => {
 rtmp_server.listen(port);
 
 const web_server = http.createServer({ highWaterMark }, (req, res) => {
-  const url = new URL(req.url ?? '/', `http://localhost:${web}`);
-  if (!(req.method === 'GET' && url.pathname === `/${app}/${streamKey}`)) {
+  // new URL は解析できない URL (例: //[) だと例外を投げてサーバごと落ちるので、代わりに null を返す URL.parse を使う
+  const url = URL.parse(req.url ?? '/', `http://localhost:${web}`);
+  if (url == null || !(req.method === 'GET' && url.pathname === `/${app}/${streamKey}`)) {
     res.writeHead(404, { 'access-control-allow-origin': '*' });
     res.end();
     return;
   }
+  // データは初期化セグメントが揃ってから (映像のキーフレームから) 送るので、レスポンスヘッダだけ先に送る
   res.writeHead(200, {
-    'content-type': 'application/octet-stream',
+    'content-type': 'video/mp4',
     'access-control-allow-origin': '*',
   });
+  res.flushHeaders();
 
   const viewer: Viewer = {
     write: (chunk: Buffer) => {

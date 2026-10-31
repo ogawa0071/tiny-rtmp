@@ -240,8 +240,10 @@ export const write_mp4_avc_track_information = (track_id: number, timescale: num
   const sps = SequenceParameterSets[0];
   const { resolution, vui_parameters: { source_aspect_ratio } } = read_seq_parameter_set_data(strip_nal_unit_header(sps));
 
+  // SAR が未定義 (aspect_ratio_idc が 0 や予約値、sar_width か sar_height が 0) の時は 1:1 とみなす
+  const [sar_width, sar_height] = source_aspect_ratio.every((value) => Number.isInteger(value) && value > 0) ? source_aspect_ratio : [1, 1];
   const presentation = [
-    Math.floor(resolution[0] * source_aspect_ratio[0] / source_aspect_ratio[1]),
+    Math.floor(resolution[0] * sar_width / sar_height),
     resolution[1],
   ];
 
@@ -261,12 +263,25 @@ export const write_mp4_avc_track_information = (track_id: number, timescale: num
   });
 };
 
+// NAL Unit Header と slice_header のバイト数 (avcC にない PPS を参照しているなど、読めなければ null)
+const slice_header_bytes = (nalu: Buffer, parameterSets: ParameterSets): number | null => {
+  try {
+    const nalu_header = read_nal_unit_header(nalu);
+    const bit_reader = new EBSPBitReader(nalu.subarray(nalu_header.consumed_bytes));
+    skip_slice_header(nalu_header, bit_reader, parameterSets);
+    return nalu_header.consumed_bytes + Math.ceil(bit_reader.consumedBits() / 8);
+  } catch {
+    return null;
+  }
+};
+
 // NAL Unit ごとに Sub-Sample Encryption する
-// VCL NAL Unit (映像のスライス) は NAL Unit Header と slice_header を平文で残し、残りを encrypt で暗号化する
-// それ以外の NAL Unit (SPS/PPS/SEI など) は全て平文で残す
-const encrypt_subsamples = (sizedNalus: Buffer, avcDecoderConfigurationRecord: AVCDecoderConfigurationRecord, encrypt: (data: Buffer) => Buffer): [Buffer, SubsampleInformation[]] => {
+// slice_header を持つ VCL NAL Unit (映像のスライス) は NAL Unit Header と slice_header を平文で残し、残りを encrypt で暗号化する
+// それ以外の NAL Unit (SPS/PPS/SEI や slice_header を持たない Data Partition B/C など) は全て平文で残す
+// align が true なら BytesOfProtectedData を 16 byte の倍数にする (cenc は CMAF でそう決まっている)
+// parameterSets はサンプルの中で送られてきた (in-band の) SPS/PPS で更新する
+const encrypt_subsamples = (sizedNalus: Buffer, avcDecoderConfigurationRecord: AVCDecoderConfigurationRecord, parameterSets: ParameterSets, align: boolean, encrypt: (data: Buffer) => Buffer): [Buffer, SubsampleInformation[]] => {
   const naluLengthSize = avcDecoderConfigurationRecord.lengthSize;
-  const parameterSets = read_parameter_sets(avcDecoderConfigurationRecord);
   const builder = new ByteBuilder();
   const nalu_reader = new ByteReader(sizedNalus);
 
@@ -275,17 +290,28 @@ const encrypt_subsamples = (sizedNalus: Buffer, avcDecoderConfigurationRecord: A
     const length = nalu_reader.readUIntBE(naluLengthSize);
     const nalu = nalu_reader.read(length);
 
-    const nalu_header = read_nal_unit_header(nalu);
-    const { nal_unit_type, consumed_bytes } = nalu_header;
-    const isVCL = 1 <= nal_unit_type && nal_unit_type <= 5;
+    // slice_header を持つのは nal_unit_type 1 (non-IDR), 2 (Data Partition A), 5 (IDR)
+    const nal_unit_type = length > 0 ? nalu[0] & 0x1F : 0;
+    const hasSliceHeader = nal_unit_type === 1 || nal_unit_type === 2 || nal_unit_type === 5;
+    const headerBytes = hasSliceHeader ? slice_header_bytes(nalu, parameterSets) : null;
+    try {
+      if (nal_unit_type === 7) {
+        const sps = read_seq_parameter_set_data(strip_nal_unit_header(nalu));
+        parameterSets.spss = [sps, ... parameterSets.spss.filter(({ seq_parameter_set_id }) => seq_parameter_set_id !== sps.seq_parameter_set_id)];
+      } else if (nal_unit_type === 8) {
+        const pps = read_pic_parameter_set_data(strip_nal_unit_header(nalu));
+        parameterSets.ppss = [pps, ... parameterSets.ppss.filter(({ pic_parameter_set_id }) => pic_parameter_set_id !== pps.pic_parameter_set_id)];
+      }
+    } catch {
+      // 読めない SPS/PPS は使わない
+    }
 
     builder.writeUIntBE(length, naluLengthSize);
-    if (isVCL) {
+    if (headerBytes != null) {
       // CENCv3 から slice_header は clear である必要がある
       // CENCv1 では そのような記載がないため nal header くらいがあれば十分
-      const bit_reader = new EBSPBitReader(nalu.subarray(consumed_bytes));
-      skip_slice_header(nalu_header, bit_reader, parameterSets);
-      const clearBytes = consumed_bytes + Math.ceil(bit_reader.consumedBits() / 8);
+      // 16 byte に満たない端数は slice_header の後ろの平文に含める
+      const clearBytes = headerBytes + (align ? (length - headerBytes) % 16 : 0);
       const encrypted = encrypt(nalu.subarray(clearBytes));
       builder.write(nalu.subarray(0, clearBytes));
       builder.write(encrypted);
@@ -303,21 +329,21 @@ const encrypt_subsamples = (sizedNalus: Buffer, avcDecoderConfigurationRecord: A
   return [builder.build(), subsamples];
 };
 
-export const encrypt_avc_cenc = (format: EncryptionFormatCENC, key: Buffer, iv: Buffer, sizedNalus: Buffer, avcDecoderConfigurationRecord: AVCDecoderConfigurationRecord): [Buffer, SubsampleInformation[]] => {
+export const encrypt_avc_cenc = (format: EncryptionFormatCENC, key: Buffer, iv: Buffer, sizedNalus: Buffer, avcDecoderConfigurationRecord: AVCDecoderConfigurationRecord, parameterSets: ParameterSets = read_parameter_sets(avcDecoderConfigurationRecord)): [Buffer, SubsampleInformation[]] => {
   // IV のビット数が少ない場合は 0 埋めして合わせる
   iv = padIV(format, iv);
   // cenc (AES-CTR) では、1 つのサンプル内の暗号化部分を連続した 1 つのストリームとして暗号化する
   const cipher = crypto.createCipheriv(format.algorithm, key, iv);
-  return encrypt_subsamples(sizedNalus, avcDecoderConfigurationRecord, (data) => cipher.update(data));
+  return encrypt_subsamples(sizedNalus, avcDecoderConfigurationRecord, parameterSets, true, (data) => cipher.update(data));
 };
 
-export const encrypt_avc_cbcs = (format: EncryptionFormatCBCS, key: Buffer, iv: Buffer, sizedNalus: Buffer, avcDecoderConfigurationRecord: AVCDecoderConfigurationRecord): [Buffer, SubsampleInformation[]] => {
+export const encrypt_avc_cbcs = (format: EncryptionFormatCBCS, key: Buffer, iv: Buffer, sizedNalus: Buffer, avcDecoderConfigurationRecord: AVCDecoderConfigurationRecord, parameterSets: ParameterSets = read_parameter_sets(avcDecoderConfigurationRecord)): [Buffer, SubsampleInformation[]] => {
   // IV のビット数が少ない場合は 0 埋めして合わせる
   iv = padIV(format, iv);
   const [crypt, skip] = format.pattern;
   // cbcs (AES-CBC) では、Sub-Sample ごとに IV から暗号化し直し、
   // 16 byte のブロック単位で crypt 個を暗号化して skip 個を平文で残すパターンを繰り返す (余りの 16 byte 未満は平文)
-  return encrypt_subsamples(sizedNalus, avcDecoderConfigurationRecord, (data) => {
+  return encrypt_subsamples(sizedNalus, avcDecoderConfigurationRecord, parameterSets, false, (data) => {
     const cipher = crypto.createCipheriv(format.algorithm, key, iv);
     const builder = new ByteBuilder();
     for (let offset = 0; offset < data.byteLength; offset += format.bytes) {
@@ -329,9 +355,9 @@ export const encrypt_avc_cbcs = (format: EncryptionFormatCBCS, key: Buffer, iv: 
   });
 };
 
-export const encrypt_avc = (format: EncryptionFormat, key: Buffer, iv: Buffer, sizedNalus: Buffer, avcDecoderConfigurationRecord: AVCDecoderConfigurationRecord): [Buffer, SubsampleInformation[]] => {
+export const encrypt_avc = (format: EncryptionFormat, key: Buffer, iv: Buffer, sizedNalus: Buffer, avcDecoderConfigurationRecord: AVCDecoderConfigurationRecord, parameterSets?: ParameterSets): [Buffer, SubsampleInformation[]] => {
   switch (format.scheme) {
-    case EncryptionScheme.CENC: return encrypt_avc_cenc(format, key, iv, sizedNalus, avcDecoderConfigurationRecord);
-    case EncryptionScheme.CBCS: return encrypt_avc_cbcs(format, key, iv, sizedNalus, avcDecoderConfigurationRecord);
+    case EncryptionScheme.CENC: return encrypt_avc_cenc(format, key, iv, sizedNalus, avcDecoderConfigurationRecord, parameterSets);
+    case EncryptionScheme.CBCS: return encrypt_avc_cbcs(format, key, iv, sizedNalus, avcDecoderConfigurationRecord, parameterSets);
   }
 };

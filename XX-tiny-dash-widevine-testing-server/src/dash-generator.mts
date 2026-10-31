@@ -14,9 +14,9 @@ import SegmentTimeline from '../../07-tiny-dash-server/src/segment-timeline.mts'
 import { serializeXML, XMLNode } from '../../07-tiny-dash-server/src/xml.mts';
 import { aacMimeTypeCodec, avcMimeTypeCodec } from '../../07-tiny-dash-server/src/mimetype.mts';
 
-import { encrypt_avc, write_mp4_avc_track_information } from '../../08-tiny-dash-cenc-server/src/avc.mts';
+import { encrypt_avc, read_parameter_sets, write_mp4_avc_track_information, type ParameterSets } from '../../08-tiny-dash-cenc-server/src/avc.mts';
 import { encrypt_aac, write_mp4_aac_track_information } from '../../08-tiny-dash-cenc-server/src/aac.mts';
-import { EncryptionFormat, fragment, IVType, pssh } from '../../08-tiny-dash-cenc-server/src/cenc.mts';
+import { EncryptionFormat, EncryptionScheme, fragment, IVType, pssh } from '../../08-tiny-dash-cenc-server/src/cenc.mts';
 
 type VideoInformation = {
   type: number;
@@ -27,14 +27,20 @@ type VideoInformation = {
 
 const RTMP_TIMESCALE = 1000;
 const AAC_SAMPLES_PER_FRAME = 1024;
+const WIDEVINE_SYSTEM_ID = Buffer.from('edef8ba9-79d6-4ace-a3c8-27dcd51d21ed'.replaceAll('-', ''), 'hex');
+const WIDEVINE_PSSH_DATA = Buffer.from('CAESEJA1GVFoa14boiJDns7B8SoaDXdpZGV2aW5lX3Rlc3QiASo', 'base64'); // テスト用の PSSH (Protocol Buffers のデータ)
 
 export default class DASHGenerator {
   private avcDecoderConfigurationRecord: Buffer | null = null;
+  private parameterSets: ParameterSets | null = null; // slice_header を読むのに使う SPS/PPS (映像データの中で送られてきたものも含む)
   private audioSpecificConfig: Buffer | null = null;
   private onMetadata: AMF0Object | null = null;
 
   private previousVideoInformation: VideoInformation | null = null;
   private aacLatestTimestamp: number | null = null;
+  // moof の sequence_number (Representation ごとに 1 から増やす)
+  private videoSequenceNumber = 0;
+  private audioSequenceNumber = 0;
 
   private liveWindowLength: number;
   private videoTimeline: SegmentTimeline | null = null;
@@ -46,18 +52,37 @@ export default class DASHGenerator {
   private keyId: Buffer;
   private key: Buffer;
 
-  private avail = new Date().toISOString();
+  // availabilityStartTime は RTMP の timestamp が 0 になる時刻 (最初のメディアが届いた時に決める)
+  private availabilityStartTime: Temporal.Instant | null = null;
+  // 配信ごとに変わる値 (配信をやり直すと同じ URL で中身が変わらないように、セグメントの URL に含める)
+  // (初期化セグメントには暗号化の IV なども入るので、前の配信のものがキャッシュから使われると復号できない)
+  public readonly session = `${Date.now()}`;
 
   public constructor(format: EncryptionFormat, keyId: Buffer, key: Buffer, liveWindowLength: number = 3) {
     this.liveWindowLength = liveWindowLength;
     this.encryptionFormat = format;
     this.ivSize = this.encryptionFormat.bytes;
-    this.ivType = {
+    // cenc (AES-CTR) はサンプルごとに乱数で作った IV (Per-Sample IV) を使い、senc に書く
+    // cbcs (AES-CBC) は全てのサンプルで同じ IV (Constant IV) を使い、tenc に書く (cbcs を使う Apple や Firefox などは Constant IV を前提にしている)
+    this.ivType = format.scheme === EncryptionScheme.CENC ? {
       type: IVType.PER_SAMPLE,
       per_sample_iv_size: this.ivSize,
+    } : {
+      type: IVType.CONSTANT,
+      constant_iv: crypto.randomBytes(this.ivSize),
     };
     this.keyId = keyId;
     this.key = key;
+  }
+
+  // 暗号化されていることと、その方式 (cenc/cbcs) と鍵の ID (tenc の default_KID と同じ) を示す (DASH-IF IOP 7.7.2)
+  private mp4protection(): XMLNode {
+    const kid = this.keyId.toString('hex');
+    return XMLNode.from('ContentProtection', {
+      schemeIdUri: 'urn:mpeg:dash:mp4protection:2011',
+      value: this.encryptionFormat.scheme,
+      'cenc:default_KID': `${kid.slice(0, 8)}-${kid.slice(8, 12)}-${kid.slice(12, 16)}-${kid.slice(16, 20)}-${kid.slice(20)}`,
+    });
   }
 
   public mpd(): string {
@@ -71,12 +96,19 @@ export default class DASHGenerator {
       'xsi:schemaLocation': 'urn:mpeg:dash:schema:mpd:2011 http://standards.iso.org/ittf/PubliclyAvailableStandards/MPEG-DASH_schema_files/DASH-MPD.xsd',
       profiles: 'urn:mpeg:dash:profile:isoff-live:2011',
       type: 'dynamic',
-      availabilityStartTime: this.avail,
-      publishTime: new Date().toISOString(),
+      availabilityStartTime: (this.availabilityStartTime ?? Temporal.Now.instant()).toString({ smallestUnit: 'millisecond' }),
+      publishTime: Temporal.Now.instant().toString({ smallestUnit: 'millisecond' }),
       minimumUpdatePeriod: 'PT1S',
       minBufferTime: 'PT2S',
     });
-    const period = XMLNode.from('Period', { start: 'PT0S' });
+    // type="dynamic" の MPD では Period@id が必須
+    const period = XMLNode.from('Period', { id: '0', start: 'PT0S' });
+    // Widevine の初期化データ (cenc:pssh) は、初期化セグメントの pssh box (同じ KID) を base64 にしたもの
+    const widevine_protection = XMLNode.from('ContentProtection', {
+      schemeIdUri: 'urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed',
+    }, [
+      XMLNode.from('cenc:pssh', {}, [make((vector) => { pssh(WIDEVINE_SYSTEM_ID, [this.keyId], WIDEVINE_PSSH_DATA, vector); }).toString('base64')]),
+    ]);
 
     if (this.onMetadata?.videocodecid != null && this.avcDecoderConfigurationRecord != null && this.videoTimeline != null) {
       const avcDecoderConfigurationRecord = read_avc_decoder_configuration_record(this.avcDecoderConfigurationRecord);
@@ -85,16 +117,12 @@ export default class DASHGenerator {
         mimeType: 'video/mp4',
       });
 
-      const widevine_protection = XMLNode.from('ContentProtection', {
-        schemeIdUri: 'urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed',
-      }, [
-        XMLNode.from('cenc:pssh', {}, ['AAAANHBzc2gAAAAA7e+LqXnWSs6jyCfc1R0h7QAAABQSEOtngrvLNF6Wu89hZjDxo9o=']),
-      ]);
-      video_adaptationset.children.push(widevine_protection);
+      video_adaptationset.children.push(this.mp4protection(), widevine_protection);
 
       const video_representation = XMLNode.from('Representation', {
         id: '1',
         codecs: avcMimeTypeCodec(avcDecoderConfigurationRecord),
+        bandwidth: `${this.videoTimeline.bandwidth()}`, // Representation@bandwidth は必須
       });
 
       video_representation.children.push(this.videoTimeline.segment_template());
@@ -109,16 +137,12 @@ export default class DASHGenerator {
         mimeType: 'audio/mp4',
       });
 
-      const widevine_protection = XMLNode.from('ContentProtection', {
-        schemeIdUri: 'urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed',
-      }, [
-        XMLNode.from('cenc:pssh', {}, ['AAAANHBzc2gAAAAA7e+LqXnWSs6jyCfc1R0h7QAAABQSEOtngrvLNF6Wu89hZjDxo9o=']),
-      ]);
-      audio_adaptationset.children.push(widevine_protection);
+      audio_adaptationset.children.push(this.mp4protection(), widevine_protection);
 
       const audio_representation = XMLNode.from('Representation', {
         id: '2',
         codecs: aacMimeTypeCodec(audioSpecificConfig),
+        bandwidth: `${this.audioTimeline.bandwidth()}`, // Representation@bandwidth は必須
       });
       audio_representation.children.push(this.audioTimeline.segment_template());
       audio_adaptationset.children.push(audio_representation);
@@ -155,6 +179,7 @@ export default class DASHGenerator {
       case 'Video':
         if (payload.packetType === PacketType.SequenceStart) {
           this.avcDecoderConfigurationRecord = payload.avcDecoderConfigurationRecord;
+          this.parameterSets = read_parameter_sets(read_avc_decoder_configuration_record(payload.avcDecoderConfigurationRecord));
           return;
         }
         break;
@@ -172,6 +197,8 @@ export default class DASHGenerator {
     }
 
     if (this.onMetadata == null) { return; }
+    // RTMP の timestamp は 0 から始まるとは限らないので、timestamp が 0 になる時刻を availabilityStartTime にする
+    this.availabilityStartTime ??= Temporal.Now.instant().subtract({ milliseconds: payload.timestamp });
 
     // 初期化情報が揃ったトラックから、初期化セグメントを作ってセグメントを並べ始める
 
@@ -179,24 +206,20 @@ export default class DASHGenerator {
       const initialization = make((vector) => {
         initialize(RTMP_TIMESCALE, [1], vector, (vector) => {
           vector.write(write_mp4_avc_track_information(1, RTMP_TIMESCALE, this.encryptionFormat, this.ivType, this.keyId, this.avcDecoderConfigurationRecord!));
-          pssh(Buffer.from('edef8ba9-79d6-4ace-a3c8-27dcd51d21ed'.replaceAll('-', ''), 'hex'), [this.keyId], Buffer.from(
-            'CAESEJA1GVFoa14boiJDns7B8SoaDXdpZGV2aW5lX3Rlc3QiASo', 'base64' // テスト用の PSSH (Protocol Buffers のデータ)
-          ), vector); // 本当は v0 の方がいい
+          pssh(WIDEVINE_SYSTEM_ID, [this.keyId], WIDEVINE_PSSH_DATA, vector); // 本当は v0 の方がいい
         });
       });
-      this.videoTimeline = new SegmentTimeline('video', RTMP_TIMESCALE, initialization, { liveWindowLength: this.liveWindowLength });
+      this.videoTimeline = new SegmentTimeline(`video_${this.session}`, RTMP_TIMESCALE, initialization, { liveWindowLength: this.liveWindowLength });
     }
     if (this.onMetadata.audiocodecid != null && this.audioSpecificConfig != null && this.audioTimeline == null) {
       const { samplingFrequency } = read_audio_specific_config(this.audioSpecificConfig);
       const initialization = make((vector) => {
         initialize(samplingFrequency, [1], vector, (vector) => {
           vector.write(write_mp4_aac_track_information(1, samplingFrequency, this.encryptionFormat, this.ivType, this.keyId, this.audioSpecificConfig!));
-          pssh(Buffer.from('edef8ba9-79d6-4ace-a3c8-27dcd51d21ed'.replaceAll('-', ''), 'hex'), [this.keyId], Buffer.from(
-            'CAESEJA1GVFoa14boiJDns7B8SoaDXdpZGV2aW5lX3Rlc3QiASo', 'base64' // テスト用の PSSH (Protocol Buffers のデータ)
-          ), vector); // 本当は v0 の方がいい
+          pssh(WIDEVINE_SYSTEM_ID, [this.keyId], WIDEVINE_PSSH_DATA, vector); // 本当は v0 の方がいい
         });
       });
-      this.audioTimeline = new SegmentTimeline('audio', samplingFrequency, initialization, { liveWindowLength: this.liveWindowLength });
+      this.audioTimeline = new SegmentTimeline(`audio_${this.session}`, samplingFrequency, initialization, { liveWindowLength: this.liveWindowLength });
     }
 
     switch (payload.kind) {
@@ -207,13 +230,13 @@ export default class DASHGenerator {
         if (this.previousVideoInformation != null) {
           const avcDecoderConfigurationRecord = read_avc_decoder_configuration_record(this.avcDecoderConfigurationRecord);
           const { type, dts, cto, data } = this.previousVideoInformation;
-          const duration = payload.timestamp - dts;
+          const duration = Math.max(0, payload.timestamp - dts); // timestamp が戻っても負の長さにしない
           this.videoTimeline.feed(make((vector) => {
             const iv = this.ivType.type === IVType.CONSTANT ? this.ivType.constant_iv : crypto.randomBytes(this.ivSize);
-            const [encrypted, subsample] = encrypt_avc(this.encryptionFormat, this.key, iv, data, avcDecoderConfigurationRecord);
+            const [encrypted, subsample] = encrypt_avc(this.encryptionFormat, this.key, iv, data, avcDecoderConfigurationRecord, this.parameterSets!);
 
             fragment(
-              { track_id: 1, keyframe: type === FrameType.KEY_FRAME, duration, dts, cto },
+              { sequence_number: ++this.videoSequenceNumber, track_id: 1, keyframe: type === FrameType.KEY_FRAME, duration, dts, cto },
               { iv, subsamples: subsample },
               this.ivType.type,
               encrypted,
@@ -222,11 +245,11 @@ export default class DASHGenerator {
           }));
         }
         // 1 つ前のフレームを今のセグメントに書き出してから、キーフレームで新しいセグメントを始める
-        if (payload.frameType === FrameType.KEY_FRAME) {
-          this.videoTimeline.append(payload.timestamp);
-          // 音声も同じタイミングで区切る (次に届く音声フレームから新しいセグメントに入れる)
+        if (payload.frameType === FrameType.KEY_FRAME && this.videoTimeline.append(payload.timestamp)) {
+          // 映像を区切った時は音声も同じタイミングで区切る (次に届く音声フレームから新しいセグメントに入れる)
+          // 音声のフレームの区切りは映像と揃わず 1 秒より少し短くなることがあるので、最小の長さは確認しない
           if (this.aacLatestTimestamp != null) {
-            this.audioTimeline?.append(this.aacLatestTimestamp + AAC_SAMPLES_PER_FRAME);
+            this.audioTimeline?.append(this.aacLatestTimestamp + AAC_SAMPLES_PER_FRAME, true);
           }
         }
         this.previousVideoInformation = {
@@ -240,20 +263,28 @@ export default class DASHGenerator {
       case 'Audio': {
         if (this.audioTimeline == null) { return; }
         if (this.audioSpecificConfig == null) { return; }
-        // AAC は 1 フレームが 1024 サンプルなので、最初のフレームの timestamp から 1024 ずつ進める
+        // AAC は 1 フレームが 1024 サンプルなので、前のフレームから 1024 ずつ進める
+        // ただし音声が途切れた時などに RTMP の timestamp と 1 フレーム以上ずれたら、RTMP の timestamp に合わせ直す
+        const { samplingFrequency } = read_audio_specific_config(this.audioSpecificConfig);
+        const timestamp = Math.floor(payload.timestamp * samplingFrequency / 1000);
         if (this.aacLatestTimestamp == null) {
-          const { samplingFrequency } = read_audio_specific_config(this.audioSpecificConfig);
-          this.aacLatestTimestamp = Math.floor(payload.timestamp * samplingFrequency / 1000);
+          // 最初の音声フレームからセグメントを始める (映像のキーフレームを待つと、それまでの音声が捨てられる)
+          this.audioTimeline.append(timestamp);
+        }
+        if (this.aacLatestTimestamp == null || Math.abs(this.aacLatestTimestamp + AAC_SAMPLES_PER_FRAME - timestamp) > AAC_SAMPLES_PER_FRAME) {
+          this.aacLatestTimestamp = timestamp;
         } else {
           this.aacLatestTimestamp += AAC_SAMPLES_PER_FRAME;
         }
         const dts = this.aacLatestTimestamp;
+        // 映像がない配信では、音声だけで (1 秒以上たったら) セグメントを区切る
+        if (this.onMetadata.videocodecid == null) { this.audioTimeline.append(dts); }
         this.audioTimeline.feed(make((vector) => {
           const iv = this.ivType.type === IVType.CONSTANT ? this.ivType.constant_iv : crypto.randomBytes(this.ivSize);
           const [encrypted, subsample] = encrypt_aac(this.encryptionFormat, this.key, iv, payload.data);
 
           fragment(
-            { track_id: 1, keyframe: true, duration: AAC_SAMPLES_PER_FRAME, dts, cto: 0 },
+            { sequence_number: ++this.audioSequenceNumber, track_id: 1, keyframe: true, duration: AAC_SAMPLES_PER_FRAME, dts, cto: 0 },
             { iv, subsamples: subsample },
             this.ivType.type,
             encrypted,

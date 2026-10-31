@@ -207,7 +207,7 @@ export const fragment = (fragment: FragmentInformation, encryption: SampleInform
   const moof_begin = vector.byteLength();
   let trun_begin = 0;
   moof(vector, (vector) => {
-    mfhd(vector);
+    mfhd(fragment.sequence_number, vector);
     traf(vector, (vector) => {
       tfhd(fragment.track_id, vector);
       tfdt(fragment.dts, vector);

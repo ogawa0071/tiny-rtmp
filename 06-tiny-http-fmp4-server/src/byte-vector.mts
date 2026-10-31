@@ -17,7 +17,7 @@ export default class ByteVector {
   }
 
   private extend(desired: number): void {
-    let capacity = this.buffer.byteLength;
+    let capacity = Math.max(1, this.buffer.byteLength); // 0 は何倍しても 0 なので 1 から始める
     while (capacity < desired) {
       capacity *= 2;
     }

@@ -47,9 +47,12 @@ export default class SegmentTimeline {
     this.minimumSegmentDuration = option.minimumSegmentDuration;
   }
 
-  public append(timestamp: number): void {
-    if (this.currentSegment != null && (timestamp - this.currentSegment.begin()) < (this.minimumSegmentDuration * this.timescale)) {
-      return;
+  // 新しいセグメントを始めたら true を返す
+  // force の時は最小の長さを確認しない (映像に合わせて音声を区切る時用) が、長さ 0 のセグメントは作らない
+  public append(timestamp: number, force: boolean = false): boolean {
+    if (this.currentSegment != null) {
+      const duration = timestamp - this.currentSegment.begin();
+      if (duration <= 0 || (!force && duration < this.minimumSegmentDuration * this.timescale)) { return false; }
     }
 
     if (this.currentSegment != null) {
@@ -67,6 +70,16 @@ export default class SegmentTimeline {
 
     this.sequenceNumber += 1;
     this.currentSegment = new Segment(timestamp, this.timescale);
+    return true;
+  }
+
+  // MPD に載せる @bandwidth (ライブウィンドウ内のセグメントの最大ビットレート)
+  public bandwidth(): number {
+    let bandwidth = 0;
+    for (const segment of this.segmentMap.values()) {
+      bandwidth = Math.max(bandwidth, Math.ceil(segment.segment()!.byteLength * 8 * this.timescale / Math.max(1, segment.duration()!)));
+    }
+    return bandwidth;
   }
 
   public feed(data: Buffer): void {

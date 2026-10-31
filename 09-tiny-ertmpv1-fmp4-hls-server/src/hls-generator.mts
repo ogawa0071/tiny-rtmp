@@ -1,5 +1,6 @@
 import type { AMF0Object } from '../../01-tiny-rtmp-server/src/amf0-reader.mts';
 import type { Message } from '../../01-tiny-rtmp-server/src/message.mts';
+import { logger } from '../../01-tiny-rtmp-server/src/logger.mts';
 
 import { AACPacketType, read_onmetadata } from '../../03-tiny-http-ts-server/src/rtmp-handler.mts';
 import { PlaylistTimestamp } from '../../04-tiny-hls-server/src/playlist-timestamp.mts';
@@ -9,6 +10,7 @@ import { write_mp4_avc_track_information } from '../../06-tiny-http-fmp4-server/
 import { write_mp4_aac_track_information } from '../../06-tiny-http-fmp4-server/src/aac.mts';
 
 import handle_rtmp_payload, { FrameType, PacketType } from './rtmp-handler.mts';
+import { write_mp4_hevc_track_information } from './hevc.mts';
 import MediaPlaylist from './media-playlist.mts';
 
 type VideoInformation = {
@@ -35,6 +37,9 @@ export default class HLSGenerator {
   private previousAudioInformation: AudioInformation | null = null;
 
   private onMetadata: AMF0Object | null = null;
+  // 映像が対応していないコーデック (AV1 や VP9 など) なら、そのコーデック (映像なしの配信として扱う)
+  private unsupportedVideoCodec: string | null = null;
+  private sequenceNumber = 0; // mfhd の sequence_number (moof ごとに 1 から増やす)
 
   private initialization: Buffer | null = null;
   private playlist: MediaPlaylist;
@@ -70,6 +75,13 @@ export default class HLSGenerator {
     const payload = handle_rtmp_payload(message);
     if (payload == null) { return; }
 
+    // 対応していないコーデックの映像は fMP4 にできないので、映像なしの配信として扱う
+    if (payload.kind === 'Video' && payload.codec === 'Unsupported') {
+      if (this.unsupportedVideoCodec == null) { logger.warn('Unsupported video codec, video is ignored', { fourcc: payload.fourcc }); }
+      this.unsupportedVideoCodec = payload.fourcc;
+      return;
+    }
+
     // 初期化セグメントに必要な情報を集める
     switch (payload.kind) {
       case 'Video':
@@ -79,8 +91,7 @@ export default class HLSGenerator {
             this.videoTrack = write_mp4_avc_track_information(VIDEO_TRACK_ID, RTMP_TIMESCALE, payload.avcDecoderConfigurationRecord);
             break;
           case 'HEVC':
-            // TODO
-            //this.videoTrack = write_mp4_hevc_track_information(VIDEO_TRACK_ID, RTMP_TIMESCALE, payload.hevcDecoderConfigurationRecord);
+            this.videoTrack = write_mp4_hevc_track_information(VIDEO_TRACK_ID, RTMP_TIMESCALE, payload.hevcDecoderConfigurationRecord);
             break;
         }
         return;
@@ -99,7 +110,7 @@ export default class HLSGenerator {
     if (this.onMetadata == null) { return; }
     const has_video = this.videoTrack != null;
     const has_audio = this.audioTrack != null;
-    if (this.onMetadata.videocodecid != null && !has_video) { return; }
+    if (this.onMetadata.videocodecid != null && !has_video && this.unsupportedVideoCodec == null) { return; }
     if (this.onMetadata.audiocodecid != null && !has_audio) { return; }
 
     this.initialization ??= make((vector) => {
@@ -115,9 +126,9 @@ export default class HLSGenerator {
         // フレームの長さ (duration) は次のフレームとの差でわかるので、1 つ前のフレームをここで書き出す
         if (this.previousVideoInformation != null) {
           const { frameType: type, dts, cto, data } = this.previousVideoInformation;
-          const duration = payload.timestamp - dts;
+          const duration = Math.max(0, payload.timestamp - dts); // timestamp が戻っても負の長さにしない
           this.playlist.feed(make((vector) => {
-            fragment({ track_id: VIDEO_TRACK_ID, keyframe: type === FrameType.KEY_FRAME, duration, dts, cto }, data, vector);
+            fragment({ sequence_number: ++this.sequenceNumber, track_id: VIDEO_TRACK_ID, keyframe: type === FrameType.KEY_FRAME, duration, dts, cto }, data, vector);
           }));
         }
         // 1 つ前のフレームを今のセグメントに書き出してから、キーフレームで新しいセグメントを始める
@@ -136,9 +147,9 @@ export default class HLSGenerator {
         // FIXME: これは手抜き 各音声コーデックで sample 数から duration を厳密に求めるべき
         if (this.previousAudioInformation != null) {
           const { dts, data } = this.previousAudioInformation;
-          const duration = payload.timestamp - dts;
+          const duration = Math.max(0, payload.timestamp - dts); // timestamp が戻っても負の長さにしない
           this.playlist.feed(make((vector) => {
-            fragment({ track_id: AUDIO_TRACK_ID, keyframe: true, duration, dts, cto: 0 }, data, vector);
+            fragment({ sequence_number: ++this.sequenceNumber, track_id: AUDIO_TRACK_ID, keyframe: true, duration, dts, cto: 0 }, data, vector);
           }));
         }
         // 映像がある時は映像のキーフレームで区切るので、音声だけの時に限って音声で新しいセグメントを始める

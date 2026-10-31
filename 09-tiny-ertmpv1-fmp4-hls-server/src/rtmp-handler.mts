@@ -27,7 +27,12 @@ export type HEVCData = {
   compositionTimeOffset: number;
   data: Buffer;
 });
-export type VideoData = (AVCData | HEVCData) & {
+// 対応していないコーデック (AV1 や VP9 など) の映像
+export type UnsupportedVideoData = {
+  codec: 'Unsupported';
+  fourcc: string;
+};
+export type VideoData = (AVCData | HEVCData | UnsupportedVideoData) & {
   timestamp: number;
   frameType: number;
   kind: 'Video';
@@ -88,7 +93,7 @@ export const handle_video = (message: { timestamp: number; data: Buffer; }): Vid
       return { kind: 'Video', frameType, timestamp: message.timestamp, ... hevc };
     }
     default:
-      return null;
+      return { kind: 'Video', frameType, timestamp: message.timestamp, codec: 'Unsupported', fourcc };
   }
 };
 
