@@ -93,12 +93,19 @@ export default class DASHGenerator {
     return this.onMetadata?.videocodecid === 7 || this.onMetadata?.videocodecid === 'avc1';
   }
 
+  // 配信の音声が、このサーバで扱える AAC か (onMetaData の audiocodecid で判断する)
+  // (コーデックを数値ではなく 'mp4a' の文字列で送ってくる配信ソフトもある)
+  private hasAudio(): boolean {
+    return this.onMetadata?.audiocodecid === 10 || this.onMetadata?.audiocodecid === 'mp4a';
+  }
+
   // MPD を作る (まだ MPD に載せられるセグメントがなければ null)
   public mpd(): string | null {
-    // SegmentTimeline には S が 1 つ以上必要なので、全てのトラックにセグメントができるまでは MPD を作らない
-    // (トラックを後から MPD に足しても、再生を始めたプレイヤーには使われない)
-    const timelines = [this.videoTimeline, this.audioTimeline].filter((timeline) => timeline != null);
-    if (timelines.length === 0 || !timelines.every((timeline) => timeline.hasSegments())) { return null; }
+    // SegmentTimeline には S が 1 つ以上必要なので、onMetaData に書かれた (このサーバで扱える) 全てのトラックにセグメントができるまでは MPD を作らない
+    // (トラックを後から MPD に足しても再生を始めたプレイヤーには使われないので、初期化情報が遅れて届くトラックも待つ)
+    if (!this.hasVideo() && !this.hasAudio()) { return null; }
+    if (this.hasVideo() && !(this.videoTimeline?.hasSegments() ?? false)) { return null; }
+    if (this.hasAudio() && !(this.audioTimeline?.hasSegments() ?? false)) { return null; }
 
     const declaration = '<?xml version="1.0" encoding="UTF-8"?>';
 
@@ -144,7 +151,7 @@ export default class DASHGenerator {
       period.children.push(video_adaptationset);
     }
 
-    if (this.onMetadata?.audiocodecid != null && this.audioSpecificConfig != null && this.audioTimeline != null) {
+    if (this.hasAudio() && this.audioSpecificConfig != null && this.audioTimeline != null) {
       const audioSpecificConfig = read_audio_specific_config(this.audioSpecificConfig);
       const audio_adaptationset = XMLNode.from('AdaptationSet', {
         contentType: 'audio',
@@ -225,7 +232,7 @@ export default class DASHGenerator {
       });
       this.videoTimeline = new SegmentTimeline(`video_${this.session}`, RTMP_TIMESCALE, initialization, { liveWindowLength: this.liveWindowLength });
     }
-    if (this.onMetadata.audiocodecid != null && this.audioSpecificConfig != null && this.audioTimeline == null) {
+    if (this.hasAudio() && this.audioSpecificConfig != null && this.audioTimeline == null) {
       const { samplingFrequency } = read_audio_specific_config(this.audioSpecificConfig);
       const initialization = make((vector) => {
         initialize(samplingFrequency, [1], vector, (vector) => {
