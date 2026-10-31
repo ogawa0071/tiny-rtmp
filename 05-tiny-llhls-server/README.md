@@ -52,6 +52,8 @@ http://localhost:8000/myapp/mystreamkey/playlist.m3u8
 http://localhost:8000/myapp/mystreamkey/{番号}.ts
 ```
 
+セグメントの番号は配信を始めた時刻 (UNIX 時間の秒) から始まります (配信し直しても前の配信と URL が重ならないようにするため)。
+
 ### パーシャルセグメント
 ```
 http://localhost:8000/myapp/mystreamkey/{セグメント番号}_{パート番号}.ts

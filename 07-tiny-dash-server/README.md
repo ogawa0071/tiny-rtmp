@@ -51,12 +51,14 @@ http://localhost:8000/myapp/mystreamkey/manifest.mpd
 
 ### Initialization Segment
 ```
-http://localhost:8000/myapp/mystreamkey/video_init.mp4
-http://localhost:8000/myapp/mystreamkey/audio_init.mp4
+http://localhost:8000/myapp/mystreamkey/video_{配信ごとの番号}_init.mp4
+http://localhost:8000/myapp/mystreamkey/audio_{配信ごとの番号}_init.mp4
 ```
+
+配信ごとの番号は配信を始めた時刻で、配信し直すと変わります (前の配信のセグメントがキャッシュから使われないようにするため)。
 
 ### Media Segment
 ```
-http://localhost:8000/myapp/mystreamkey/video_{番号}.m4s
-http://localhost:8000/myapp/mystreamkey/audio_{番号}.m4s
+http://localhost:8000/myapp/mystreamkey/video_{配信ごとの番号}_{番号}.m4s
+http://localhost:8000/myapp/mystreamkey/audio_{配信ごとの番号}_{番号}.m4s
 ```
