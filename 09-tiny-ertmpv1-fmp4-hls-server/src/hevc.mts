@@ -57,8 +57,9 @@ const read_resolution = (sps: Buffer): [width: number, height: number] => {
   return [pic_width_in_luma_samples - SubWidthC * (left + right), pic_height_in_luma_samples - SubHeightC * (top + bottom)];
 };
 
-// hvc1 では VPS/SPS/PPS を全て hvcC に入れて映像データの中には入れない決まりで、その配列の array_completeness は 1 にする (ISO/IEC 14496-15)
-// FFmpeg などは映像データの中にもあってよい 0 (hev1 向けの値) で送ってくるので、コピーして 1 に書き換える
+// hvc1 では VPS/SPS/PPS を全て hvcC に入れて映像データの中には入れない決まりで、その配列の array_completeness は 1、それ以外 (SEI など) の配列は 0 にする (ISO/IEC 14496-15)
+// FFmpeg などは映像データの中にもあってよい 0 (hev1 向けの値) で送ってくるので、コピーして書き換える
+// (映像データの中に送られてくる VPS/SPS/PPS は strip_parameter_sets で取り除く)
 const complete_parameter_set_arrays = (hevcDecoderConfigurationRecord: Buffer): Buffer => {
   const record = Buffer.from(hevcDecoderConfigurationRecord);
   const reader = new ByteReader(record);
@@ -67,13 +68,37 @@ const complete_parameter_set_arrays = (hevcDecoderConfigurationRecord: Buffer): 
   for (let i = 0; i < numOfArrays; i++) {
     const header = reader.read(1); // array_completeness (1bit), reserved (1bit), NAL_unit_type (6bit) (record の一部なので、書き換えると record も変わる)
     const nal_unit_type = header[0] & 0x3F;
-    if (nal_unit_type === VPS_NUT || nal_unit_type === SPS_NUT || nal_unit_type === PPS_NUT) { header[0] |= 0x80; }
+    const parameter_set = nal_unit_type === VPS_NUT || nal_unit_type === SPS_NUT || nal_unit_type === PPS_NUT;
+    header[0] = (header[0] & 0x7F) | (parameter_set ? 0x80 : 0x00);
     const numNalus = reader.readU16BE();
     for (let j = 0; j < numNalus; j++) {
       reader.read(reader.readU16BE());
     }
   }
   return record;
+};
+
+// 映像データの NAL Unit の前に付いている長さのバイト数 (HEVCDecoderConfigurationRecord の lengthSizeMinusOne + 1)
+export const read_nal_unit_length_size = (hevcDecoderConfigurationRecord: Buffer): number => {
+  // 22 byte 目: constantFrameRate (2bit), numTemporalLayers (3bit), temporalIdNested (1bit), lengthSizeMinusOne (2bit)
+  return (hevcDecoderConfigurationRecord.readUInt8(21) & 0b00000011) + 1;
+};
+
+// hvc1 では VPS/SPS/PPS を映像データの中に入れないので、配信ソフトが映像データの中にも入れてくるもの (x265 の repeat-headers など) は取り除く
+// (hvcC と違う VPS/SPS/PPS も取り除くことになるが、途中でパラメータセットが変わる配信はここでは扱わない)
+export const strip_parameter_sets = (sizedNalus: Buffer, lengthSize: number): Buffer => {
+  const reader = new ByteReader(sizedNalus);
+  const nalus: Buffer[] = [];
+  while (!reader.isEOF()) {
+    const header = reader.read(lengthSize);
+    const length = header.readUIntBE(0, lengthSize);
+    if (length === 0) { continue; } // 長さ 0 の NAL Unit は何も含まないので飛ばす
+    const nalu = reader.read(length);
+    const nal_unit_type = (nalu.readUInt8(0) >> 1) & 0x3F; // NAL Unit Header: forbidden_zero_bit (1bit), nal_unit_type (6bit), ...
+    if (nal_unit_type === VPS_NUT || nal_unit_type === SPS_NUT || nal_unit_type === PPS_NUT) { continue; }
+    nalus.push(header, nalu);
+  }
+  return Buffer.concat(nalus);
 };
 
 // HEVC は hvc1 (VisualSampleEntry) の中の hvcC に、HEVCDecoderConfigurationRecord を入れる (ISO/IEC 14496-15)

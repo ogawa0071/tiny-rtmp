@@ -2,7 +2,7 @@ import type { AMF0Object } from '../../01-tiny-rtmp-server/src/amf0-reader.mts';
 import type { Message } from '../../01-tiny-rtmp-server/src/message.mts';
 import { logger } from '../../01-tiny-rtmp-server/src/logger.mts';
 
-import { AACPacketType, read_onmetadata } from '../../03-tiny-http-ts-server/src/rtmp-handler.mts';
+import { AACPacketType, AudioCodecType, read_onmetadata, VideoCodecType } from '../../03-tiny-http-ts-server/src/rtmp-handler.mts';
 import { PlaylistTimestamp } from '../../04-tiny-hls-server/src/playlist-timestamp.mts';
 
 import { fragment, initialize, make } from '../../06-tiny-http-fmp4-server/src/fmp4.mts';
@@ -10,7 +10,7 @@ import { write_mp4_avc_track_information } from '../../06-tiny-http-fmp4-server/
 import { write_mp4_aac_track_information } from '../../06-tiny-http-fmp4-server/src/aac.mts';
 
 import handle_rtmp_payload, { FrameType, PacketType } from './rtmp-handler.mts';
-import { write_mp4_hevc_track_information } from './hevc.mts';
+import { read_nal_unit_length_size, strip_parameter_sets, write_mp4_hevc_track_information } from './hevc.mts';
 import MediaPlaylist from './media-playlist.mts';
 
 type VideoInformation = {
@@ -28,10 +28,17 @@ type AudioInformation = {
 const RTMP_TIMESCALE = 1000;
 const VIDEO_TRACK_ID = 1;
 const AUDIO_TRACK_ID = 2;
+// Enhanced RTMP の onMetaData の videocodecid は、FourCC を big endian の 32bit 整数にした値 ('hvc1' なら 0x68766331)
+const HEVC_FOURCC = Buffer.from('hvc1', 'ascii').readUInt32BE(0);
 
 export default class HLSGenerator {
   private videoTrack: Buffer | null = null;
   private audioTrack: Buffer | null = null;
+  // HEVC の映像データの NAL Unit の前に付いている長さのバイト数 (HEVCDecoderConfigurationRecord で決まる)
+  private hevcNalUnitLengthSize = 4;
+  // 初期化セグメントに入れたトラック (初期化セグメントを作る時に決めて、後から変えない)
+  private hasVideo = false;
+  private hasAudio = false;
 
   private previousVideoInformation: VideoInformation | null = null;
   private previousAudioInformation: AudioInformation | null = null;
@@ -98,6 +105,7 @@ export default class HLSGenerator {
             break;
           case 'HEVC':
             this.videoTrack = write_mp4_hevc_track_information(VIDEO_TRACK_ID, RTMP_TIMESCALE, payload.hevcDecoderConfigurationRecord);
+            this.hevcNalUnitLengthSize = read_nal_unit_length_size(payload.hevcDecoderConfigurationRecord);
             break;
         }
         return;
@@ -112,23 +120,37 @@ export default class HLSGenerator {
       }
     }
 
-    // onMetaData に書かれている全てのトラックの初期化情報が揃うまでは何もしない
-    if (this.onMetadata == null) { return; }
-    const has_video = this.videoTrack != null;
-    const has_audio = this.audioTrack != null;
-    if (this.onMetadata.videocodecid != null && !has_video && this.unsupportedVideoCodec == null) { return; }
-    if (this.onMetadata.audiocodecid != null && !has_audio && this.unsupportedAudioCodec == null) { return; }
+    // onMetaData に書かれているトラックのうち、fMP4 にできるコーデック (H.264, H.265, AAC) のトラックの初期化情報が揃うまでは何もしない
+    // fMP4 にできないコーデック (MP3 や Sorenson H.263 など) のトラックは待たない
+    // (MP3 などには初期化情報がなく、最初のフレームが届くまで対応していないと分からないので、待つとそれまでに届いた映像・音声が捨てられる)
+    if (this.initialization == null) {
+      if (this.onMetadata == null) { return; }
+      // (コーデックを数値ではなく 'avc1' などの文字列で送ってくる配信ソフトもある)
+      const { videocodecid, audiocodecid } = this.onMetadata;
+      const video_expected = videocodecid === VideoCodecType.AVC || videocodecid === HEVC_FOURCC || videocodecid === 'avc1' || videocodecid === 'hvc1';
+      const audio_expected = audiocodecid === AudioCodecType.AAC || audiocodecid === 'mp4a';
+      if (video_expected && this.videoTrack == null && this.unsupportedVideoCodec == null) { return; }
+      if (audio_expected && this.audioTrack == null && this.unsupportedAudioCodec == null) { return; }
+      if (this.videoTrack == null && this.audioTrack == null) { return; }
 
-    this.initialization ??= make((vector) => {
-      initialize(RTMP_TIMESCALE, [... (has_video ? [VIDEO_TRACK_ID] : []), ... (has_audio ? [AUDIO_TRACK_ID] : [])], vector, (vector) => {
-        if (this.videoTrack != null) { vector.write(this.videoTrack); }
-        if (this.audioTrack != null) { vector.write(this.audioTrack); }
+      // 初期化セグメントに入れたトラックだけを書き出す (後から初期化情報が届いたトラックは、初期化セグメントにないので使えない)
+      this.hasVideo = this.videoTrack != null;
+      this.hasAudio = this.audioTrack != null;
+      this.initialization = make((vector) => {
+        initialize(RTMP_TIMESCALE, [... (this.hasVideo ? [VIDEO_TRACK_ID] : []), ... (this.hasAudio ? [AUDIO_TRACK_ID] : [])], vector, (vector) => {
+          if (this.videoTrack != null) { vector.write(this.videoTrack); }
+          if (this.audioTrack != null) { vector.write(this.audioTrack); }
+        });
       });
-    });
+    }
 
     switch (payload.kind) {
-      case 'Video':
-        if (!has_video) { return; }
+      case 'Video': {
+        if (!this.hasVideo) { return; }
+        // hvc1 では VPS/SPS/PPS は hvcC だけに入れるので、映像データの中に送られてきたものは取り除く
+        // (VPS/SPS/PPS だけを別のメッセージで送ってくる配信ソフトもあり、その時は何も残らない。長さ 0 のサンプルは読めないプレイヤーがあるので、フレームとして扱わない)
+        const sample = payload.codec === 'HEVC' ? strip_parameter_sets(payload.data, this.hevcNalUnitLengthSize) : payload.data;
+        if (sample.byteLength === 0) { return; }
         // フレームの長さ (duration) は次のフレームとの差でわかるので、1 つ前のフレームをここで書き出す
         if (this.previousVideoInformation != null) {
           const { frameType: type, dts, cto, data } = this.previousVideoInformation;
@@ -145,11 +167,12 @@ export default class HLSGenerator {
           frameType: payload.frameType,
           dts: payload.timestamp,
           cto: payload.compositionTimeOffset,
-          data: payload.data,
+          data: sample,
         };
         return;
+      }
       case 'Audio':
-        if (!has_audio) { return; }
+        if (!this.hasAudio) { return; }
         // FIXME: これは手抜き 各音声コーデックで sample 数から duration を厳密に求めるべき
         if (this.previousAudioInformation != null) {
           const { dts, data } = this.previousAudioInformation;
@@ -159,7 +182,7 @@ export default class HLSGenerator {
           }));
         }
         // 映像がある時は映像のキーフレームで区切るので、音声だけの時に限って音声で新しいセグメントを始める
-        if (!has_video) {
+        if (!this.hasVideo) {
           this.playlist.append(PlaylistTimestamp.fromRTMP(payload.timestamp));
         }
         this.previousAudioInformation = {
