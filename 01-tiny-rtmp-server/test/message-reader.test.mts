@@ -256,13 +256,23 @@ describe('Chunk Header', () => {
     reader.feed(Buffer.alloc(128));
     // Abort (cs_id: 2): cs_id 6 の受信途中のメッセージを捨てる
     reader.feed(Buffer.from('020000000000040200000000' + '00000006', 'hex'));
+    // fmt 3 (cs_id: 6): ヘッダを全て引き継いで、新しいメッセージを最初から送り直す
+    // (受信途中のメッセージが捨てられていないと、その続きとして読まれてしまう)
+    reader.feed(Buffer.concat([Buffer.from('c6', 'hex'), Buffer.alloc(128, 0x11)]));
+    reader.feed(Buffer.concat([Buffer.from('c6', 'hex'), Buffer.alloc(72, 0x11)]));
     // fmt 1 (cs_id: 6): timestamp delta 33, length 2, Video (Message Stream ID は Abort 前のものを引き継ぐ)
     reader.feed(Buffer.from('4600002100000209' + '1701', 'hex'));
 
     expect((await gen.next()).value).toMatchObject({
       message_type_id: 9,
       message_stream_id: 1,
-      timestamp: 133,
+      timestamp: 200, // fmt 0 の直後の fmt 3 は、fmt 0 の timestamp (100) を差分とみなす
+      data: Buffer.alloc(200, 0x11),
+    });
+    expect((await gen.next()).value).toMatchObject({
+      message_type_id: 9,
+      message_stream_id: 1,
+      timestamp: 233,
       data: Buffer.from('1701', 'hex'),
     });
   });

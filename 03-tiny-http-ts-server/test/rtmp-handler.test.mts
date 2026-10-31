@@ -8,6 +8,9 @@ describe('FLV Tag', () => {
     ['too short AVC', '1701'],
     ['video command frame (FrameType: 5)', '5700'],
     ['Enhanced RTMP ExVideoTagHeader', '9068766331'],
+    // 長さの確認では弾かれず、CodecID (下位 4bit) は 7 (AVC) に見える入力で、FrameType 5 と ExVideoTagHeader の判定を確かめる
+    ['video command frame (FrameType: 5) with AVC CodecID', '5700000000'],
+    ['Enhanced RTMP ExVideoTagHeader with PacketType 7 (looks like AVC CodecID)', '9700000000ff'],
   ])('%s is ignored', (_, hex) => {
     expect(handle_video({ timestamp: 0, data: Buffer.from(hex, 'hex') })).toBeNull();
   });

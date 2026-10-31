@@ -47,6 +47,7 @@
     - プロジェクトのルートディレクトリで `yarn` を実行してください
     - 型チェック (`yarn tsc`) には TypeScript 7 (`@typescript/native`) を使っています
     - ESLint (typescript-eslint) がまだ TypeScript 7 に対応していないので、`typescript` には TypeScript 6 の互換パッケージ (`@typescript/typescript6`) を入れています
+        - Yarn v1 の Workspace は別名 (`npm:`) で入れた `typescript` を peerDependencies の確認に使わないので、`yarn` の実行時に typescript-eslint の `unmet peer dependency "typescript@..."` という警告が出ますが、ESLint は TypeScript 6 で動作します
 
 ## 参考資料
 

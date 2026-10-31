@@ -63,6 +63,28 @@ describe('Partial Segment', () => {
       expect(parts).toStrictEqual([1]);
     }
   });
+
+  test('an audio frame that arrives before the keyframe with the same timestamp does not make an empty part', () => {
+    const playlist = new MediaPlaylist({ partialSegmentDuration: 1 });
+    // 20 ms ごとの音声と 30 fps の映像 (30 フレームごとにキーフレーム) を timestamp 順に入れる
+    // timestamp が同じなら音声が先 (FFmpeg は同じ timestamp のパケットを stream の番号順に送るので、音声が stream 0 だとこうなる)
+    const frames = [
+      ... Array.from({ length: 50 * 8 }, (_, i) => ({ timestamp: i * 20, video: false, keyframe: false })),
+      ... Array.from({ length: 30 * 8 }, (_, i) => ({ timestamp: Math.round(i * 1000 / 30), video: true, keyframe: i % 30 === 0 })),
+    ].sort((a, b) => a.timestamp - b.timestamp || Number(a.video) - Number(b.video));
+    for (const { timestamp, video, keyframe } of frames) {
+      if (keyframe) { playlist.append(PlaylistTimestamp.fromRTMP(timestamp)); }
+      playlist.feed([Buffer.alloc(1)], PlaylistTimestamp.fromRTMP(timestamp), video, keyframe);
+    }
+
+    const list = segments(playlist.m3u8());
+    expect(list.length).toBeGreaterThan(0);
+    for (const { parts } of list) {
+      for (const duration of parts) {
+        expect(duration).toBeGreaterThan(0);
+      }
+    }
+  });
 });
 
 describe('Blocking Playlist Reload', () => {
