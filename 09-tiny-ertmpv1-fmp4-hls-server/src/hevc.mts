@@ -2,7 +2,10 @@ import ByteReader from '../../01-tiny-rtmp-server/src/byte-reader.mts';
 import EBSPBitReader from '../../06-tiny-http-fmp4-server/src/ebsp-bit-reader.mts';
 import { box, make, track, visualSampleEntry } from '../../06-tiny-http-fmp4-server/src/fmp4.mts';
 
-const SPS_NUT = 33; // SPS の nal_unit_type (H.265 Table 7-1)
+// VPS/SPS/PPS の nal_unit_type (H.265 Table 7-1)
+const VPS_NUT = 32;
+const SPS_NUT = 33;
+const PPS_NUT = 34;
 
 // HEVCDecoderConfigurationRecord (ISO/IEC 14496-15 8.3.3.1) から最初の SPS を取り出す
 const find_sps = (hevcDecoderConfigurationRecord: Buffer): Buffer | null => {
@@ -54,7 +57,27 @@ const read_resolution = (sps: Buffer): [width: number, height: number] => {
   return [pic_width_in_luma_samples - SubWidthC * (left + right), pic_height_in_luma_samples - SubHeightC * (top + bottom)];
 };
 
-// HEVC は hvc1 (VisualSampleEntry) の中の hvcC に、HEVCDecoderConfigurationRecord をそのまま入れる (ISO/IEC 14496-15)
+// hvc1 では VPS/SPS/PPS を全て hvcC に入れて映像データの中には入れない決まりで、その配列の array_completeness は 1 にする (ISO/IEC 14496-15)
+// FFmpeg などは映像データの中にもあってよい 0 (hev1 向けの値) で送ってくるので、コピーして 1 に書き換える
+const complete_parameter_set_arrays = (hevcDecoderConfigurationRecord: Buffer): Buffer => {
+  const record = Buffer.from(hevcDecoderConfigurationRecord);
+  const reader = new ByteReader(record);
+  reader.read(22); // configurationVersion から lengthSizeMinusOne までの固定長の部分
+  const numOfArrays = reader.readU8();
+  for (let i = 0; i < numOfArrays; i++) {
+    const header = reader.read(1); // array_completeness (1bit), reserved (1bit), NAL_unit_type (6bit) (record の一部なので、書き換えると record も変わる)
+    const nal_unit_type = header[0] & 0x3F;
+    if (nal_unit_type === VPS_NUT || nal_unit_type === SPS_NUT || nal_unit_type === PPS_NUT) { header[0] |= 0x80; }
+    const numNalus = reader.readU16BE();
+    for (let j = 0; j < numNalus; j++) {
+      reader.read(reader.readU16BE());
+    }
+  }
+  return record;
+};
+
+// HEVC は hvc1 (VisualSampleEntry) の中の hvcC に、HEVCDecoderConfigurationRecord を入れる (ISO/IEC 14496-15)
+// (パラメータセットを映像データの中にも入れられる hev1 もあるが、Apple のプレイヤーなどは hvc1 でないと再生できないことがある)
 export const write_mp4_hevc_track_information = (track_id: number, timescale: number, hevcDecoderConfigurationRecord: Buffer): Buffer => {
   const sps = find_sps(hevcDecoderConfigurationRecord);
   const [width, height] = sps != null ? read_resolution(sps) : [0, 0];
@@ -64,7 +87,7 @@ export const write_mp4_hevc_track_information = (track_id: number, timescale: nu
       box('hvc1', vector, (vector) => {
         visualSampleEntry(width, height, vector, (vector) => {
           box('hvcC', vector, (vector) => {
-            vector.write(hevcDecoderConfigurationRecord);
+            vector.write(complete_parameter_set_arrays(hevcDecoderConfigurationRecord));
           });
         });
       });

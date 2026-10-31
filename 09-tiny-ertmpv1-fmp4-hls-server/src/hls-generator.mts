@@ -37,8 +37,9 @@ export default class HLSGenerator {
   private previousAudioInformation: AudioInformation | null = null;
 
   private onMetadata: AMF0Object | null = null;
-  // 映像が対応していないコーデック (AV1 や VP9 など) なら、そのコーデック (映像なしの配信として扱う)
-  private unsupportedVideoCodec: string | null = null;
+  // 映像・音声が対応していないコーデック (AV1 や MP3 など) なら、そのコーデック (そのトラックがない配信として扱う)
+  private unsupportedVideoCodec: string | number | null = null;
+  private unsupportedAudioCodec: number | null = null;
   private sequenceNumber = 0; // mfhd の sequence_number (moof ごとに 1 から増やす)
 
   private initialization: Buffer | null = null;
@@ -75,10 +76,15 @@ export default class HLSGenerator {
     const payload = handle_rtmp_payload(message);
     if (payload == null) { return; }
 
-    // 対応していないコーデックの映像は fMP4 にできないので、映像なしの配信として扱う
+    // 対応していないコーデックの映像・音声は fMP4 にできないので、そのトラックがない配信として扱う
     if (payload.kind === 'Video' && payload.codec === 'Unsupported') {
-      if (this.unsupportedVideoCodec == null) { logger.warn('Unsupported video codec, video is ignored', { fourcc: payload.fourcc }); }
-      this.unsupportedVideoCodec = payload.fourcc;
+      if (this.unsupportedVideoCodec == null) { logger.warn('Unsupported video codec, video is ignored', { codecId: payload.codecId }); }
+      this.unsupportedVideoCodec = payload.codecId;
+      return;
+    }
+    if (payload.kind === 'Audio' && payload.codec === 'Unsupported') {
+      if (this.unsupportedAudioCodec == null) { logger.warn('Unsupported audio codec, audio is ignored', { soundFormat: payload.soundFormat }); }
+      this.unsupportedAudioCodec = payload.soundFormat;
       return;
     }
 
@@ -111,7 +117,7 @@ export default class HLSGenerator {
     const has_video = this.videoTrack != null;
     const has_audio = this.audioTrack != null;
     if (this.onMetadata.videocodecid != null && !has_video && this.unsupportedVideoCodec == null) { return; }
-    if (this.onMetadata.audiocodecid != null && !has_audio) { return; }
+    if (this.onMetadata.audiocodecid != null && !has_audio && this.unsupportedAudioCodec == null) { return; }
 
     this.initialization ??= make((vector) => {
       initialize(RTMP_TIMESCALE, [... (has_video ? [VIDEO_TRACK_ID] : []), ... (has_audio ? [AUDIO_TRACK_ID] : [])], vector, (vector) => {

@@ -2,9 +2,9 @@ import { MessageType } from '../../01-tiny-rtmp-server/src/message.mts';
 import type { Message } from '../../01-tiny-rtmp-server/src/message.mts';
 import ByteReader from '../../01-tiny-rtmp-server/src/byte-reader.mts';
 
-// 従来の FLV の映像 (AVC) と音声、データの扱いは HTTP-TS 配信 (03-tiny-http-ts-server) と同じものを使う
-import { handle_amf0_data, handle_audio, handle_video as handle_legacy_video, FrameType } from '../../03-tiny-http-ts-server/src/rtmp-handler.mts';
-import type { ActionScriptData, AudioData, AVCData } from '../../03-tiny-http-ts-server/src/rtmp-handler.mts';
+// 従来の FLV の映像 (AVC) と音声 (AAC)、データの扱いは HTTP-TS 配信 (03-tiny-http-ts-server) と同じものを使う
+import { handle_amf0_data, handle_audio as handle_aac_audio, handle_video as handle_legacy_video, AudioCodecType, FrameType, VideoCodecType } from '../../03-tiny-http-ts-server/src/rtmp-handler.mts';
+import type { AACData, ActionScriptData, AVCData } from '../../03-tiny-http-ts-server/src/rtmp-handler.mts';
 
 export { FrameType };
 
@@ -27,10 +27,10 @@ export type HEVCData = {
   compositionTimeOffset: number;
   data: Buffer;
 });
-// 対応していないコーデック (AV1 や VP9 など) の映像
+// 対応していないコーデックの映像 (Enhanced RTMP の AV1 や VP9、従来の形式の Sorenson H.263 や VP6 など)
 export type UnsupportedVideoData = {
   codec: 'Unsupported';
-  fourcc: string;
+  codecId: string | number; // Enhanced RTMP なら FourCC (例: 'av01')、従来の形式なら CodecID (例: 2 は Sorenson H.263)
 };
 export type VideoData = (AVCData | HEVCData | UnsupportedVideoData) & {
   timestamp: number;
@@ -73,9 +73,17 @@ export const handle_video = (message: { timestamp: number; data: Buffer; }): Vid
   const reader = new ByteReader(message.data);
 
   const meta = reader.readU8();
-  // 先頭 1bit (IsExHeader) が立っていなければ、従来の FLV の VideoTagHeader
+  // 先頭 1bit (IsExHeader) が立っていなければ、従来の FLV の VideoTagHeader: FrameType (4bit), CodecID (4bit)
   const isExHeader = (meta & 0x80) !== 0;
-  if (!isExHeader) { return handle_legacy_video(message); }
+  if (!isExHeader) {
+    // H.264 (AVC) 以外は fMP4 にできないので、対応していないコーデックとして返す (FrameType 5 はコマンドなので扱わない)
+    const frameType = (meta & 0xF0) >> 4;
+    const codecId = meta & 0x0F;
+    if (codecId !== VideoCodecType.AVC && frameType !== FrameType.VIDEO_INFO_OR_COMMAND) {
+      return { kind: 'Video', frameType, timestamp: message.timestamp, codec: 'Unsupported', codecId };
+    }
+    return handle_legacy_video(message);
+  }
 
   // Enhanced RTMP の ExVideoTagHeader: IsExHeader (1bit), FrameType (3bit), PacketType (4bit), FourCC (32bit)
   const frameType = (meta & 0x70) >> 4;
@@ -93,8 +101,28 @@ export const handle_video = (message: { timestamp: number; data: Buffer; }): Vid
       return { kind: 'Video', frameType, timestamp: message.timestamp, ... hevc };
     }
     default:
-      return { kind: 'Video', frameType, timestamp: message.timestamp, codec: 'Unsupported', fourcc };
+      return { kind: 'Video', frameType, timestamp: message.timestamp, codec: 'Unsupported', codecId: fourcc };
   }
+};
+
+// 対応していないコーデックの音声 (MP3 など)
+export type UnsupportedAudioData = {
+  codec: 'Unsupported';
+  soundFormat: number; // 例: 2 は MP3
+};
+export type AudioData = (AACData | UnsupportedAudioData) & {
+  timestamp: number;
+  kind: 'Audio';
+};
+
+export const handle_audio = (message: { timestamp: number; data: Buffer; }): AudioData | null => {
+  if (message.data.byteLength < 1) { return null; }
+  // AudioTagHeader の先頭 4bit が SoundFormat: AAC 以外は fMP4 にできないので、対応していないコーデックとして返す
+  const soundFormat = (message.data[0] & 0xF0) >> 4;
+  if (soundFormat !== AudioCodecType.AAC) {
+    return { kind: 'Audio', timestamp: message.timestamp, codec: 'Unsupported', soundFormat };
+  }
+  return handle_aac_audio(message);
 };
 
 export default (message: Message): VideoData | AudioData | ActionScriptData | null => {
