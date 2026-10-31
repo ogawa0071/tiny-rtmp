@@ -1,7 +1,7 @@
 import type { Message } from '../../01-tiny-rtmp-server/src/message.mts';
 
 import MPEGTSTransmuxer from '../../03-tiny-http-ts-server/src/mpegts-transmuxer.mts';
-import handle_rtmp_payload, { AACPacketType, FrameType, PacketType } from '../../03-tiny-http-ts-server/src/rtmp-handler.mts';
+import handle_rtmp_payload, { FrameType, PacketType } from '../../03-tiny-http-ts-server/src/rtmp-handler.mts';
 import { PlaylistTimestamp } from '../../04-tiny-hls-server/src/playlist-timestamp.mts';
 
 import MediaPlaylist from './media-playlist.mts';
@@ -57,9 +57,8 @@ export default class LLHLSGenerator {
   public feed(message: Message): void {
     const payload = handle_rtmp_payload(message);
     const timestamp = PlaylistTimestamp.fromRTMP(message.timestamp);
-    const keyframe = payload?.kind === 'Video' && payload.packetType === PacketType.CodedFrames && payload.frameType === FrameType.KEY_FRAME;
-    // 映像・音声のフレームか (シーケンスヘッダやメタデータはフレームではない)
-    const frame = (payload?.kind === 'Video' && payload.packetType === PacketType.CodedFrames) || (payload?.kind === 'Audio' && payload.packetType === AACPacketType.Raw);
+    const video = payload?.kind === 'Video' && payload.packetType === PacketType.CodedFrames;
+    const keyframe = video && payload.frameType === FrameType.KEY_FRAME;
     if (keyframe) {
       // キーフレームから新しいセグメントを始める
       this.playlist.append(timestamp);
@@ -68,6 +67,6 @@ export default class LLHLSGenerator {
     }
 
     // キーフレームを含むパーシャルセグメントは単体でデコードを始められる (INDEPENDENT=YES)
-    this.playlist.feed(this.transmuxer.feed(message), timestamp, keyframe, frame);
+    this.playlist.feed(this.transmuxer.feed(message), timestamp, video, keyframe);
   }
 }

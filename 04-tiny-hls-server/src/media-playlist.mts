@@ -22,9 +22,10 @@ export default class MediaPlaylist {
   public published: Promise<boolean>;
   private publishedNotify: (success: boolean) => void;
 
-  // 配信し直しても URI (セグメント名など) が前の配信と重ならないように、番号を現在時刻 (秒) から始める
+  // 配信し直しても URI (セグメント名) が前の配信と重ならないように、番号を現在時刻から始める
+  // セグメントは 1 秒以上なので、0.1 秒ごとに 1 進む時計 (UNIX 時間を 100 ミリ秒で割ったもの) から始めれば、前の配信の番号を越えられる
   // (前の配信の同じ URI のセグメントがキャッシュから使われないようにする: FFmpeg の -hls_start_number_source epoch と同じ考え方)
-  private sequenceNumber: number = Math.floor(Date.now() / 1000) - 1;
+  private sequenceNumber: number = Math.floor(Date.now() / 100) - 1;
 
   private liveWindowLength: number;
 
@@ -122,8 +123,6 @@ export default class MediaPlaylist {
     m3u8 += '#EXT-X-VERSION:3\n';
     m3u8 += `#EXT-X-MEDIA-SEQUENCE:${begin}\n`;
     m3u8 += `#EXT-X-TARGETDURATION:${this.targetduration}\n`;
-    // セグメントはキーフレーム (IDR) から始まるので、他のセグメントなしでデコードできる
-    m3u8 += '#EXT-X-INDEPENDENT-SEGMENTS\n';
     m3u8 += '\n';
     for (const [msn, segment] of this.segmentMap) {
       m3u8 += `#EXTINF:${segment.extinf()!.toFixed(6)},\n`; // #EXTINF:<duration>,[<title>] (タイトルは省略できるがカンマは必要)

@@ -39,12 +39,14 @@ const options = {
 +const rtmp_server = tls.createServer({ noDelay: true, key, cert }, (connection) => {
 
 -const web_server = http.createServer(async (req, res) => {
-+const web_server = http2.createSecureServer({ key, cert }, async (req, res) => {
++const web_server = http2.createSecureServer({ key, cert, allowHTTP1: true }, async (req, res) => {
 ```
+
+HTTP/2 に対応していないプレイヤー (FFmpeg など) も通常の HLS として再生できるように、HTTP/1.1 の接続も受け付けています (`allowHTTP1`)。
 
 ## 主要コンポーネント
 
-- index.mts - [RTMPS/HTTPS HLSサーバ](../07-tiny-rtmps-https-hls-server/)に[LL-HLSサーバ](../05-tiny-llhls-server/)を加え、HTTP2に対応させた実装
+- index.mts - [RTMPS/HTTPS HLSサーバ](../XX-tiny-rtmps-https-hls-server/)に[LL-HLSサーバ](../05-tiny-llhls-server/)を加え、HTTP2に対応させた実装
 
 ## 実行方法
 

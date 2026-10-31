@@ -37,9 +37,10 @@ export default class MediaPlaylist {
   public published: Promise<boolean>;
   private publishedNotify: (success: boolean) => void;
 
-  // 配信し直しても URI (セグメント名など) が前の配信と重ならないように、番号を現在時刻 (秒) から始める
+  // 配信し直しても URI (セグメント名や _HLS_msn) が前の配信と重ならないように、番号を現在時刻から始める
+  // セグメントは 1 秒以上なので、0.1 秒ごとに 1 進む時計 (UNIX 時間を 100 ミリ秒で割ったもの) から始めれば、前の配信の番号を越えられる
   // (前の配信の同じ URI のセグメントがキャッシュから使われないようにする: FFmpeg の -hls_start_number_source epoch と同じ考え方)
-  private sequenceNumber: number = Math.floor(Date.now() / 1000) - 1;
+  private sequenceNumber: number = Math.floor(Date.now() / 100) - 1;
 
   private liveWindowLength: number;
   private partialSegmentDuration: number;
@@ -53,8 +54,8 @@ export default class MediaPlaylist {
 
   // EXT-X-PROGRAM-DATE-TIME の基準 (最初のセグメントの日時と、その timestamp)
   private origin: { pdt: Temporal.Instant; timestamp: number; } | null = null;
-  // 最後に届いたデータの timestamp (配信の終了時に、作成中のセグメントを完成させるのに使う)
-  private latestTimestamp: number | null = null;
+  // 直近の映像のフレームの timestamp (新しい順に 3 つまで、フレームの長さの見積もりに使う)
+  private videoTimestamps: number[] = [];
   private ended: boolean = false;
   // プレイリストが更新されるのを待っている視聴者 (Blocking Playlist Reload)
   private waiters: Set<() => void> = new Set<() => void>();
@@ -68,6 +69,15 @@ export default class MediaPlaylist {
     const { promise: published, resolve: publishedNotify } = Promise.withResolvers<boolean>();
     this.published = published;
     this.publishedNotify = publishedNotify;
+  }
+
+  // 映像のフレームの長さの見積もり (次のフレームが来るまで分からないので、直前のフレームとの間隔を使う)
+  // timestamp はミリ秒に丸められていて間隔が 1 ミリ秒ずれることがあるので、直近 2 つの間隔の短い方にする
+  private videoFrameDuration(): number {
+    const [latest, previous, before] = this.videoTimestamps;
+    if (previous == null) { return 0; }
+    if (before == null) { return latest - previous; }
+    return Math.min(latest - previous, previous - before);
   }
 
   // プレイリストの更新を待っている視聴者を起こす
@@ -126,29 +136,33 @@ export default class MediaPlaylist {
     }
   }
 
-  // frame: 映像・音声のフレームか (シーケンスヘッダやメタデータではないか)
-  public feed(data: Iterable<Buffer>, { timestamp, timescale }: PlaylistTimestamp, keyframe: boolean, frame: boolean) {
+  // video: 映像のフレームか (パーシャルセグメントは、セグメントと同じく映像のフレームの境目で区切る)
+  public feed(data: Iterable<Buffer>, { timestamp, timescale }: PlaylistTimestamp, video: boolean, keyframe: boolean) {
     if (this.ended) { return; }
-    // パーシャルセグメントはフレームで区切り、境界ちょうどのタイムスタンプのフレームは次のパーシャルセグメントに入れる
-    // (データのないシーケンスヘッダなどで区切ると、長さ 0 のパーシャルセグメントができることがある)
-    if (frame && this.currentSegment != null && (timestamp - this.currentSegment.latestBegin()) >= (this.partialSegmentDuration * timescale)) {
-      this.currentSegment.partialComplete(this.currentSegment.latestBegin() + (this.partialSegmentDuration * timescale), timescale);
-      this.updated();
+    if (video) {
+      this.videoTimestamps = [timestamp, ... this.videoTimestamps].slice(0, 3);
+      // このフレームの終わりまで入れると PART-TARGET を超えるなら、このフレームから新しいパーシャルセグメントにする
+      // (パーシャルセグメントの長さは PART-TARGET 以下でなければならない: RFC 8216bis 4.4.4.9)
+      const begin = this.currentSegment?.latestBegin();
+      if (begin != null && timestamp > begin && (timestamp + this.videoFrameDuration()) - begin > this.partialSegmentDuration * timescale) {
+        this.currentSegment!.partialComplete(timestamp, timescale);
+        this.updated();
+      }
     }
 
     for (const buffer of data) {
       this.currentSegment?.feed(buffer, keyframe);
     }
-    if (frame) { this.latestTimestamp = timestamp; }
   }
 
   // 配信の終了時に呼ぶ
   public end(): void {
     if (this.ended) { return; }
     this.ended = true;
-    // 作成中のセグメントは、最後に届いたデータの時刻までで完成させる (最後のフレームの長さは分からないので含めない)
-    if (this.currentSegment != null && this.latestTimestamp != null && this.latestTimestamp > this.currentSegment.begin()) {
-      this.completeCurrentSegment(this.latestTimestamp);
+    // 作成中のセグメントは、最後の映像のフレームの終わりまでで完成させる
+    const end = this.videoTimestamps.length === 0 ? null : this.videoTimestamps[0] + this.videoFrameDuration();
+    if (this.currentSegment != null && end != null && end > this.currentSegment.begin()) {
+      this.completeCurrentSegment(end);
       this.sequenceNumber += 1;
     } else {
       this.currentSegment?.abort();
@@ -169,8 +183,6 @@ export default class MediaPlaylist {
     m3u8 += `#EXT-X-PART-INF:PART-TARGET=${this.partialSegmentDuration.toFixed(6)}\n`;
     m3u8 += `#EXT-X-MEDIA-SEQUENCE:${begin}\n`;
     m3u8 += `#EXT-X-TARGETDURATION:${this.targetduration}\n`;
-    // セグメントはキーフレーム (IDR) から始まるので、他のセグメントなしでデコードできる
-    m3u8 += '#EXT-X-INDEPENDENT-SEGMENTS\n';
     m3u8 += '\n';
     for (const [msn, segment] of this.segmentMap) {
       // 日時はミリ秒の精度で書く (RFC 8216 4.3.2.6)
@@ -216,8 +228,9 @@ export default class MediaPlaylist {
     if (msn > this.sequenceNumber) { return false; }
     if (msn < this.sequenceNumber) {
       // 完成したセグメントの最後のパーシャルセグメントより後ろの番号は、次のセグメントの 0 番目として扱う (RFC 8216bis 6.2.5.2)
+      // (もう残っていない古いセグメントなら、プレイリストはそれより先まで進んでいる)
       const segment = this.segmentMap.get(msn) ?? this.orphanedMap.get(msn);
-      if (part != null && segment?.partial(part) == null) { return this.contains(msn + 1, 0); }
+      if (part != null && segment != null && segment.partial(part) == null) { return this.contains(msn + 1, 0); }
       return true;
     }
     // 作成中のセグメントは、完成したパーシャルセグメントだけがプレイリストに載っている
@@ -230,11 +243,15 @@ export default class MediaPlaylist {
     if (this.ended) { return false; }
     // セグメントは、最後の (完成した) セグメントの 2 つ先まで (作成中のセグメントは、まだセグメントとしては載っていない)
     if (msn > (this.sequenceNumber - 1) + 2) { return true; }
-    if (part == null || msn !== this.sequenceNumber || this.currentSegment == null) { return false; }
+    if (part == null || this.currentSegment == null) { return false; }
     // パーシャルセグメントは、最後に完成したもの (今書き込んでいるものの 1 つ前) から
     // Advance Part Limit (PART-TARGET が 1 秒未満なら 3 / PART-TARGET、それ以外は 3) 先まで
     const limit = this.partialSegmentDuration < 1 ? 3 / this.partialSegmentDuration : 3;
-    return part > (this.currentSegment.latestIndex() - 1) + limit;
+    const latest = this.currentSegment.latestIndex() - 1;
+    if (msn === this.sequenceNumber) { return part - latest > limit; }
+    // 次のセグメントのパーシャルセグメントは、少なくとも今書き込んでいるものと、次のセグメントの 0〜part 番目の分だけ先にある
+    if (msn === this.sequenceNumber + 1) { return 1 + (part + 1) > limit; }
+    return false;
   }
 
   // 指定された (パーシャル) セグメントがプレイリストに載るまで待つ (Blocking Playlist Reload)
@@ -246,8 +263,10 @@ export default class MediaPlaylist {
       const remains = deadline - performance.now();
       if (remains <= 0) { return false; }
       await new Promise<void>((resolve) => {
-        const timer = setTimeout(resolve, remains);
-        this.waiters.add(() => { clearTimeout(timer); resolve(); });
+        // 時間切れでも更新でも、待つのをやめる時は自分を waiters から外す
+        const wakeup = () => { clearTimeout(timer); this.waiters.delete(wakeup); resolve(); };
+        const timer = setTimeout(wakeup, remains);
+        this.waiters.add(wakeup);
       });
     }
     return true;
