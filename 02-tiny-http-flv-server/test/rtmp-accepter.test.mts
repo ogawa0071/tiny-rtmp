@@ -378,7 +378,7 @@ describe('Regression Test', () => {
             description: 'Publish Accepted',
             level: 'status',
           } : {
-            code: 'NetStream.Publish.Failed',
+            code: 'NetStream.Publish.BadName',
             description: 'Publish Failed',
             level: 'error',
           },
@@ -722,7 +722,7 @@ describe('Regression Test', () => {
         0,
         null,
         {
-          code: 'NetStream.Publish.Failed',
+          code: 'NetStream.Publish.BadName',
           description: 'Publish Failed',
           level: 'error',
         },

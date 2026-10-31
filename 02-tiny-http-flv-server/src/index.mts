@@ -157,11 +157,12 @@ const web_server = http.createServer({ highWaterMark }, (req, res) => {
     res.end();
     return;
   }
-  // FLV Header は、配信のメタデータが分かってから (視聴者の初期化時に) 送る
+  // FLV Header は、配信のメタデータが分かってから (視聴者の初期化時に) 送るので、レスポンスヘッダだけ先に送る
   res.writeHead(200, {
     'content-type': 'video/x-flv',
     'access-control-allow-origin': '*',
   });
+  res.flushHeaders();
 
   const viewer: Viewer = {
     write: (chunk: Buffer) => {

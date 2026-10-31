@@ -176,7 +176,7 @@ export const TRANSITION = {
       description: description ?? 'Publish Accepted',
     } : {
       level: 'error', // 異常系
-      code: 'NetStream.Publish.Failed', // Permission Denied
+      code: 'NetStream.Publish.BadName', // 配信中や不正なストリーム名 (Flash の NetStatus のコードで、OBS (librtmp) や nginx-rtmp も使う)
       description: description ?? 'Publish Failed',
     };
 
@@ -312,29 +312,44 @@ async function* handle_rtmp(connection: Duplex, auth: AuthConfiguration, handsha
   }
 }
 
+// 複数の配信が同時に同じ出力先へ書き込むと FLV が壊れるので、書き出すのは一度に一つの配信だけにする
+let recording = false;
+
 export default async (connection: Duplex, auth: AuthConfiguration, open_output?: () => Writable, handshake: Handshake = handle_handshake): Promise<void> => {
   // FLV の出力先は配信が始まってから開く (認証で切断されるような接続では開かない)
-  let writer: FLVWriter | null = null;
+  // 書き出すかどうかは配信の最初のメッセージで決める (配信の途中から書き出すと、FLV の先頭に必要な初期化情報が欠ける)
+  // undefined: まだ決めていない, null: この配信は書き出さない
+  let writer: FLVWriter | null | undefined = undefined;
+  // FLV のタグの timestamp は最初のタグを 0 とした時刻 (RTMP の timestamp は 0 から始まるとは限らない)
+  let base: number | null = null;
   try {
     for await (const message of handle_rtmp(connection, auth, handshake)) {
-      if (open_output == null) { continue; }
-      writer ??= new FLVWriter(open_output());
+      if (writer === undefined) {
+        writer = open_output == null || recording ? null : new FLVWriter(open_output());
+        recording ||= writer != null;
+      }
+      if (writer == null) { continue; }
+      base ??= message.timestamp;
+      const timestamp = Math.max(0, message.timestamp - base); // 最初のタグより前の時刻は 0 に揃える
 
       switch (message.message_type_id) {
         case MessageType.Audio:
         case MessageType.Video:
-          writer.write(message);
+          writer.write({ ... message, timestamp });
           break;
         case MessageType.DataAMF0: {
           // 配信ソフトは @setDataFrame 付きで onMetaData を送ってくるので、FLV には @setDataFrame を除いて書き込む
           const [name, ... values] = message.data;
           const data = write_amf0(... (name === '@setDataFrame' ? values : message.data));
-          writer.write({ ... message, data });
+          writer.write({ ... message, timestamp, data });
           break;
         }
       }
     }
   } finally {
-    writer?.close();
+    if (writer != null) {
+      writer.close();
+      recording = false;
+    }
   }
 };

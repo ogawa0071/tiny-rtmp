@@ -210,8 +210,8 @@ const pingpong = async (reader: AsyncByteReader, socket: Duplex): Promise<void> 
         write_frame(socket, Opcode.Pong, payload);
         break;
       case Opcode.Close:
-        // Close を受け取ったら、同じステータスコードで Close を返して切断する
-        write_frame(socket, Opcode.Close, payload.subarray(0, 2));
+        // Close を受け取ったら、同じステータスコードで Close を返して切断する (こちらから Close を送った後の返事なら返さない)
+        if (socket.writable) { write_frame(socket, Opcode.Close, payload.subarray(0, 2)); }
         socket.end();
         return;
     }
