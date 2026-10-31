@@ -320,7 +320,8 @@ export default async (connection: Duplex, auth: AuthConfiguration, open_output?:
   // 書き出すかどうかは配信の最初のメッセージで決める (配信の途中から書き出すと、FLV の先頭に必要な初期化情報が欠ける)
   // undefined: まだ決めていない, null: この配信は書き出さない
   let writer: FLVWriter | null | undefined = undefined;
-  // FLV のタグの timestamp は最初のタグを 0 とした時刻 (RTMP の timestamp は 0 から始まるとは限らない)
+  // FLV のタグの timestamp は最初の映像/音声のタグを 0 とした時刻 (RTMP の timestamp は 0 から始まるとは限らない)
+  // onMetaData は映像/音声と同じ時計とは限らない (中継サーバなどは 0 で送ってくる) ので、基準にはしない
   let base: number | null = null;
   try {
     for await (const message of handle_rtmp(connection, auth, handshake)) {
@@ -329,10 +330,12 @@ export default async (connection: Duplex, auth: AuthConfiguration, open_output?:
         recording ||= writer != null;
       }
       if (writer == null) { continue; }
-      base ??= message.timestamp;
+      if (message.message_type_id === MessageType.Audio || message.message_type_id === MessageType.Video) {
+        base ??= message.timestamp;
+      }
       // RTMP の timestamp は 32bit で一周するので、差も 2^32 で一周させて求める
-      // 32bit の符号付き整数として負になる差 (最初のタグより前の時刻) は 0 に揃える
-      const elapsed = (message.timestamp - base + 2 ** 32) % 2 ** 32;
+      // 32bit の符号付き整数として負になる差 (最初の映像/音声より前の時刻) と、最初の映像/音声より前に届いたデータは 0 に揃える
+      const elapsed = base == null ? 0 : (message.timestamp - base + 2 ** 32) % 2 ** 32;
       const timestamp = elapsed < 2 ** 31 ? elapsed : 0;
 
       switch (message.message_type_id) {

@@ -203,13 +203,13 @@ describe('Regression Test', () => {
       ];
       expect(data).toStrictEqual(strip(expected));
     }
-    // send data
+    // send data (onMetaData は映像/音声と違う時計 (ここでは 0) で送られることがある)
     {
       writer.write({
-        message_type_id: MessageType.Video,
+        message_type_id: MessageType.DataAMF0,
         message_stream_id: 1,
-        timestamp: 123456789,
-        data: Buffer.from('test', 'ascii'),
+        timestamp: 0,
+        data: ['@setDataFrame', 'onMetaData', { videocodecid: 7, audiocodecid: 10 }],
       });
 
       // header
@@ -218,29 +218,47 @@ describe('Regression Test', () => {
       expect((await flv.readU8())).toStrictEqual(0x05);
       expect((await flv.readU32BE())).toStrictEqual(9);
       expect((await flv.readU32BE())).toStrictEqual(0);
-      // tag
-      expect((await flv.readU8())).toStrictEqual(MessageType.Video);
-      expect((await flv.readU24BE())).toStrictEqual(4);
-      // FLV の最初のタグの timestamp は 0 (以降のタグは、最初のタグからの時刻になる)
+      // tag (最初の映像/音声より前に届いたデータは 0)
+      expect((await flv.readU8())).toStrictEqual(MessageType.DataAMF0);
+      const size = await flv.readU24BE();
       expect((await flv.readU24BE())).toStrictEqual(0);
       expect((await flv.readU8())).toStrictEqual(0);
       expect((await flv.readU24BE())).toStrictEqual(0);
-      expect((await flv.read(4)).equals(Buffer.from('test', 'ascii'))).toStrictEqual(true);
-      expect((await flv.readU32BE())).toStrictEqual(4 + 11);
+      await flv.read(size);
+      expect((await flv.readU32BE())).toStrictEqual(size + 11);
     }
-    // send data (24bit に収まらない timestamp)
+    // send data (32bit で一周する直前の timestamp)
     {
       writer.write({
         message_type_id: MessageType.Video,
         message_stream_id: 1,
-        timestamp: 123456789 + 2 ** 24 + 5,
+        timestamp: 2 ** 32 - 1000,
         data: Buffer.from('test', 'ascii'),
       });
 
       // tag
       expect((await flv.readU8())).toStrictEqual(MessageType.Video);
       expect((await flv.readU24BE())).toStrictEqual(4);
-      // 最初のタグからの時刻 (2^24 + 5) の下位 24bit と、上位 8bit (TimestampExtended)
+      // FLV のタグの timestamp は最初の映像/音声のタグを 0 とした時刻
+      expect((await flv.readU24BE())).toStrictEqual(0);
+      expect((await flv.readU8())).toStrictEqual(0);
+      expect((await flv.readU24BE())).toStrictEqual(0);
+      expect((await flv.read(4)).equals(Buffer.from('test', 'ascii'))).toStrictEqual(true);
+      expect((await flv.readU32BE())).toStrictEqual(4 + 11);
+    }
+    // send data (32bit で一周した後の、24bit に収まらない時刻)
+    {
+      writer.write({
+        message_type_id: MessageType.Video,
+        message_stream_id: 1,
+        timestamp: (2 ** 32 - 1000 + 2 ** 24 + 5) % 2 ** 32,
+        data: Buffer.from('test', 'ascii'),
+      });
+
+      // tag
+      expect((await flv.readU8())).toStrictEqual(MessageType.Video);
+      expect((await flv.readU24BE())).toStrictEqual(4);
+      // 最初の映像/音声のタグからの時刻 (2^24 + 5) の下位 24bit と、上位 8bit (TimestampExtended)
       expect((await flv.readU24BE())).toStrictEqual(5);
       expect((await flv.readU8())).toStrictEqual(1);
       expect((await flv.readU24BE())).toStrictEqual(0);
