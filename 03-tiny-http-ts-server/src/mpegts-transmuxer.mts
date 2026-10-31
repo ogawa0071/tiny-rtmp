@@ -39,9 +39,9 @@ const PCR_INTERVAL = 50;
 // データが届いてからデコードするまでの猶予で、ないとデコードする時刻にデータが届き終わらない (FFmpeg の -muxdelay と同じ)
 const DECODE_DELAY = 700;
 
-// RTMP の timestamp (ミリ秒) を MPEG-TS の 90kHz (33bit) に変換する
+// RTMP の timestamp (ミリ秒) を MPEG-TS の 90kHz (33bit) に変換する (負の値も 33bit で一周させて正の値にする)
 const timestamp_from_rtmp_to_mpegts = (timestamp: number): number => {
-  return (timestamp * 90) % 2 ** 33;
+  return ((timestamp * 90) % 2 ** 33 + 2 ** 33) % 2 ** 33;
 };
 
 export default class MPEGTSTransmuxer {
@@ -100,6 +100,8 @@ export default class MPEGTSTransmuxer {
           return;
         }
         if (this.audioSpecificConfig == null) { return; }
+        // 中身のない AAC のフレームは ADTS にできないので送らない (raw_data_block は終端の ID_END だけでも 1 byte ある)
+        if (payload.data.byteLength === 0) { return; }
         yield* this.emitPSIAndPCR(payload.timestamp);
         yield* this.aacPacketizer.packetize(
           write_pes(
