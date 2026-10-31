@@ -63,6 +63,8 @@ const handle_hevc = (packetType: number, reader: ByteReader): HEVCData | null =>
 };
 
 export const handle_video = (message: { timestamp: number; data: Buffer; }): VideoData | null => {
+  // 映像のフレームなら、従来の形式でも Enhanced RTMP の形式でも 5 byte 以上ある
+  if (message.data.byteLength < 5) { return null; }
   const reader = new ByteReader(message.data);
 
   const meta = reader.readU8();
@@ -73,6 +75,10 @@ export const handle_video = (message: { timestamp: number; data: Buffer; }): Vid
   // Enhanced RTMP の ExVideoTagHeader: IsExHeader (1bit), FrameType (3bit), PacketType (4bit), FourCC (32bit)
   const frameType = (meta & 0x70) >> 4;
   const packetType = meta & 0x0F;
+  // FrameType 5 は映像のフレームではなくコマンドなので扱わない
+  if (frameType === FrameType.VIDEO_INFO_OR_COMMAND) { return null; }
+  // CodedFrames は FourCC の後ろに CompositionTime (SI24) が続く
+  if (packetType === PacketType.CodedFrames && message.data.byteLength < 8) { return null; }
   const fourcc = reader.read(4).toString('ascii');
 
   switch (fourcc) {

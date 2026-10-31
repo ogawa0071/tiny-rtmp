@@ -87,11 +87,16 @@ const handle_avc = (reader: ByteReader): AVCData | null => {
 };
 
 export const handle_video = ({ timestamp, data }: { timestamp: number; data: Buffer; }): VideoData | null => {
+  // AVC のフレームなら VideoTagHeader (1byte), AVCPacketType (1byte), CompositionTime (3byte) が必ずある
+  if (data.byteLength < 5) { return null; }
   const reader = new ByteReader(data);
 
   const meta = reader.readU8();
   const frameType = (meta & 0xF0) >> 4;
   const codec = meta & 0x0F;
+  // FrameType 5 は映像のフレームではなくコマンド (AVCPacketType などを持たない) なので扱わない
+  // また先頭 1bit が立っていれば Enhanced RTMP の ExVideoTagHeader なので、従来の形式としては扱わない
+  if (frameType === FrameType.VIDEO_INFO_OR_COMMAND || (meta & 0x80) !== 0) { return null; }
 
   switch (codec) {
     case VideoCodecType.AVC: {
@@ -123,6 +128,8 @@ const handle_aac = (reader: ByteReader): AACData | null => {
 };
 
 export const handle_audio = ({ timestamp, data }: { timestamp: number; data: Buffer; }): AudioData | null => {
+  // AAC なら AudioTagHeader (1byte) と AACPacketType (1byte) が必ずある
+  if (data.byteLength < 2) { return null; }
   const reader = new ByteReader(data);
 
   const meta = reader.readU8();
@@ -145,9 +152,10 @@ export const handle_amf0_data = ({ timestamp, data }: { timestamp: number; data:
 };
 
 // 配信ソフトは onMetaData を @setDataFrame 付きで送ってくる (['@setDataFrame', 'onMetaData', { ... }])
+// ただし @setDataFrame が付いていない onMetaData (['onMetaData', { ... }]) もあるので、どちらも受け付ける
 export const read_onmetadata = (values: AMF0Value[]): AMF0Object | null => {
-  const [command, name, metadata] = values;
-  if (command !== '@setDataFrame' || name !== 'onMetaData' || !isAMF0Object(metadata)) { return null; }
+  const [name, metadata] = values[0] === '@setDataFrame' ? values.slice(1) : values;
+  if (name !== 'onMetaData' || !isAMF0Object(metadata)) { return null; }
   return metadata;
 };
 
