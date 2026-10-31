@@ -36,6 +36,10 @@ describe('AVCC to Annex B', () => {
     expect(write_annexb_avc(avcc('09f0', '67dd', '68ee', '65cc'), record)).toStrictEqual(annexb('09f0', '67dd', '68ee', '65cc'));
   });
 
+  test('SPS is inserted before an in-band PPS without SPS', () => {
+    expect(write_annexb_avc(avcc('68ee', '65cc'), record)).toStrictEqual(annexb('09f0', '67aa', '68ee', '65cc'));
+  });
+
   test('Zero-length NAL units are skipped', () => {
     expect(write_annexb_avc(avcc('', '41cc'), record)).toStrictEqual(annexb('09f0', '41cc'));
   });

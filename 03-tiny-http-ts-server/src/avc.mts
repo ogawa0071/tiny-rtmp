@@ -59,7 +59,17 @@ export const write_annexb_avc = (sizedNalus: Buffer, avcDecoderConfigurationReco
     switch (naluType) {
       case 0x09: hasAUD = true; break;
       case 0x07: hasSPS = true; break;
-      case 0x08: hasPPS = true; break;
+      case 0x08: { // PPS
+        // PPS は SPS を参照するので、SPS がまだなければ PPS の前に AVCDecoderConfigurationRecord の SPS を入れる
+        if (!hasSPS) {
+          for (const sps of avcDecoderConfigurationRecord.SequenceParameterSets) {
+            annexb.push(startcode, sps);
+          }
+          hasSPS = true;
+        }
+        hasPPS = true;
+        break;
+      }
       case 0x05: { // IDR
         if (hasIDR) { break; }
         // 配信ソフトが SPS/PPS を映像データにも入れている時は、そちらが新しいかもしれないので足さない
