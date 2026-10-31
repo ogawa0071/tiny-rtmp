@@ -92,8 +92,9 @@ const rtmp_server = net.createServer({ noDelay: true }, (connection) => {
 rtmp_server.listen(port);
 
 const web_server = http.createServer({ highWaterMark }, (req, res) => {
-  const url = new URL(req.url ?? '/', `http://localhost:${web}`);
-  if (!(req.method === 'GET' && url.pathname === `/${app}/${streamKey}`)) {
+  // new URL は解析できない URL (例: //[) だと例外を投げてサーバごと落ちるので、代わりに null を返す URL.parse を使う
+  const url = URL.parse(req.url ?? '/', `http://localhost:${web}`);
+  if (url == null || !(req.method === 'GET' && url.pathname === `/${app}/${streamKey}`)) {
     res.writeHead(404, { 'access-control-allow-origin': '*' });
     res.end();
     return;

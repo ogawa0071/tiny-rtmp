@@ -121,11 +121,12 @@ const web_server = http.createServer(async (req, res) => {
     res.end(body);
   };
 
-  const url = new URL(req.url ?? '/', `http://localhost:${web}`);
+  // new URL は解析できない URL (例: //[) だと例外を投げてサーバごと落ちるので、代わりに null を返す URL.parse を使う
+  const url = URL.parse(req.url ?? '/', `http://localhost:${web}`);
   const directory = `/${app}/${streamKey}/`;
   // await している間に配信が終わって差し替わっても大丈夫なように、今の配信の LLHLSGenerator を取り出しておく
   const generator = rtmp_to_llhls;
-  if (!(req.method === 'GET' && url.pathname.startsWith(directory)) || generator == null) {
+  if (url == null || !(req.method === 'GET' && url.pathname.startsWith(directory)) || generator == null) {
     respond(404, {});
     return;
   }

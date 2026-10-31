@@ -198,6 +198,8 @@ const pingpong = async (reader: AsyncByteReader, socket: Duplex): Promise<void> 
 
 const web_server = http.createServer();
 web_server.addListener('upgrade', (req, socket, _) => {
+  // upgrade 後のソケットのエラーは http サーバが処理しないので最初にリスナーを付ける (付けないと 404 を返した後の ECONNRESET などでプロセスごと落ちる)
+  socket.on('error', () => { socket.destroy(); });
   const response = (status: number, message: string, headers?: Record<string, string>) => {
     const newline = '\r\n';
     socket.write(`HTTP/1.1 ${status} ${message}` + newline);
@@ -207,8 +209,9 @@ web_server.addListener('upgrade', (req, socket, _) => {
     socket.write(newline);
   };
 
-  const url = new URL(req.url ?? '/', `http://localhost:${web}`);
-  if (!(req.method === 'GET' && url.pathname === `/${app}/${streamKey}`)) {
+  // new URL は解析できない URL (例: //[) だと例外を投げてサーバごと落ちるので、代わりに null を返す URL.parse を使う
+  const url = URL.parse(req.url ?? '/', `http://localhost:${web}`);
+  if (url == null || !(req.method === 'GET' && url.pathname === `/${app}/${streamKey}`)) {
     response(404, 'Not Found', { 'access-control-allow-origin': '*' });
     socket.end();
     return;
