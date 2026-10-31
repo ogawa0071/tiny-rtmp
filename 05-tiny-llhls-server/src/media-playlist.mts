@@ -5,6 +5,9 @@ import type Segment from './segment.mts';
 
 const MINIMUM_LIVE_WINDOW_LENGTH = 3;
 
+// このプロセスで最後に使ったメディアシーケンス番号 (配信し直した時は、これより大きい番号から始める)
+let latestSequenceNumber = 0;
+
 // promise が ms ミリ秒以内に解決すればその値を、間に合わなければ null を返す
 const within = async <T,>(promise: Promise<T>, ms: number): Promise<T | null> => {
   const { promise: timeout, resolve } = Promise.withResolvers<null>();
@@ -39,8 +42,9 @@ export default class MediaPlaylist {
 
   // 配信し直しても URI (セグメント名や _HLS_msn) が前の配信と重ならないように、番号を現在時刻から始める
   // セグメントは 1 秒以上なので、0.1 秒ごとに 1 進む時計 (UNIX 時間を 100 ミリ秒で割ったもの) から始めれば、前の配信の番号を越えられる
+  // ただし実時間より速く届いた配信 (ffmpeg の -re なしなど) の番号は時計を追い越すので、このプロセスで使った番号よりは必ず大きくする
   // (前の配信の同じ URI のセグメントがキャッシュから使われないようにする: FFmpeg の -hls_start_number_source epoch と同じ考え方)
-  private sequenceNumber: number = Math.floor(Date.now() / 100) - 1;
+  private sequenceNumber: number = Math.max(Math.floor(Date.now() / 100) - 1, latestSequenceNumber);
 
   private liveWindowLength: number;
   private partialSegmentDuration: number;
@@ -124,6 +128,7 @@ export default class MediaPlaylist {
       this.completeCurrentSegment(timestamp);
     }
     this.sequenceNumber += 1;
+    latestSequenceNumber = Math.max(latestSequenceNumber, this.sequenceNumber);
     // EXT-X-PROGRAM-DATE-TIME は、最初のセグメントの日時に timestamp の差を足して決める
     // (届いた時刻を使うと、まとめて届いた時にセグメント同士の日時が重なって、日時とセグメントの対応が曖昧になる)
     this.origin ??= { pdt: Temporal.Now.instant(), timestamp };
