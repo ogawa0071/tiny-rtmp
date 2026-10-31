@@ -1,5 +1,3 @@
-import type { Writable } from 'node:stream';
-
 import type { Message } from '../../01-tiny-rtmp-server/src/message.mts';
 
 import MPEGTSTransmuxer from '../../03-tiny-http-ts-server/src/mpegts-transmuxer.mts';
@@ -36,11 +34,15 @@ export default class LLHLSGenerator {
     return this.playlist.published;
   }
 
-  public stream(msn: number, part: number | null, writable: Writable, cb?: (found: boolean) => void): void {
-    return this.playlist.stream(msn, part, writable, cb);
+  public get(msn: number, part: number | null): Promise<Buffer | null> {
+    return this.playlist.get(msn, part);
   }
 
-  public block(msn: number, part: number | null): Promise<void> {
+  public tooFar(msn: number, part: number | null): boolean {
+    return this.playlist.tooFar(msn, part);
+  }
+
+  public block(msn: number, part: number | null): Promise<boolean> {
     return this.playlist.block(msn, part);
   }
 
@@ -59,7 +61,7 @@ export default class LLHLSGenerator {
     if (keyframe) {
       // キーフレームから新しいセグメントを始める
       this.playlist.append(timestamp);
-      // セグメント単体でもデコードを始められるように、セグメントの先頭に PAT/PMT/PCR を入れる
+      // セグメント単体でもデコードを始められるように、セグメントの先頭に PAT/PMT を入れる
       this.transmuxer.resetPSI();
     }
 

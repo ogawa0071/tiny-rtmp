@@ -113,8 +113,9 @@ const handle = async (connection: Duplex) => {
   } catch (e) {
     logger.error('RTMP session error', { error: e });
   } finally {
+    // 配信が終わっても、EXT-X-ENDLIST を付けたプレイリストとセグメントは次の配信が始まるまで返し続ける
+    // (プレイリストに載せたセグメントは、視聴者が取得できるようにしておく必要がある: RFC 8216 6.2.1)
     generator?.end();
-    if (rtmp_to_hls === generator) { rtmp_to_hls = null; }
   }
 };
 

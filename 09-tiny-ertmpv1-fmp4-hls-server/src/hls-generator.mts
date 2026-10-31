@@ -60,7 +60,10 @@ export default class HLSGenerator {
   }
 
   public end(): void {
-    this.playlist.end();
+    // 最後のフレームは長さが分からないので書き出せていない
+    // 最後に書き出したフレームの終わり (= 最後のフレームの先頭) までで、最後のセグメントを完成させる
+    const last = this.previousVideoInformation ?? this.previousAudioInformation;
+    this.playlist.end(last == null ? null : PlaylistTimestamp.fromRTMP(last.dts));
   }
 
   public feed(message: Message): void {

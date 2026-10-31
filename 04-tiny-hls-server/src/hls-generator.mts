@@ -33,13 +33,14 @@ export default class HLSGenerator {
 
   public feed(message: Message): void {
     const payload = handle_rtmp_payload(message);
+    const timestamp = PlaylistTimestamp.fromRTMP(message.timestamp);
     if (payload?.kind === 'Video' && payload.packetType === PacketType.CodedFrames && payload.frameType === FrameType.KEY_FRAME) {
       // キーフレームから新しいセグメントを始める
-      this.playlist.append(PlaylistTimestamp.fromRTMP(payload.timestamp));
-      // セグメント単体でもデコードを始められるように、セグメントの先頭に PAT/PMT/PCR を入れる
+      this.playlist.append(timestamp);
+      // セグメント単体でもデコードを始められるように、セグメントの先頭に PAT/PMT を入れる
       this.transmuxer.resetPSI();
     }
 
-    this.playlist.feed(this.transmuxer.feed(message));
+    this.playlist.feed(this.transmuxer.feed(message), timestamp);
   }
 }

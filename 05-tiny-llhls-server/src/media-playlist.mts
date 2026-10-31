@@ -1,14 +1,12 @@
-import { Writable } from 'node:stream';
-
 import { PlaylistTimestamp } from '../../04-tiny-hls-server/src/playlist-timestamp.mts';
 
 import ConcatenatedSegment from './concatenated-segment.mts';
+import type Segment from './segment.mts';
 
 const MINIMUM_LIVE_WINDOW_LENGTH = 3;
 
 export type MediaPlaylistOption = {
   liveWindowLength: number;
-  orphanedWindowLength: number;
   partialSegmentDuration: number;
   minimumSegmentDuration: number;
 };
@@ -18,7 +16,6 @@ export const MediaPlaylistOption = {
     return {
       ... option,
       liveWindowLength: Math.max(option?.liveWindowLength ?? MINIMUM_LIVE_WINDOW_LENGTH, MINIMUM_LIVE_WINDOW_LENGTH),
-      orphanedWindowLength: Math.max(option?.orphanedWindowLength ?? MINIMUM_LIVE_WINDOW_LENGTH, MINIMUM_LIVE_WINDOW_LENGTH),
       partialSegmentDuration: Math.max(option?.partialSegmentDuration ?? 0.25, 0.25),
       minimumSegmentDuration: Math.max(option?.minimumSegmentDuration ?? 1, 1),
     };
@@ -32,7 +29,6 @@ export default class MediaPlaylist {
   private sequenceNumber: number = -1;
 
   private liveWindowLength: number;
-  private orphanedWindowLength: number;
   private partialSegmentDuration: number;
 
   private currentSegment: ConcatenatedSegment | null = null;
@@ -42,10 +38,17 @@ export default class MediaPlaylist {
   private minimumSegmentDuration: number;
   private targetduration: number | null = null;
 
+  // EXT-X-PROGRAM-DATE-TIME の基準 (最初のセグメントの日時と、その timestamp)
+  private origin: { pdt: Temporal.Instant; timestamp: number; } | null = null;
+  // 最後に届いたデータの timestamp (配信の終了時に、作成中のセグメントを完成させるのに使う)
+  private latestTimestamp: number | null = null;
+  private ended: boolean = false;
+  // プレイリストが更新されるのを待っている視聴者 (Blocking Playlist Reload)
+  private waiters: Set<() => void> = new Set<() => void>();
+
   public constructor(opt?: Partial<MediaPlaylistOption>) {
     const option = MediaPlaylistOption.from(opt);
     this.liveWindowLength = option.liveWindowLength;
-    this.orphanedWindowLength = option.orphanedWindowLength;
     this.partialSegmentDuration = option.partialSegmentDuration;
     this.minimumSegmentDuration = option.minimumSegmentDuration;
 
@@ -54,31 +57,56 @@ export default class MediaPlaylist {
     this.publishedNotify = publishedNotify;
   }
 
+  // プレイリストの更新を待っている視聴者を起こす
+  private updated(): void {
+    for (const wakeup of this.waiters) { wakeup(); }
+    this.waiters.clear();
+  }
+
+  // プレイリストに載っているセグメントの長さの合計 (秒)
+  private duration(): number {
+    return this.segmentMap.values().reduce((total, segment) => total + segment.extinf()!, 0);
+  }
+
+  // 作成中のセグメントを完成させて、プレイリストに載せる
+  private completeCurrentSegment(timestamp: number): void {
+    const segment = this.currentSegment!;
+    segment.complete(timestamp);
+    this.segmentMap.set(this.sequenceNumber, segment);
+    // EXT-X-TARGETDURATION は一番長いセグメントに合わせる (バージョン 6 以降では、セグメントの長さを整数に丸めた値でよい)
+    this.targetduration = Math.max(this.targetduration ?? 0, Math.round(segment.extinf()!));
+
+    // 古いセグメントをライブウィンドウから外す
+    // ただし、プレイリストの長さが Target Duration の 3 倍より短くなるようには外せない (RFC 8216 6.2.2)
+    while (this.segmentMap.size > this.liveWindowLength) {
+      const [msn, oldest] = this.segmentMap.entries().next().value!;
+      if (this.duration() - oldest.extinf()! < 3 * this.targetduration) { break; }
+      this.segmentMap.delete(msn);
+      this.orphanedMap.set(msn, oldest);
+    }
+    // 外したセグメントは、そのセグメントとプレイリストの長さの分の間は取得できる必要がある (RFC 8216 6.2.2)
+    // (LL-HLS のプレイリストには作成中のセグメントも載っているので、プレイリストのセグメント数より 2 つ多く残す)
+    while (this.orphanedMap.size > this.segmentMap.size + 2) {
+      this.orphanedMap.delete(this.orphanedMap.keys().next().value!);
+    }
+  }
+
   public append({ timestamp, timescale }: PlaylistTimestamp) {
+    if (this.ended) { return; }
     if (this.currentSegment != null && (timestamp - this.currentSegment.begin()) < (this.minimumSegmentDuration * timescale)) {
       return;
     }
-    const previousSegment = this.currentSegment;
 
-    if (previousSegment != null) {
-      // 完成を待っている視聴者への通知は、次のセグメントをプレイリストに載せてから行う
-      previousSegment.complete(timestamp, false);
-      this.segmentMap.set(this.sequenceNumber, previousSegment);
-      // EXT-X-TARGETDURATION は全てのセグメントの長さ以上である必要があるので、一番長いセグメントに合わせる
-      this.targetduration = Math.max(this.targetduration ?? 0, Math.ceil(previousSegment.extinf()!));
+    if (this.currentSegment != null) {
+      this.completeCurrentSegment(timestamp);
     }
-    // ライブウィンドウから外れたセグメントは、プレイリストを取得済みの視聴者のために少しの間だけ残しておく
-    const orphaned = this.sequenceNumber - this.liveWindowLength;
-    const orphanedSegment = this.segmentMap.get(orphaned);
-    if (orphanedSegment != null) {
-      this.orphanedMap.set(orphaned, orphanedSegment);
-      this.segmentMap.delete(orphaned);
-    }
-    this.orphanedMap.delete(orphaned - this.orphanedWindowLength);
-
     this.sequenceNumber += 1;
-    this.currentSegment = new ConcatenatedSegment(timestamp, timescale, new Date());
-    previousSegment?.notify();
+    // EXT-X-PROGRAM-DATE-TIME は、最初のセグメントの日時に timestamp の差を足して決める
+    // (届いた時刻を使うと、まとめて届いた時にセグメント同士の日時が重なって、日時とセグメントの対応が曖昧になる)
+    this.origin ??= { pdt: Temporal.Now.instant(), timestamp };
+    const pdt = this.origin.pdt.add({ milliseconds: Math.round((timestamp - this.origin.timestamp) * 1000 / timescale) });
+    this.currentSegment = new ConcatenatedSegment(timestamp, timescale, pdt);
+    this.updated();
 
     if (this.segmentMap.size >= MINIMUM_LIVE_WINDOW_LENGTH) {
       this.publishedNotify(true);
@@ -86,23 +114,38 @@ export default class MediaPlaylist {
   }
 
   public feed(data: Iterable<Buffer>, { timestamp, timescale }: PlaylistTimestamp, keyframe: boolean = false) {
+    if (this.ended) { return; }
     // パーシャルセグメントの境界ちょうどのタイムスタンプのデータは、次のパーシャルセグメントに入れる
     if (this.currentSegment != null && (timestamp - this.currentSegment.latestBegin()) >= (this.partialSegmentDuration * timescale)) {
       this.currentSegment.partialComplete(this.currentSegment.latestBegin() + (this.partialSegmentDuration * timescale), timescale);
+      this.updated();
     }
 
     for (const buffer of data) {
       this.currentSegment?.feed(buffer, keyframe);
     }
+    this.latestTimestamp = timestamp;
   }
 
-  // 配信の終了時に呼ぶ (プレイリストを公開できるまで待っている視聴者に、公開できなかったことを伝える)
+  // 配信の終了時に呼ぶ
   public end(): void {
-    this.publishedNotify(false);
+    if (this.ended) { return; }
+    this.ended = true;
+    // 作成中のセグメントは、最後に届いたデータの時刻までで完成させる (最後のフレームの長さは分からないので含めない)
+    if (this.currentSegment != null && this.latestTimestamp != null && this.latestTimestamp > this.currentSegment.begin()) {
+      this.completeCurrentSegment(this.latestTimestamp);
+      this.sequenceNumber += 1;
+    } else {
+      this.currentSegment?.abort();
+    }
+    this.currentSegment = null;
+    // プレイリストの公開や更新を待っている視聴者に、配信が終わったことを伝える
+    this.publishedNotify(this.segmentMap.size > 0);
+    this.updated();
   }
 
   public m3u8(): string {
-    const begin = Math.max(0, this.sequenceNumber - this.liveWindowLength);
+    const begin = this.sequenceNumber - this.segmentMap.size;
 
     let m3u8 = '';
     m3u8 += '#EXTM3U\n';
@@ -111,25 +154,26 @@ export default class MediaPlaylist {
     m3u8 += `#EXT-X-PART-INF:PART-TARGET=${this.partialSegmentDuration.toFixed(6)}\n`;
     m3u8 += `#EXT-X-MEDIA-SEQUENCE:${begin}\n`;
     m3u8 += `#EXT-X-TARGETDURATION:${this.targetduration}\n`;
+    // セグメントはキーフレーム (IDR) から始まるので、他のセグメントなしでデコードできる
+    m3u8 += '#EXT-X-INDEPENDENT-SEGMENTS\n';
     m3u8 += '\n';
-    for (let i = begin; i < this.sequenceNumber; i++) {
-      const segment = this.segmentMap.get(i)!;
-      const programDateTime = segment.programDateTime();
-      if (programDateTime != null) {
-        m3u8 += `#EXT-X-PROGRAM-DATE-TIME:${programDateTime.toISOString()}\n`;
-      }
+    for (const [msn, segment] of this.segmentMap) {
+      // 日時はミリ秒の精度で書く (RFC 8216 4.3.2.6)
+      m3u8 += `#EXT-X-PROGRAM-DATE-TIME:${segment.programDateTime().toString({ smallestUnit: 'millisecond' })}\n`;
       for (const [index, part] of segment.enumerate()) {
-        m3u8 += `#EXT-X-PART:DURATION=${part.extinf()!.toFixed(6)},URI="${i}_${index}.ts"` + (part.independent() ? ',INDEPENDENT=YES' : '') + '\n';
+        m3u8 += `#EXT-X-PART:DURATION=${part.extinf()!.toFixed(6)},URI="${msn}_${index}.ts"` + (part.independent() ? ',INDEPENDENT=YES' : '') + '\n';
       }
       m3u8 += `#EXTINF:${segment.extinf()!.toFixed(6)},\n`; // #EXTINF:<duration>,[<title>] (タイトルは省略できるがカンマは必要)
-      m3u8 += `${i}.ts\n`;
+      m3u8 += `${msn}.ts\n`;
+    }
+    // 配信が終わったら、これ以上セグメントが増えないことを伝える
+    if (this.ended) {
+      m3u8 += '#EXT-X-ENDLIST\n';
+      return m3u8;
     }
 
     if (this.currentSegment == null) { return m3u8; }
-    const currentProgramDateTime = this.currentSegment.programDateTime();
-    if (currentProgramDateTime != null) {
-      m3u8 += `#EXT-X-PROGRAM-DATE-TIME:${currentProgramDateTime.toISOString()}\n`;
-    }
+    m3u8 += `#EXT-X-PROGRAM-DATE-TIME:${this.currentSegment.programDateTime().toString({ smallestUnit: 'millisecond' })}\n`;
     for (const [index, part] of this.currentSegment.enumerate()) {
       const extinf = part.extinf();
       if (extinf != null) {
@@ -143,40 +187,52 @@ export default class MediaPlaylist {
     return m3u8;
   }
 
-  public stream(msn: number, part: number | null, writable: Writable, cb?: (found: boolean) => void): void {
+  // (パーシャル) セグメントのデータ (作成中なら完成するまで待つ。存在しないか、完成せずに捨てられたら null)
+  public get(msn: number, part: number | null): Promise<Buffer | null> {
     const segment = msn === this.sequenceNumber ? this.currentSegment : this.segmentMap.get(msn) ?? this.orphanedMap.get(msn);
-    if (segment == null) {
-      cb?.(false);
-      writable.end();
-      return;
-    }
-    if (part == null) {
-      cb?.(true);
-      segment.attach(writable);
-      return;
-    }
-    const partial = segment.partial(part);
-    if (partial == null) {
-      cb?.(false);
-      writable.end();
-      return;
-    }
-    cb?.(true);
-    partial.attach(writable);
-    return;
+    const target: Segment | null | undefined = part == null ? segment : segment?.partial(part);
+    return target?.data() ?? Promise.resolve(null);
   }
 
-  public block(msn: number, part: number | null): Promise<void> {
-    if (msn !== this.sequenceNumber || this.currentSegment == null) {
-      return Promise.resolve();
+  // _HLS_msn と _HLS_part で指定された (パーシャル) セグメントが、プレイリストに載っているか
+  private contains(msn: number, part: number | null): boolean {
+    if (msn > this.sequenceNumber) { return false; }
+    if (msn < this.sequenceNumber) {
+      // 完成したセグメントの最後のパーシャルセグメントより後ろの番号は、次のセグメントの 0 番目として扱う (RFC 8216bis 6.2.5.2)
+      const segment = this.segmentMap.get(msn) ?? this.orphanedMap.get(msn);
+      if (part != null && segment?.partial(part) == null) { return this.contains(msn + 1, 0); }
+      return true;
     }
-    if (part == null) {
-      return this.currentSegment.promise();
+    // 作成中のセグメントは、完成したパーシャルセグメントだけがプレイリストに載っている
+    return part != null && this.currentSegment?.partial(part)?.extinf() != null;
+  }
+
+  // 指定が先すぎるか (すぐに 400 Bad Request を返すべきか: RFC 8216bis 6.2.5.2)
+  public tooFar(msn: number, part: number | null): boolean {
+    // 配信が終わっていれば、指定は無視してプレイリストを返す
+    if (this.ended) { return false; }
+    // セグメントは、最後のセグメントの 2 つ先まで
+    if (msn > this.sequenceNumber + 2) { return true; }
+    if (part == null || msn !== this.sequenceNumber || this.currentSegment == null) { return false; }
+    // パーシャルセグメントは、最後に完成したもの (今書き込んでいるものの 1 つ前) から
+    // Advance Part Limit (PART-TARGET が 1 秒未満なら 3 / PART-TARGET、それ以外は 3) 先まで
+    const limit = this.partialSegmentDuration < 1 ? 3 / this.partialSegmentDuration : 3;
+    return part > (this.currentSegment.latestIndex() - 1) + limit;
+  }
+
+  // 指定された (パーシャル) セグメントがプレイリストに載るまで待つ (Blocking Playlist Reload)
+  // Target Duration の 3 倍待っても載らなければ false を返す (503 Service Unavailable を返すべき: RFC 8216bis 6.2.5.2)
+  public async block(msn: number, part: number | null): Promise<boolean> {
+    const deadline = performance.now() + 3 * (this.targetduration ?? 1) * 1000;
+    // 配信が終わっていれば、それ以上は待たない (EXT-X-ENDLIST があれば _HLS_msn と _HLS_part は無視する)
+    while (!this.ended && !this.contains(msn, part)) {
+      const remains = deadline - performance.now();
+      if (remains <= 0) { return false; }
+      await new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, remains);
+        this.waiters.add(() => { clearTimeout(timer); resolve(); });
+      });
     }
-    const partial = this.currentSegment.partial(part);
-    if (partial == null) {
-      return Promise.resolve();
-    }
-    return partial.promise();
+    return true;
   }
 }

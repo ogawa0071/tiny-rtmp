@@ -96,8 +96,9 @@ const handle = async (connection: Duplex) => {
   } catch (e) {
     logger.error('RTMP session error', { error: e });
   } finally {
+    // 配信が終わっても、EXT-X-ENDLIST を付けたプレイリストとセグメントは次の配信が始まるまで返し続ける
+    // (プレイリストに載せたセグメントは、視聴者が取得できるようにしておく必要がある: RFC 8216 6.2.1)
     generator?.end();
-    if (rtmp_to_llhls === generator) { rtmp_to_llhls = null; }
   }
 };
 
@@ -106,7 +107,8 @@ const rtmp_server = tls.createServer({ noDelay: true, key, cert }, (connection) 
 });
 rtmp_server.listen(port);
 
-const web_server = http2.createSecureServer({ key, cert }, async (req, res) => {
+// HTTP/2 に対応していない視聴者も (低遅延ではない通常の HLS として) 視聴できるように、HTTP/1.1 も受け付ける
+const web_server = http2.createSecureServer({ key, cert, allowHTTP1: true }, async (req, res) => {
   const respond = (status: number, headers: Record<string, string>, body: string | Buffer = '') => {
     res.writeHead(status, { 'access-control-allow-origin': '*', ... headers });
     res.end(body);
@@ -130,14 +132,24 @@ const web_server = http2.createSecureServer({ key, cert }, async (req, res) => {
       return;
     }
 
-    // Blocking Playlist Reload: _HLS_msn (と _HLS_part) で指定された (パーシャル) セグメントができるまで待ってから返す
-    const msn = Number.parseInt(url.searchParams.get('_HLS_msn') ?? '', 10);
-    const part = url.searchParams.has('_HLS_part') ? Number.parseInt(url.searchParams.get('_HLS_part')!, 10) : null;
-    if (Number.isNaN(msn) || Number.isNaN(part)) {
+    const msn = url.searchParams.get('_HLS_msn');
+    const part = url.searchParams.get('_HLS_part');
+    if (msn == null && part == null) {
       respond(200, { 'content-type': 'application/vnd.apple.mpegurl', 'cache-control': 'max-age=0' }, generator.m3u8());
       return;
     }
-    await generator.block(msn, part);
+    // Blocking Playlist Reload: _HLS_msn (と _HLS_part) で指定された (パーシャル) セグメントが載るまで待ってから返す (RFC 8216bis 6.2.5.2)
+    // _HLS_part だけの指定、0 以上の整数でない値、先すぎる指定には 400 Bad Request を返す
+    const integer = /^\d+$/;
+    if (msn == null || !integer.test(msn) || (part != null && !integer.test(part)) || generator.tooFar(Number(msn), part == null ? null : Number(part))) {
+      respond(400, { 'cache-control': 'max-age=0' });
+      return;
+    }
+    // Target Duration の 3 倍待っても載らなければ 503 Service Unavailable を返す
+    if (!await generator.block(Number(msn), part == null ? null : Number(part))) {
+      respond(503, { 'cache-control': 'max-age=0' });
+      return;
+    }
     respond(200, { 'content-type': 'application/vnd.apple.mpegurl', 'cache-control': `max-age=${maxage}` }, generator.m3u8());
     return;
   }
@@ -145,14 +157,13 @@ const web_server = http2.createSecureServer({ key, cert }, async (req, res) => {
   const ts = /^(\d+)(?:_(\d+))?\.ts$/.exec(filename);
   if (ts != null) {
     const [, msn, part] = ts;
-    // 作成中の (パーシャル) セグメントは、完成するまで書き込まれた分から順に返していく
-    generator.stream(Number.parseInt(msn, 10), part == null ? null : Number.parseInt(part, 10), res, (found) => {
-      if (found) {
-        res.writeHead(200, { 'content-type': 'video/mp2t', 'access-control-allow-origin': '*', 'cache-control': `max-age=${maxage}` });
-      } else {
-        res.writeHead(404, { 'access-control-allow-origin': '*', 'cache-control': 'max-age=0' });
-      }
-    });
+    // 作成中の (パーシャル) セグメントは、完成するまで待ってからまとめて返す (RFC 8216bis 6.2.6)
+    const data = await generator.get(Number.parseInt(msn, 10), part == null ? null : Number.parseInt(part, 10));
+    if (data == null) {
+      respond(404, { 'cache-control': 'max-age=0' });
+      return;
+    }
+    respond(200, { 'content-type': 'video/mp2t', 'cache-control': `max-age=${maxage}` }, data);
     return;
   }
 
