@@ -161,7 +161,13 @@ const web_server = http.createServer((req, res) => {
     return;
   }
   if (filename === 'manifest.mpd') {
-    respond(200, { 'content-type': 'application/dash+xml', 'cache-control': 'max-age=0' }, generator.mpd());
+    const mpd = generator.mpd();
+    // 最初のセグメントができるまでは MPD を作れないので、配信が始まっていない時と同じく 404 を返す
+    if (mpd == null) {
+      respond(404, { 'cache-control': 'max-age=0' });
+      return;
+    }
+    respond(200, { 'content-type': 'application/dash+xml', 'cache-control': 'max-age=0' }, mpd);
     return;
   }
   // 初期化セグメントは {video|audio}_{session}_init.mp4, セグメントは {video|audio}_{session}_{番号}.m4s

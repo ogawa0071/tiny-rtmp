@@ -38,6 +38,8 @@ export default class DASHGenerator {
 
   private previousVideoInformation: VideoInformation | null = null;
   private aacLatestTimestamp: number | null = null;
+  // 映像を区切ったので、次に届く音声フレームから音声も新しいセグメントにする
+  private audioCutPending = false;
   // moof の sequence_number (Representation ごとに 1 から増やす)
   private videoSequenceNumber = 0;
   private audioSequenceNumber = 0;
@@ -85,7 +87,19 @@ export default class DASHGenerator {
     });
   }
 
-  public mpd(): string {
+  // 配信の映像が、このサーバで扱える AVC か (onMetaData の videocodecid で判断する)
+  // (コーデックを数値ではなく 'avc1' の文字列で送ってくる配信ソフトもある)
+  private hasVideo(): boolean {
+    return this.onMetadata?.videocodecid === 7 || this.onMetadata?.videocodecid === 'avc1';
+  }
+
+  // MPD を作る (まだ MPD に載せられるセグメントがなければ null)
+  public mpd(): string | null {
+    // SegmentTimeline には S が 1 つ以上必要なので、全てのトラックにセグメントができるまでは MPD を作らない
+    // (トラックを後から MPD に足しても、再生を始めたプレイヤーには使われない)
+    const timelines = [this.videoTimeline, this.audioTimeline].filter((timeline) => timeline != null);
+    if (timelines.length === 0 || !timelines.every((timeline) => timeline.hasSegments())) { return null; }
+
     const declaration = '<?xml version="1.0" encoding="UTF-8"?>';
 
     const mpd = XMLNode.from('MPD', {
@@ -110,7 +124,7 @@ export default class DASHGenerator {
       XMLNode.from('cenc:pssh', {}, [make((vector) => { pssh(WIDEVINE_SYSTEM_ID, [this.keyId], WIDEVINE_PSSH_DATA, vector); }).toString('base64')]),
     ]);
 
-    if (this.onMetadata?.videocodecid != null && this.avcDecoderConfigurationRecord != null && this.videoTimeline != null) {
+    if (this.hasVideo() && this.avcDecoderConfigurationRecord != null && this.videoTimeline != null) {
       const avcDecoderConfigurationRecord = read_avc_decoder_configuration_record(this.avcDecoderConfigurationRecord);
       const video_adaptationset = XMLNode.from('AdaptationSet', {
         contentType: 'video',
@@ -202,7 +216,7 @@ export default class DASHGenerator {
 
     // 初期化情報が揃ったトラックから、初期化セグメントを作ってセグメントを並べ始める
 
-    if (this.onMetadata.videocodecid != null && this.avcDecoderConfigurationRecord != null && this.videoTimeline == null) {
+    if (this.hasVideo() && this.avcDecoderConfigurationRecord != null && this.videoTimeline == null) {
       const initialization = make((vector) => {
         initialize(RTMP_TIMESCALE, [1], vector, (vector) => {
           vector.write(write_mp4_avc_track_information(1, RTMP_TIMESCALE, this.encryptionFormat, this.ivType, this.keyId, this.avcDecoderConfigurationRecord!));
@@ -245,12 +259,9 @@ export default class DASHGenerator {
           }));
         }
         // 1 つ前のフレームを今のセグメントに書き出してから、キーフレームで新しいセグメントを始める
+        // 映像を区切った時は音声も区切る (次に届く音声フレームから新しいセグメントに入れる)
         if (payload.frameType === FrameType.KEY_FRAME && this.videoTimeline.append(payload.timestamp)) {
-          // 映像を区切った時は音声も同じタイミングで区切る (次に届く音声フレームから新しいセグメントに入れる)
-          // 音声のフレームの区切りは映像と揃わず 1 秒より少し短くなることがあるので、最小の長さは確認しない
-          if (this.aacLatestTimestamp != null) {
-            this.audioTimeline?.append(this.aacLatestTimestamp + AAC_SAMPLES_PER_FRAME, true);
-          }
+          this.audioCutPending = true;
         }
         this.previousVideoInformation = {
           type: payload.frameType,
@@ -277,8 +288,15 @@ export default class DASHGenerator {
           this.aacLatestTimestamp += AAC_SAMPLES_PER_FRAME;
         }
         const dts = this.aacLatestTimestamp;
-        // 映像がない配信では、音声だけで (1 秒以上たったら) セグメントを区切る
-        if (this.onMetadata.videocodecid == null) { this.audioTimeline.append(dts); }
+        // 映像を区切った後の最初の音声フレームから、音声も新しいセグメントにする
+        // (区切るのをこのフレームの時刻にすれば、音声が途切れた後でもセグメントの開始時刻 S@t と最初のフレームの時刻が一致する)
+        // 音声のフレームの区切りは映像と揃わず 1 秒より少し短くなることがあるので、最小の長さは確認しない
+        if (this.audioCutPending) {
+          this.audioTimeline.append(dts, true);
+          this.audioCutPending = false;
+        }
+        // 映像がない (またはこのサーバで扱えない AVC 以外の映像の) 配信では、音声だけで (1 秒以上たったら) セグメントを区切る
+        if (!this.hasVideo()) { this.audioTimeline.append(dts); }
         this.audioTimeline.feed(make((vector) => {
           const iv = this.ivType.type === IVType.CONSTANT ? this.ivType.constant_iv : crypto.randomBytes(this.ivSize);
           const [encrypted, subsample] = encrypt_aac(this.encryptionFormat, this.key, iv, payload.data);

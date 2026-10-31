@@ -36,6 +36,7 @@ export default class SegmentTimeline {
 
   private minimumSegmentDuration: number;
   private timescale: number;
+  private firstSegmentBandwidth: number | null = null; // 最初のセグメントのビットレート (bps)
 
   public constructor(prefix: string, timescale: number, initialize: Buffer, opt?: Partial<SegmentTimelineOption>) {
     this.prefix = prefix;
@@ -58,6 +59,7 @@ export default class SegmentTimeline {
     if (this.currentSegment != null) {
       this.currentSegment.complete(timestamp);
       this.segmentMap.set(this.sequenceNumber, this.currentSegment);
+      this.firstSegmentBandwidth ??= Math.ceil(this.currentSegment.segment()!.byteLength * 8 * this.timescale / this.currentSegment.duration()!);
     }
     // ライブウィンドウから外れたセグメントは、MPD を取得済みの視聴者のために少しの間だけ残しておく
     const orphaned = this.sequenceNumber - this.liveWindowLength;
@@ -73,13 +75,15 @@ export default class SegmentTimeline {
     return true;
   }
 
-  // MPD に載せる @bandwidth (ライブウィンドウ内のセグメントの最大ビットレート)
-  public bandwidth(): number {
-    let bandwidth = 0;
-    for (const segment of this.segmentMap.values()) {
-      bandwidth = Math.max(bandwidth, Math.ceil(segment.segment()!.byteLength * 8 * this.timescale / Math.max(1, segment.duration()!)));
-    }
-    return bandwidth;
+  // MPD に載せられるセグメントがあるか (SegmentTimeline には S が 1 つ以上必要)
+  public hasSegments(): boolean {
+    return this.segmentMap.size > 0;
+  }
+
+  // MPD に載せる @bandwidth (まだセグメントがなければ null)
+  // 最初のセグメントのビットレートを使い、MPD を更新しても同じ Representation の値は変えない (FFmpeg の dashenc と同じ)
+  public bandwidth(): number | null {
+    return this.firstSegmentBandwidth;
   }
 
   public feed(data: Buffer): void {
