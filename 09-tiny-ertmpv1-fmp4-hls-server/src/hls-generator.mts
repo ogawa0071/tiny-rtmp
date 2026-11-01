@@ -83,7 +83,7 @@ export default class HLSGenerator {
     const payload = handle_rtmp_payload(message);
     if (payload == null) { return; }
 
-    // 対応していないコーデックの映像・音声は fMP4 にできないので、そのトラックがない配信として扱う
+    // 対応していないコーデックの映像・音声はこのサーバでは fMP4 にしないので、そのトラックがない配信として扱う
     if (payload.kind === 'Video' && payload.codec === 'Unsupported') {
       if (this.unsupportedVideoCodec == null) { logger.warn('Unsupported video codec, video is ignored', { codecId: payload.codecId }); }
       this.unsupportedVideoCodec = payload.codecId;
@@ -120,8 +120,9 @@ export default class HLSGenerator {
       }
     }
 
-    // onMetaData に書かれているトラックのうち、fMP4 にできるコーデック (H.264, H.265, AAC) のトラックの初期化情報が揃うまでは何もしない
-    // fMP4 にできないコーデック (MP3 や Sorenson H.263 など) のトラックは待たない
+    // onMetaData に書かれているトラックのうち、このサーバが fMP4 にするコーデック (H.264, H.265, AAC) のトラックの初期化情報が揃うまでは何もしない
+    // このサーバが fMP4 にしないコーデック (MP3 や Sorenson H.263 など) のトラックは待たない
+    // (MP3 も 'mp4a' の esds の ObjectTypeIndication を 0x6B (MPEG-1 Audio) か 0x69 (MPEG-2 Audio) にすれば MP4 に入れられるが、このサーバでは扱わない。Sorenson H.263 は MP4 に入れる方法がない)
     // (MP3 などには初期化情報がなく、最初のフレームが届くまで対応していないと分からないので、待つとそれまでに届いた映像・音声が捨てられる)
     if (this.initialization == null) {
       if (this.onMetadata == null) { return; }

@@ -39,7 +39,7 @@ const trackIds = (generator: HLSGenerator): Set<number> => {
   return ids;
 };
 
-describe('Tracks that cannot be put into fMP4', () => {
+describe('Tracks of codecs that this server does not put into fMP4', () => {
   test('H.264 + MP3: segments start from the first keyframe even when it arrives before the first MP3 frame', () => {
     const generator = new HLSGenerator();
     generator.feed(metadata(7, 2));

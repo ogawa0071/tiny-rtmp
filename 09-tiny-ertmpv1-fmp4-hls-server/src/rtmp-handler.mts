@@ -117,7 +117,7 @@ export type AudioData = (AACData | UnsupportedAudioData) & {
 
 export const handle_audio = (message: { timestamp: number; data: Buffer; }): AudioData | null => {
   if (message.data.byteLength < 1) { return null; }
-  // AudioTagHeader の先頭 4bit が SoundFormat: AAC 以外は fMP4 にできないので、対応していないコーデックとして返す
+  // AudioTagHeader の先頭 4bit が SoundFormat: AAC 以外はこのサーバでは fMP4 にしないので、対応していないコーデックとして返す
   const soundFormat = (message.data[0] & 0xF0) >> 4;
   if (soundFormat !== AudioCodecType.AAC) {
     return { kind: 'Audio', timestamp: message.timestamp, codec: 'Unsupported', soundFormat };
