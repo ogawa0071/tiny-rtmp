@@ -1,9 +1,10 @@
+import { MessageType } from '../../01-tiny-rtmp-server/src/message.mts';
 import type { Message } from '../../01-tiny-rtmp-server/src/message.mts';
 import type { AMF0Object } from '../../01-tiny-rtmp-server/src/amf0-reader.mts';
 
 import { read_audio_specific_config } from '../../03-tiny-http-ts-server/src/aac.mts';
 import { read_avc_decoder_configuration_record } from '../../03-tiny-http-ts-server/src/avc.mts';
-import handle_rtmp_payload, { AACPacketType, FrameType, PacketType, read_onmetadata } from '../../03-tiny-http-ts-server/src/rtmp-handler.mts';
+import handle_rtmp_payload, { AACPacketType, AudioCodecType, FrameType, PacketType, read_onmetadata } from '../../03-tiny-http-ts-server/src/rtmp-handler.mts';
 
 import { fragment, initialize, make } from '../../06-tiny-http-fmp4-server/src/fmp4.mts';
 import { write_mp4_avc_track_information } from '../../06-tiny-http-fmp4-server/src/avc.mts';
@@ -27,6 +28,8 @@ export default class DASHGenerator {
   private avcDecoderConfigurationRecord: Buffer | null = null;
   private audioSpecificConfig: Buffer | null = null;
   private onMetadata: AMF0Object | null = null;
+  // AAC の初期化情報より先に、AAC 以外の音声 (MP3 など) が届いたか
+  private unsupportedAudio = false;
 
   private previousVideoInformation: VideoInformation | null = null;
   private aacLatestTimestamp: number | null = null;
@@ -58,6 +61,8 @@ export default class DASHGenerator {
   // 配信の音声が、このサーバで扱える AAC か (onMetaData の audiocodecid で判断する)
   // (コーデックを数値ではなく 'mp4a' の文字列で送ってくる配信ソフトもある)
   private hasAudio(): boolean {
+    // onMetaData に AAC と書かれていても、AAC の初期化情報より先に AAC 以外の音声が届いたなら、AAC は届かない
+    if (this.unsupportedAudio) { return false; }
     return this.onMetadata?.audiocodecid === 10 || this.onMetadata?.audiocodecid === 'mp4a';
   }
 
@@ -139,6 +144,12 @@ export default class DASHGenerator {
   }
 
   public feed(message: Message): void {
+    // AAC の初期化情報より先に AAC 以外の音声が届いたら、onMetaData に AAC と書かれていても AAC は届かないので、音声を待たない (09 と同じ)
+    // (handle_rtmp_payload は AAC 以外の音声には null を返すので、AudioTagHeader の先頭 4bit の SoundFormat を見る)
+    // (AAC の初期化情報の後に届く Enhanced RTMP の音声 (FFmpeg が 5.1ch などの AAC の後に送る MultichannelConfig や、OBS や FFmpeg の 2 つ目の音声トラック) では AAC をやめない)
+    if (message.message_type_id === MessageType.Audio && this.audioSpecificConfig == null && message.data.byteLength >= 1 && (message.data[0] >> 4) !== AudioCodecType.AAC) {
+      this.unsupportedAudio = true;
+    }
     const payload = handle_rtmp_payload(message);
     if (payload == null) { return; }
 
@@ -158,7 +169,8 @@ export default class DASHGenerator {
         break;
       case 'Data': {
         const metadata = read_onmetadata(payload.values);
-        if (metadata != null) { this.onMetadata = metadata; }
+        // MPD に載せるトラックは最初の onMetaData で決める (配信の途中で onMetaData が送り直されても、トラックを増やしたり減らしたりしない)
+        if (metadata != null) { this.onMetadata ??= metadata; }
         return;
       }
     }
