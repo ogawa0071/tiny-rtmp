@@ -8,7 +8,7 @@
 - mpegts.mts - MPEG-TSフォーマットのパケット生成
 - aac.mts / avc.mts - AACとAVCコーデックの処理
 - bit-reader.mts / bit-builder.mts - ビットレベルでのデータ操作ユーティリティ
-- rtmp-handler.mts - RTMPの映像/音声/データメッセージの中身の解析
+- rtmp-handler.mts - RTMPの映像/音声/データメッセージの中身の解析と、一周して戻る timestamp (RTMP は 32bit, FFmpeg は 31bit) を一周しない時刻に直す処理 (04 以降の HLS, fMP4, DASH のサーバで使う)
 
 ## 実行方法
 

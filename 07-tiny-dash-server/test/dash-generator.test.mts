@@ -163,6 +163,28 @@ describe('MPD', () => {
       }
     }
   });
+
+  test.each([
+    // onMetaData に AVC と書かれていなければ、音声だけで MPD を作れるようになった後に届いた映像は、MPD に足さない
+    ['no onMetaData', null, ['audio']],
+    // onMetaData に AVC と書かれていれば、映像の初期化情報が遅れて届いても待つ
+    ['onMetaData that declares the video', { videocodecid: 7, audiocodecid: 10 }, ['video', 'audio']],
+  ])('%s: an AVC sequence header that arrives after the first audio segment', (_, object, tracks) => {
+    for (const firstRequest of [0, 4000]) {
+      const generator = new DASHGenerator();
+      if (object != null) { generator.feed(onmetadata(object)); }
+      generator.feed(audio(0, AAC_SEQUENCE_HEADER));
+      const mpds: (string | null)[] = [];
+      for (let t = 0; t < 6000; t += 100) {
+        // 最初の音声のセグメント (1 秒) ができた後に、映像が届き始める
+        if (t === 3000) { generator.feed(video(t, AVC_SEQUENCE_HEADER)); }
+        if (t >= 3000) { generator.feed(video(t, avc(t % 1000 === 0 ? 1 : 2))); }
+        generator.feed(audio(t + 8, AAC_FRAME));
+        if (t >= firstRequest) { mpds.push(generator.mpd()); }
+      }
+      expectTracks(mpds, tracks);
+    }
+  });
 });
 
 describe('Sequence headers without the configuration', () => {
@@ -188,5 +210,44 @@ describe('Sequence headers without the configuration', () => {
     const mpd = generator.mpd();
     expect(mpd).toContain('codecs="avc1.4D400D"');
     expect(mpd).toContain('codecs="mp4a.40.2"');
+  });
+
+  // FFmpeg は ADTS の AAC (MPEG-TS や HLS などの入力) を -c copy で送る時、中身が空の AAC の初期化情報 (af00) を先に送り、本当の初期化情報は最初の音声のフレームの直前に送ってくる
+  // (FFmpeg 8.0 以降の 5.1ch などでは、中身が空の初期化情報の後に Enhanced RTMP の形式 (SoundFormat 9) の MultichannelConfig も送ってくる)
+  // 音声が映像より遅れて始まり、MPD を作れるようになる (最初の映像のセグメントができる) 1 秒より後に本当の初期化情報が届いても、AAC が届くと分かっているので待つ
+  test.each<[string, AMF0Object | null, string[]]>([
+    ['stereo, no onMetaData', null, ['af00']],
+    ['5.1ch (MultichannelConfig)', { videocodecid: 7, audiocodecid: 10 }, ['af00', '946d70346101060000003f']],
+    ['5.1ch (MultichannelConfig), no onMetaData', null, ['af00', '946d70346101060000003f']],
+  ])('FFmpeg -c copy from ADTS AAC, %s: the AAC track is waited for even if the audio starts late', (_, object, headers) => {
+    for (const firstRequest of [0, 4000]) {
+      const generator = new DASHGenerator();
+      if (object != null) { generator.feed(onmetadata(object)); }
+      generator.feed(video(0, AVC_SEQUENCE_HEADER));
+      for (const hex of headers) { generator.feed(audio(0, Buffer.from(hex, 'hex'))); }
+      expectTracks(publish(generator, { audioStart: 2500, firstRequest }), ['video', 'audio']);
+    }
+  });
+});
+
+describe('RTMP timestamps that wrap around', () => {
+  test.each([
+    ['the RTMP specification (32bit)', 2 ** 32],
+    ['FFmpeg (31bit)', 2 ** 31],
+  ])('segments keep being made after the timestamps of %s wrap around', (_, wrap) => {
+    const generator = new DASHGenerator();
+    // 配信を始めてから 2.5 秒後に timestamp が一周して 0 に戻る
+    const timestamp = (t: number): number => (wrap - 2500 + t) % wrap;
+    generator.feed(metadata(7, 10));
+    generator.feed(video(timestamp(0), AVC_SEQUENCE_HEADER));
+    generator.feed(audio(timestamp(0), AAC_SEQUENCE_HEADER));
+    for (let t = 0; t < 6000; t += 100) {
+      generator.feed(video(timestamp(t), avc(t % 1000 === 0 ? 1 : 2)));
+      generator.feed(audio(timestamp(t + 8), AAC_FRAME));
+    }
+    // 一周した後も映像は 1 秒ごとに区切られ、セグメントの開始時刻 (S@t) も戻らない (ライブウィンドウには最後の 3 つが載る)
+    const [videoTimeline] = generator.mpd()!.split('contentType="audio"');
+    const segments = [... videoTimeline.matchAll(/<S t="(\d+)" d="(\d+)"/g)].map(([, t, d]) => [Number(t), Number(d)]);
+    expect(segments).toStrictEqual([[wrap - 500, 1000], [wrap + 500, 1000], [wrap + 1500, 1000]]);
   });
 });

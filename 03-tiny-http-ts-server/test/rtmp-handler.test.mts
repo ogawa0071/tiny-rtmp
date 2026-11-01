@@ -1,6 +1,9 @@
 import { describe, expect, test } from 'vitest';
 
-import { handle_audio, handle_video, read_onmetadata } from '../src/rtmp-handler.mts';
+import { MessageType } from '../../01-tiny-rtmp-server/src/message.mts';
+import type { Message } from '../../01-tiny-rtmp-server/src/message.mts';
+
+import { handle_audio, handle_video, read_onmetadata, TimestampUnwrapper } from '../src/rtmp-handler.mts';
 
 describe('FLV Tag', () => {
   test.each([
@@ -74,5 +77,39 @@ describe('onMetaData', () => {
 
   test('other data', () => {
     expect(read_onmetadata(['onTextData', { text: 'hello' }])).toBeNull();
+  });
+});
+
+describe('TimestampUnwrapper', () => {
+  const video = (timestamp: number): Message => ({ message_type_id: MessageType.Video, message_stream_id: 1, timestamp, data: Buffer.alloc(0) });
+  const audio = (timestamp: number): Message => ({ message_type_id: MessageType.Audio, message_stream_id: 1, timestamp, data: Buffer.alloc(0) });
+  const unwrap = (messages: Message[]): number[] => {
+    const unwrapper = new TimestampUnwrapper();
+    return messages.map((message) => unwrapper.unwrap(message).timestamp);
+  };
+
+  test('timestamps that do not wrap around are left as they are', () => {
+    expect(unwrap([video(1000), audio(1021), video(1033), audio(990), video(1067)])).toStrictEqual([1000, 1021, 1033, 990, 1067]);
+  });
+
+  test('an onMetaData is left as it is and does not move the time of the video and audio', () => {
+    const unwrapper = new TimestampUnwrapper();
+    unwrapper.unwrap(video(2 ** 32 - 33));
+    const onmetadata: Message = { message_type_id: MessageType.DataAMF0, message_stream_id: 1, timestamp: 0, data: ['@setDataFrame', 'onMetaData', {}] };
+    expect(unwrapper.unwrap(onmetadata)).toStrictEqual(onmetadata);
+    expect(unwrapper.unwrap(video(0)).timestamp).toBe(2 ** 32);
+  });
+
+  test.each([
+    // RTMP 仕様の 32bit (約 49.7 日) と、FFmpeg の 31bit (約 24.8 日)
+    ['32bit wraparound of the RTMP specification', 2 ** 32],
+    ['31bit wraparound of FFmpeg', 2 ** 31],
+  ])('%s keeps the time increasing', (_, wrap) => {
+    expect(unwrap([video(wrap - 33), audio(wrap - 11), video(0), audio(12), video(33)])).toStrictEqual([wrap - 33, wrap - 11, wrap, wrap + 12, wrap + 33]);
+  });
+
+  test('negative DTS of FFmpeg (-avoid_negative_ts disabled, sent as 0x7FFFFFxx) are shifted so that the time is not negative', () => {
+    // FFmpeg は初期化情報を 0 ms で送ってから、-67 ms のキーフレーム, -33 ms の映像, -21 ms の音声, 0 ms の映像と音声を 31bit で送る
+    expect(unwrap([video(0), audio(0), video(0x7FFFFFBD), video(0x7FFFFFDF), audio(0x7FFFFFEB), video(0), audio(0)])).toStrictEqual([0, 0, 0, 34, 46, 67, 67]);
   });
 });

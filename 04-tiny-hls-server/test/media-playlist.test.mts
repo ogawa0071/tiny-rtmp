@@ -8,7 +8,7 @@ const publish = (playlist: MediaPlaylist, interval: number, count: number): void
   for (let i = 0; i <= count; i++) {
     const timestamp = PlaylistTimestamp.fromRTMP(i * interval);
     playlist.append(timestamp);
-    playlist.feed([Buffer.from([i % 256])], timestamp);
+    playlist.feed([Buffer.from([i % 256])], timestamp, true);
   }
 };
 
@@ -41,8 +41,8 @@ describe('End of stream', () => {
   test('the last segment is completed and EXT-X-ENDLIST is added', () => {
     const playlist = new MediaPlaylist({ liveWindowLength: 3 });
     publish(playlist, 1000, 5);
-    // 最後のセグメントの途中までデータが届いてから、配信が終わる
-    playlist.feed([Buffer.from([0])], PlaylistTimestamp.fromRTMP(5500));
+    // 最後のセグメントの途中まで映像のフレームが届いてから、配信が終わる
+    playlist.feed([Buffer.from([0])], PlaylistTimestamp.fromRTMP(5500), true);
     playlist.end();
 
     const m3u8 = playlist.m3u8();

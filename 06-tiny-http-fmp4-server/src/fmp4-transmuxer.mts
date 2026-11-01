@@ -3,7 +3,7 @@ import type { Message } from '../../01-tiny-rtmp-server/src/message.mts';
 import type { AMF0Object } from '../../01-tiny-rtmp-server/src/amf0-reader.mts';
 
 import { read_audio_specific_config } from '../../03-tiny-http-ts-server/src/aac.mts';
-import handle_rtmp_payload, { AACPacketType, AudioCodecType, FrameType, PacketType, read_onmetadata, VideoCodecType } from '../../03-tiny-http-ts-server/src/rtmp-handler.mts';
+import handle_rtmp_payload, { AACPacketType, AudioCodecType, FrameType, PacketType, read_onmetadata, TimestampUnwrapper, VideoCodecType } from '../../03-tiny-http-ts-server/src/rtmp-handler.mts';
 
 import { write_mp4_aac_track_information } from './aac.mts';
 import { fragment, initialize, make } from './fmp4.mts';
@@ -19,6 +19,8 @@ type VideoInformation = {
 const RTMP_TIMESCALE = 1000;
 const VIDEO_TRACK_ID = 1;
 const AUDIO_TRACK_ID = 2;
+// onMetaData にコーデックが書かれていない時に、まだ初期化情報が届いていないトラックを、最初のフレームから待つ長さ (ミリ秒)
+const UNDECLARED_TRACK_WAIT = 1000;
 
 // 視聴者に送る fMP4 の断片 (moof + mdat)
 export type FMP4Fragment = {
@@ -28,11 +30,14 @@ export type FMP4Fragment = {
 };
 
 export default class FMP4Transmuxer {
+  private timestamps = new TimestampUnwrapper();
   private avcDecoderConfigurationRecord: Buffer | null = null;
   private audioSpecificConfig: Buffer | null = null;
   private onMetadata: AMF0Object | null = null;
-  // AAC の初期化情報より先に、AAC 以外の音声 (MP3 など) が届いたか
-  private unsupportedAudio = false;
+  // 最初に届いた音声のメッセージの SoundFormat (AudioTagHeader の先頭 4bit: 10 は AAC、2 は MP3、9 は Enhanced RTMP の形式)
+  private firstAudioFormat: number | null = null;
+  // 最初に届いたフレームの timestamp (onMetaData にコーデックが書かれていない時に、UNDECLARED_TRACK_WAIT の間だけ届いていないトラックを待つ)
+  private firstFrameTimestamp: number | null = null;
 
   private initializeSegment: Buffer | null = null;
   // 初期化セグメントに入れたトラック (初期化セグメントを作る時に決めて、後から変えない)
@@ -47,16 +52,31 @@ export default class FMP4Transmuxer {
   }
 
   // 初期化セグメント (ftyp + moov) を作る (まだ作れなければ null)
-  private create_initialize_segment(): Buffer | null {
-    // onMetaData に書かれているトラックのうち、このサーバが fMP4 にするコーデック (H.264, AAC) のトラックは、初期化情報が届くまで待つ
-    // (コーデックを数値ではなく 'avc1' や 'mp4a' の文字列で送ってくる配信ソフトもある)
+  // timestamp: いま届いたフレームの timestamp
+  private create_initialize_segment(timestamp: number): Buffer | null {
+    // このサーバが fMP4 にするコーデック (H.264, AAC) のトラックは、初期化情報が届くまで待つ
+    // 映像は、onMetaData に H.264 と書かれていれば待つ (コーデックを数値ではなく 'avc1' や 'mp4a' の文字列で送ってくる配信ソフトもある)
+    // 音声は、もう届いていれば最初に届いた音声のコーデックで、まだ届いていなければ onMetaData で決める
+    // (onMetaData に AAC と書かれていても、最初に AAC 以外の音声が届いたなら AAC は届かないので待たない。
+    //  onMetaData に書かれていなくても、最初に AAC が届いたなら待つ: 中身が空の初期化情報が先に届いても、本当の初期化情報は後から届く)
     // それ以外のコーデック (MP3 や Sorenson H.263 など) のトラックは待たない (このサーバでは fMP4 にしないので、そのトラックがない配信として扱う)
-    // (onMetaData に AAC と書かれていても、AAC の初期化情報より先に AAC 以外の音声が届いたなら、AAC は届かないので待たない)
     const video_expected = this.onMetadata?.videocodecid === VideoCodecType.AVC || this.onMetadata?.videocodecid === 'avc1';
-    const audio_expected = (this.onMetadata?.audiocodecid === AudioCodecType.AAC || this.onMetadata?.audiocodecid === 'mp4a') && !this.unsupportedAudio;
+    const audio_expected = this.firstAudioFormat != null
+      ? this.firstAudioFormat === AudioCodecType.AAC
+      : (this.onMetadata?.audiocodecid === AudioCodecType.AAC || this.onMetadata?.audiocodecid === 'mp4a');
     if (video_expected && this.avcDecoderConfigurationRecord == null) { return null; }
     if (audio_expected && this.audioSpecificConfig == null) { return null; }
     if (this.avcDecoderConfigurationRecord == null && this.audioSpecificConfig == null) { return null; }
+
+    // onMetaData にコーデックが 1 つも書かれていない時 (onMetaData を送ってこない配信ソフトや、yasea など) は、どのトラックが届くか分からない
+    // yasea などは、それぞれのトラックの初期化情報をそのトラックの最初のフレームの直前に送ってくるので、もう一方のトラックの初期化情報は最初のフレームより後に届く
+    // そこで、まだ初期化情報が届いていないトラックを、最初のフレームから少しの間 (UNDECLARED_TRACK_WAIT) だけ待つ (待っている間に届いたフレームは捨てる)
+    const declared = this.onMetadata?.videocodecid != null || this.onMetadata?.audiocodecid != null;
+    const missing = this.avcDecoderConfigurationRecord == null || (this.audioSpecificConfig == null && this.firstAudioFormat == null);
+    if (!declared && missing) {
+      this.firstFrameTimestamp ??= timestamp;
+      if (timestamp - this.firstFrameTimestamp < UNDECLARED_TRACK_WAIT) { return null; }
+    }
 
     // 初期化セグメントには、それまでに初期化情報が届いたトラックを全て入れる
     // (onMetaData を送ってこない配信ソフトや、onMetaData にコーデックを書かない配信ソフト (yasea など) もあるので、onMetaData に書かれていなくても入れる)
@@ -79,11 +99,15 @@ export default class FMP4Transmuxer {
     });
   }
 
-  public feed(message: Message): FMP4Fragment | null {
-    // handle_rtmp_payload は AAC 以外の音声には null を返すので、AudioTagHeader の先頭 4bit の SoundFormat を見る
-    // (AAC の初期化情報の後に届く Enhanced RTMP の音声 (FFmpeg が 5.1ch などの AAC の後に送る MultichannelConfig や、2 つ目の音声トラック) では AAC をやめない)
-    if (message.message_type_id === MessageType.Audio && this.audioSpecificConfig == null && message.data.byteLength >= 1 && (message.data[0] >> 4) !== AudioCodecType.AAC) {
-      this.unsupportedAudio = true;
+  public feed(received: Message): FMP4Fragment | null {
+    // RTMP の timestamp が一周して戻っても (rtmp-handler.mts の TimestampUnwrapper)、時刻が戻らないように直してから使う
+    const message = this.timestamps.unwrap(received);
+    // 音声のコーデックは、最初に届いた音声のメッセージで決める
+    // (handle_rtmp_payload は AAC 以外の音声や中身が空の AAC の初期化情報には null を返すので、AudioTagHeader の先頭 4bit の SoundFormat を見る)
+    // (AAC の配信でも、FFmpeg 8.0 以降は 5.1ch などの MultichannelConfig や 2 つ目の音声トラックを Enhanced RTMP の形式 (SoundFormat 9) で送ってくる。
+    //  ADTS の AAC (MPEG-TS や HLS の入力など) を -c copy で送る時は、それが本当の AAC の初期化情報より先に届くが、その前に中身が空の AAC の初期化情報が届く)
+    if (message.message_type_id === MessageType.Audio && message.data.byteLength >= 1) {
+      this.firstAudioFormat ??= message.data[0] >> 4;
     }
     const payload = handle_rtmp_payload(message);
     if (payload == null) { return null; }
@@ -104,13 +128,13 @@ export default class FMP4Transmuxer {
         break;
       case 'Data': {
         const metadata = read_onmetadata(payload.values);
-        // 初期化セグメントに入れるトラックは最初の onMetaData で決める (配信の途中で onMetaData が送り直されても変えない)
+        // 初期化情報が届くまで待つトラック (create_initialize_segment) は、最初の onMetaData で決める (初期化セグメントを作る前に onMetaData が送り直されても変えない)
         if (metadata != null) { this.onMetadata ??= metadata; }
         return null;
       }
     }
 
-    this.initializeSegment ??= this.create_initialize_segment();
+    this.initializeSegment ??= this.create_initialize_segment(payload.timestamp);
     if (this.initializeSegment == null) { return null; }
 
     switch (payload.kind) {

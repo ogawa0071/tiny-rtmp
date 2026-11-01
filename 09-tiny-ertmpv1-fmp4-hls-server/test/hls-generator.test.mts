@@ -101,16 +101,44 @@ describe('Tracks decided from the sequence headers', () => {
   test.each([
     ['onMetaData without codec ids (yasea)', { duration: 0, width: 320, height: 240, framerate: 0, audiosamplerate: 44100, stereo: true }],
     ['no onMetaData (FFmpeg -flvflags no_metadata)', null],
-  ])('%s: the tracks whose sequence headers arrive before the first frame are written', (_, object) => {
+  ])('%s: the tracks whose sequence headers arrive within 1 second of the first frame are written', (_, object) => {
+    // AVC と AAC の初期化情報が届く時刻と、書き出されるトラック
+    // (yasea などは、それぞれのトラックの初期化情報をそのトラックの最初のフレームの直前に送ってくるので、もう一方のトラックの初期化情報は最初のフレームより後に届くことがある)
+    // (最初のフレームから 1 秒以上たってから初期化情報が届いたトラックは書き出さない)
+    const cases: [number, number, number[]][] = [
+      [0, 0, [1, 2]],
+      [0, 300, [1, 2]],
+      [300, 0, [1, 2]],
+      [0, 1500, [1]],
+      [1500, 0, [2]],
+    ];
+    for (const [videoStart, audioStart, ids] of cases) {
+      const generator = new HLSGenerator();
+      if (object != null) { generator.feed(onmetadata(object)); }
+      for (let t = 0; t < 5000; t += 100) {
+        if (t === videoStart) { generator.feed(video(t, AVC_SEQUENCE_HEADER)); }
+        if (t >= videoStart) { generator.feed(video(t, avc((t - videoStart) % 1000 === 0 ? 1 : 2))); }
+        if (t === audioStart) { generator.feed(audio(t, AAC_SEQUENCE_HEADER)); }
+        if (t >= audioStart) { generator.feed(audio(t + 8, AAC_FRAME)); }
+      }
+      generator.end();
+      expect(trackIds(generator)).toStrictEqual(new Set(ids));
+    }
+  });
+
+  test('a title-only onMetaData sent while waiting does not stop waiting for the AAC declared by the first onMetaData', () => {
     const generator = new HLSGenerator();
-    if (object != null) { generator.feed(onmetadata(object)); }
+    generator.feed(metadata(7, 10));
     generator.feed(video(0, AVC_SEQUENCE_HEADER));
-    generator.feed(audio(0, AAC_SEQUENCE_HEADER));
-    for (let t = 0; t < 3000; t += 100) {
+    // AAC の初期化情報が 1 秒遅れて届き (FFmpeg の -c copy で、音声が映像より後から始まる入力など)、それを待っている間に曲名だけを書いた onMetaData が送り直される
+    for (let t = 0; t < 4000; t += 100) {
+      if (t === 500) { generator.feed(onmetadata({ title: 'next' })); }
+      if (t === 1000) { generator.feed(audio(t, AAC_SEQUENCE_HEADER)); }
       generator.feed(video(t, avc(t % 1000 === 0 ? 1 : 2)));
-      generator.feed(audio(t + 8, AAC_FRAME));
+      if (t >= 1000) { generator.feed(audio(t + 8, AAC_FRAME)); }
     }
     generator.end();
+    // 最初の onMetaData に書かれた AAC を待つので、映像と音声の両方のトラックが書き出される
     expect(trackIds(generator)).toStrictEqual(new Set([1, 2]));
   });
 });
@@ -178,19 +206,100 @@ describe('Enhanced RTMP audio after the AAC sequence header', () => {
 });
 
 describe('AAC sequence header without the configuration', () => {
-  test('an AAC sequence header without an AudioSpecificConfig (FFmpeg -c copy from ADTS AAC) is ignored until the real one arrives', () => {
-    // FFmpeg は ADTS の AAC (MPEG-TS などの入力) を -c copy で送る時、AudioSpecificConfig が空の初期化情報 (af00) を先に送り、最初のフレームの直前に本当の初期化情報を送り直す
+  // FFmpeg は ADTS の AAC (MPEG-TS や HLS などの入力) を -c copy で送る時、AudioSpecificConfig が空の初期化情報 (af00) を先に送り、
+  // 最初の音声のフレームの直前 (最初の映像のフレームより後) に本当の初期化情報を送り直す
+  // FFmpeg 8.0 以降は、その間に Enhanced RTMP の形式 (SoundFormat 9) の 5.1ch などの MultichannelConfig や、2 つ目の音声トラックの初期化情報も送ってくる
+  // (FFmpeg 9.0 で MPEG-TS の入力を -c copy で送った時のバイト列。2 つ目の音声トラックは、最初の映像のフレームの後にも届く)
+  test.each<[string, string[], string[]]>([
+    ['stereo', ['af00'], []],
+    ['5.1ch (MultichannelConfig)', ['af00', '946d70346101060000003f'], []],
+    ['2 AAC tracks (Multitrack)', ['af00', '95006d70346101', '95046d70346101010200000003'], ['95006d703461011210', '95046d70346101010200000003', '95016d7034610121']],
+    ['AAC + Opus tracks (Multitrack)', ['af00', '95004f707573014f707573486561640102000080bb0000000000', '95044f70757301010200000003'], ['95014f70757301fc']],
+  ])('FFmpeg -c copy from ADTS AAC, %s: the AAC track is waited for, with or without onMetaData, and no audio is reported as ignored', (_, beforeVideo, afterVideo) => {
+    for (const object of [{ videocodecid: 7, audiocodecid: 10 }, null]) {
+      const generator = new HLSGenerator();
+      expect(warnings(() => {
+        if (object != null) { generator.feed(onmetadata(object)); }
+        generator.feed(video(0, AVC_SEQUENCE_HEADER));
+        for (const hex of beforeVideo) { generator.feed(audio(0, Buffer.from(hex, 'hex'))); }
+        for (let t = 0; t < 3000; t += 100) {
+          generator.feed(video(t, avc(t % 1000 === 0 ? 1 : 2)));
+          if (t === 0) {
+            for (const hex of afterVideo) { generator.feed(audio(43, Buffer.from(hex, 'hex'))); }
+            generator.feed(audio(45, AAC_SEQUENCE_HEADER));
+          }
+          generator.feed(audio(t + 45, AAC_FRAME));
+        }
+        generator.end();
+      })).toStrictEqual([]);
+      // 映像と音声の両方のトラックが書き出される
+      expect(trackIds(generator)).toStrictEqual(new Set([1, 2]));
+    }
+  });
+});
+
+describe('Enhanced RTMP video of the second track', () => {
+  // FFmpeg 8.0 以降の 2 つ目の映像トラックは Multitrack (PacketType 6) の OneTrack で、トラック番号 1 を付けて送ってくる
+  // (ExVideoTagHeader の 1 byte の後に、AvMultitrackType (OneTrack は 0) と PacketType (0 は SequenceStart, 1 は CodedFrames) の 1 byte, 'avc1', トラック番号 1 が続く)
+  const SECOND_TRACK_SEQUENCE_START = Buffer.concat([Buffer.from('96006176633101', 'hex'), AVC_SEQUENCE_HEADER.subarray(5)]);
+  const second_track = (frameType: number): Buffer => Buffer.from([0x80 | (frameType << 4) | 6, 1, 0x61, 0x76, 0x63, 0x31, 1, 0, 0, 0, 0, 0, 0, 1, 0x65]);
+
+  test('FFmpeg 8.0 2 video tracks: the first track is used and no video is reported as ignored', () => {
+    const generator = new HLSGenerator();
+    expect(warnings(() => {
+      generator.feed(metadata(7, 10));
+      generator.feed(video(0, AVC_SEQUENCE_HEADER));
+      generator.feed(video(0, SECOND_TRACK_SEQUENCE_START));
+      generator.feed(audio(0, AAC_SEQUENCE_HEADER));
+      for (let t = 0; t < 3000; t += 100) {
+        generator.feed(video(t, avc(t % 1000 === 0 ? 1 : 2)));
+        generator.feed(video(t, second_track(t % 1000 === 0 ? 1 : 2)));
+        generator.feed(audio(t, AAC_FRAME));
+      }
+      generator.end();
+    })).toStrictEqual([]);
+    expect(extinfs(generator)).toStrictEqual([1, 1, 0.9]);
+    expect(trackIds(generator)).toStrictEqual(new Set([1, 2]));
+  });
+
+  test('FFmpeg 8.0 2 video tracks from an encoder without a global header: the first track is waited for even when audio arrives first', () => {
+    // FFmpeg は最初の映像トラックの中身が空の初期化情報を先に送り、最初のフレームの直前に本当の初期化情報を送り直す
     const generator = new HLSGenerator();
     generator.feed(metadata(7, 10));
-    generator.feed(video(0, AVC_SEQUENCE_HEADER));
-    generator.feed(audio(0, Buffer.from('af00', 'hex')));
-    for (let t = 0; t < 3000; t += 100) {
-      generator.feed(video(t, avc(t % 1000 === 0 ? 1 : 2)));
-      if (t === 0) { generator.feed(audio(45, AAC_SEQUENCE_HEADER)); }
-      generator.feed(audio(t + 45, AAC_FRAME));
+    generator.feed(video(0, Buffer.from('1700000000', 'hex')));
+    generator.feed(video(0, SECOND_TRACK_SEQUENCE_START));
+    generator.feed(audio(0, AAC_SEQUENCE_HEADER));
+    for (let t = 0; t < 300; t += 20) { generator.feed(audio(t, AAC_FRAME)); }
+    generator.feed(video(300, AVC_SEQUENCE_HEADER));
+    for (let t = 300; t < 3300; t += 100) {
+      generator.feed(video(t, avc((t - 300) % 1000 === 0 ? 1 : 2)));
+      generator.feed(video(t, second_track((t - 300) % 1000 === 0 ? 1 : 2)));
+      generator.feed(audio(t, AAC_FRAME));
     }
     generator.end();
-    // 映像と音声の両方のトラックが書き出される
+    // 映像と音声の両方のトラックが書き出され、最初の映像トラックのキーフレーム (300, 1300, 2300 ms) でセグメントが区切られる
     expect(trackIds(generator)).toStrictEqual(new Set([1, 2]));
+    expect(extinfs(generator)).toStrictEqual([1, 1, 0.9]);
+  });
+});
+
+describe('RTMP timestamps that wrap around', () => {
+  test.each([
+    ['the RTMP specification (32bit)', 2 ** 32],
+    ['FFmpeg (31bit)', 2 ** 31],
+  ])('segments keep being made after the timestamps of %s wrap around', (_, wrap) => {
+    const generator = new HLSGenerator();
+    // 配信を始めてから 2.5 秒後に timestamp が一周して 0 に戻る
+    const timestamp = (t: number): number => (wrap - 2500 + t) % wrap;
+    generator.feed(metadata(7, 10));
+    generator.feed(video(timestamp(0), AVC_SEQUENCE_HEADER));
+    generator.feed(audio(timestamp(0), AAC_SEQUENCE_HEADER));
+    for (let t = 0; t < 6000; t += 100) {
+      generator.feed(video(timestamp(t), avc(t % 1000 === 0 ? 1 : 2)));
+      generator.feed(audio(timestamp(t + 8), AAC_FRAME));
+    }
+    generator.end();
+    // 一周した後も 0, 1000, ..., 5000 ms のキーフレームからセグメントができる (最後は最後のフレームの先頭 5900 ms まで、プレイリストには最後の 4 つが載る)
+    expect(extinfs(generator)).toStrictEqual([1, 1, 1, 0.9]);
   });
 });

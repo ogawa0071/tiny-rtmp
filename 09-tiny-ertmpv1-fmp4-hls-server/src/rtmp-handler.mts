@@ -15,6 +15,7 @@ export const PacketType = {
   CodedFramesX: 3, // ertmp で定義された HEVC で cto = 0 の時に cto 省略する PacketType.CodedFrames の亜種
   Metadata: 4,
   MPEG2TSSequenceStart: 5,
+  Multitrack: 6, // Enhanced RTMP v2 の Multitrack (FFmpeg 8.0 以降や OBS は、2 つ目以降の映像トラックをこの形式で送る)
 } as const;
 
 export type HEVCData = {
@@ -43,6 +44,8 @@ const handle_hevc = (packetType: number, reader: ByteReader): HEVCData | null =>
     case PacketType.SequenceStart: {
       // 中身が空の初期化情報は無視する (FFmpeg はエンコーダが初期化情報を出さない時、空の初期化情報を先に送り、最初のフレームの直前に本当の初期化情報を送り直す)
       // (従来の形式の AVC と AAC も同じ: 03-tiny-http-ts-server の handle_avc)
+      // (ただし HEVC の初期化情報を送り直すのは FFmpeg 7.0 以降。FFmpeg 6.1 は送り直さず、フレームも開始コード付き (Annex B) のまま送ってくるので、
+      //  その映像は使えない: HLSGenerator は初期化情報より先にフレームが届いた映像を、ないものとして扱う)
       const hevcDecoderConfigurationRecord = reader.read();
       if (hevcDecoderConfigurationRecord.byteLength === 0) { return null; }
       return { codec: 'HEVC', packetType, hevcDecoderConfigurationRecord };
@@ -92,6 +95,9 @@ export const handle_video = (message: { timestamp: number; data: Buffer; }): Vid
   const packetType = meta & 0x0F;
   // FrameType 5 は映像のフレームではなくコマンドなので扱わない
   if (frameType === FrameType.VIDEO_INFO_OR_COMMAND) { return null; }
+  // Multitrack の形式の映像は扱わない (このサーバが使うのは、FFmpeg 8.0 以降や OBS が Multitrack ではない形式で送る最初の映像トラックだけ)
+  // (Multitrack では FourCC の前に AvMultitrackType (4bit) と PacketType (4bit) の 1 byte が入るので、ここで FourCC を読むと別の値になる)
+  if (packetType === PacketType.Multitrack) { return null; }
   // CodedFrames は FourCC の後ろに CompositionTime (SI24) が続く
   if (packetType === PacketType.CodedFrames && message.data.byteLength < 8) { return null; }
   const fourcc = reader.read(4).toString('ascii');

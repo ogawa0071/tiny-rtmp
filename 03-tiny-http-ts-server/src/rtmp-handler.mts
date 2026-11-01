@@ -74,6 +74,8 @@ const handle_avc = (reader: ByteReader): AVCData | null => {
       // FFmpeg は、配信を始める時にまだ初期化情報がないと、中身が空の初期化情報を送ってくる
       // (エンコーダが初期化情報 (グローバルヘッダ) を出さない時や、ADTS の AAC (MPEG-TS や HLS の入力など) を -c copy で送る時)
       // 本当の初期化情報は、最初のフレームから取り出して、そのフレームの直前に送り直してくるので、中身が空のものは無視する
+      // (H.264 の初期化情報を最初のフレームから取り出して送り直すのは FFmpeg 6.1 以降。それより前の FFmpeg は送り直さず、
+      //  フレームも開始コード付き (Annex B) のまま送ってくるので、その映像は使えない)
       const avcDecoderConfigurationRecord = reader.read();
       if (avcDecoderConfigurationRecord.byteLength === 0) { return null; }
       return { codec: 'AVC', packetType, avcDecoderConfigurationRecord };
@@ -162,6 +164,31 @@ export const read_onmetadata = (values: AMF0Value[]): AMF0Object | null => {
   if (name !== 'onMetaData' || !isAMF0Object(metadata)) { return null; }
   return metadata;
 };
+
+// RTMP の timestamp は 32bit なので、2^32 ミリ秒 (約 49.7 日) で一周して 0 に戻る (一周しても扱えるようにするべき: RTMP 仕様 4 章)
+// FFmpeg は FLV と同じ 31bit で送るので、2^31 ミリ秒 (約 24.8 日) で一周する (-avoid_negative_ts disabled の時の負の DTS も 0x7FFFFFxx で届く)
+// 一周して戻った timestamp のままではセグメントを区切れなくなるので、配信ごとにこのクラスで一周しない時刻に直してから使う
+export class TimestampUnwrapper {
+  private previous: { received: number; timestamp: number; } | null = null;
+  private offset = 0;
+
+  // 映像・音声の timestamp を直す (onMetaData は映像・音声と同じ時計とは限らないので、そのまま返す)
+  public unwrap(message: Message): Message {
+    if (message.message_type_id !== MessageType.Audio && message.message_type_id !== MessageType.Video) { return message; }
+    let timestamp = message.timestamp;
+    if (this.previous != null) {
+      // 前の映像・音声との差を -2^30 以上 2^30 未満にして足す
+      // (2^32 は 2^31 の倍数なので、2^32 と 2^31 のどちらで一周しても、一周しなかった時と同じ差になる)
+      const delta = ((message.timestamp - this.previous.received) % 2 ** 31 + 2 ** 31 + 2 ** 30) % 2 ** 31 - 2 ** 30;
+      timestamp = this.previous.timestamp + delta;
+    }
+    this.previous = { received: message.timestamp, timestamp };
+    // 0 より前の時刻 (FFmpeg の負の DTS など) は fMP4 などで表せないので、
+    // FFmpeg の -avoid_negative_ts make_non_negative と同じく、負にならないように全体をずらす
+    this.offset = Math.max(this.offset, -timestamp);
+    return { ... message, timestamp: timestamp + this.offset };
+  }
+}
 
 export default (message: Message): VideoData | AudioData | ActionScriptData | null => {
   switch (message.message_type_id) {

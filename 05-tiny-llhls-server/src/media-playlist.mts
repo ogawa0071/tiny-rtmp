@@ -59,6 +59,8 @@ export default class MediaPlaylist {
   private partialSegmentStalled: boolean = false;
   // PART-TARGET を決める前に作ったパーシャルセグメントの長さの最大 (秒、1 フレームだけで PART-TARGET より長いものは除く)
   private longestPartialSegment: number = 0;
+  // そのうち、いつもより長いフレームから始まるもの (partialSegmentStalled) は、こちらに分けて覚えておく (秒)
+  private longestStalledPartialSegment: number = 0;
 
   private currentSegment: ConcatenatedSegment | null = null;
   private segmentMap: Map<number, ConcatenatedSegment> = new Map<number, ConcatenatedSegment>(); // プレイリストに載せるセグメント
@@ -114,8 +116,8 @@ export default class MediaPlaylist {
     this.partialSegmentDurationDecided = true;
 
     // timestamp はミリ秒に丸められているので、同じフレーム数のパーシャルセグメントでも 1 ミリ秒長くなったり短くなったりする
-    // (ここで考えるのはこの丸めによるずれだけで、timestamp がそれ以上に揺れる配信では、1 フレーム少なく区切って 85% に届かないこともある。
-    //  1 フレームだけのパーシャルセグメントは、それより短く区切れないので、代わりに PART-TARGET を超えてしまう)
+    // (ここで考えるのはこの丸めによるずれだけで、timestamp がそれ以上に揺れる配信では、85% に届かなかったり PART-TARGET を超えたりするパーシャルセグメントができることがある。
+    //  このパーシャルセグメントにいつもより長いフレームや短いフレームが入っていると、いつものパーシャルセグメントに合わない PART-TARGET になって、配信の最後まで 85% に届かないこともある)
     const margin = timescale / 1000;
     // 1 ミリ秒長くなると PART-TARGET に入らないなら、1 フレーム少ないパーシャルセグメントもできる
     // (指定の長さがちょうどフレームの長さの整数倍の時もこちら: 24 fps で 0.25 秒の 6 フレームはいつも 0.250 秒だが、
@@ -125,7 +127,12 @@ export default class MediaPlaylist {
     if (shortest >= 0.85 * target) { return; }
     // 85% に届かないパーシャルセグメントができるなら、いつも同じフレーム数で区切れるように、PART-TARGET をこの長さ (と 1 ミリ秒) にする
     // ただし、それまでに作ったパーシャルセグメントが PART-TARGET を超えないように、それより短くはしない
-    this.partialSegmentDuration = (Math.max(duration, this.longestPartialSegment * timescale) + margin) / timescale;
+    let partTarget = Math.max(duration, this.longestPartialSegment * timescale) + margin;
+    // いつもより長いフレームから始まるものも、その長さ (と 1 ミリ秒) にしても、いつも通りのパーシャルセグメント (1 ミリ秒短いこともある) が 85% に届くなら、それより短くはしない
+    // (届かない時は合わせない: そのパーシャルセグメントは PART-TARGET を超えることがあるが、それは PART-TARGET を決める前に作ったものだけで、プレイリストから外れればなくなる)
+    const stalled = this.longestStalledPartialSegment * timescale + margin;
+    if (stalled > partTarget && duration - margin >= 0.85 * stalled) { partTarget = stalled; }
+    this.partialSegmentDuration = partTarget / timescale;
   }
 
   // パーシャルセグメントは映像のフレームの境目で区切るので、1 フレームより短くはできない
@@ -144,17 +151,23 @@ export default class MediaPlaylist {
 
   // PART-TARGET を決める前に作ったパーシャルセグメントの長さを覚えておく (decidePartialSegmentDuration で、これより短い PART-TARGET にしないため)
   // (1 フレームだけで PART-TARGET より長いもの (映像が途切れた時など) は、どのみち PART-TARGET に入らないので除く)
-  // (いつもより長いフレームから始まるものも除く: その長さに合わせると、その後のいつも通りのパーシャルセグメントが配信の最後まで 85% に届かないことがある。
-  //  除いたものは PART-TARGET を超えることがあるが、それはこの 1 つだけで、プレイリストから外れればなくなる)
+  // (いつもより長いフレームから始まるものは分けて覚えておく: その長さに合わせると、その後のいつも通りのパーシャルセグメントが配信の最後まで 85% に届かないことがあるので、
+  //  合わせるかどうかは decidePartialSegmentDuration で決める。合わせなかったものは PART-TARGET を超えることがあるが、それは PART-TARGET を決めるまでに映像が途切れるたびに 1 つずつで、
+  //  プレイリストから外れればなくなる)
   private recordPartialSegment(seconds: number): void {
-    if (this.partialSegmentDurationDecided || this.partialSegmentStalled || seconds > this.partialSegmentDuration) { return; }
-    this.longestPartialSegment = Math.max(this.longestPartialSegment, seconds);
+    if (this.partialSegmentDurationDecided || seconds > this.partialSegmentDuration) { return; }
+    if (this.partialSegmentStalled) {
+      this.longestStalledPartialSegment = Math.max(this.longestStalledPartialSegment, seconds);
+    } else {
+      this.longestPartialSegment = Math.max(this.longestPartialSegment, seconds);
+    }
   }
 
   // 今書き込んでいるパーシャルセグメントを timestamp までで完成させて、timestamp から次のパーシャルセグメントを始める
   // now: 今届いた映像のフレームの timestamp (完成したパーシャルセグメントは、この時刻にプレイリストに追加される)
   // decide: このパーシャルセグメントの長さから PART-TARGET を決めてよいか (いつもより短く区切ったものからは決めない)
-  // (いつもより長いフレームから始まるものからも決めない: そのフレームの分だけ、いつもと長さやフレーム数が違う)
+  // (いつもより長いフレームから始まるものからも決めない: そのフレームの分だけ、いつもと長さやフレーム数が違う。
+  //  その代わり、そのパーシャルセグメントは後から決めた PART-TARGET を超えたり、その 85% に届かなかったりすることがあるが、プレイリストから外れればなくなる)
   private completePartialSegment(timestamp: number, timescale: number, now: number, decide: boolean): void {
     const segment = this.currentSegment!;
     const duration = timestamp - segment.latestBegin();
@@ -180,10 +193,11 @@ export default class MediaPlaylist {
     if (begin != null && frame.timestamp > begin && end - begin > target) {
       // このフレームが 1 つ前のフレームと同じ長さ (と timestamp の丸めの 1 ミリ秒) でも入らないなら、いつも通りの長さで区切っている
       // 入ったはずなのに入らなかった時 (次のフレームが欠けた、映像が途切れた) は、このパーシャルセグメントはいつもより短いので、PART-TARGET を決めるのには使わない
-      // その時はこのフレームがいつもより長いので、このフレームから始まる次のパーシャルセグメントも使わない (その次に区切った時に決める)
       const regular = this.lastFrameLength != null && frame.timestamp + this.lastFrameLength + frame.timescale / 1000 - begin > target;
       this.completePartialSegment(frame.timestamp, frame.timescale, end, regular);
-      this.partialSegmentStalled = !regular;
+      // その時、このフレームが 1 つ前のフレームの 1.5 倍より長い (フレームが欠けた、映像が途切れた) なら、このフレームから始まる次のパーシャルセグメントも使わない (その次に区切った時に決める)
+      // (timestamp が数ミリ秒揺れて、1 つ前のフレームより少し長いだけなら、次のパーシャルセグメントはいつも通りなので使う)
+      this.partialSegmentStalled = !regular && this.lastFrameLength != null && (end - frame.timestamp) * 2 > this.lastFrameLength * 3;
     }
     for (const buffer of frame.buffers) {
       this.currentSegment?.feed(buffer, frame.keyframe);
@@ -227,12 +241,14 @@ export default class MediaPlaylist {
     }
   }
 
-  public append({ timestamp, timescale }: PlaylistTimestamp) {
-    if (this.ended) { return; }
+  // timestamp から新しいセグメントを始める (始めたら true を返す)
+  // 今のセグメントがまだ minimumSegmentDuration より短ければ、新しいセグメントは始めずに今のセグメントに続ける
+  public append({ timestamp, timescale }: PlaylistTimestamp): boolean {
+    if (this.ended) { return false; }
     // 保留していた 1 つ前の映像のフレームは、このキーフレームの時刻で終わる
     this.flush(timestamp);
     if (this.currentSegment != null && (timestamp - this.currentSegment.begin()) < (this.minimumSegmentDuration * timescale)) {
-      return;
+      return false;
     }
 
     if (this.currentSegment != null) {
@@ -256,9 +272,10 @@ export default class MediaPlaylist {
       this.partialSegmentDurationDecided = true;
       this.publishedNotify(true);
     }
+    return true;
   }
 
-  // video: 映像のフレームか (パーシャルセグメントは、セグメントと同じく映像のフレームの境目で区切る)
+  // video: 映像のフレームか (パーシャルセグメントは、セグメントと同じく映像のフレームの境目で区切る。映像のない配信では音声のフレーム)
   public feed(data: Iterable<Buffer>, { timestamp, timescale }: PlaylistTimestamp, video: boolean, keyframe: boolean) {
     if (this.ended) { return; }
     if (!video) {

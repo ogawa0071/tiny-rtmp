@@ -84,21 +84,25 @@ describe('Tracks in the initialization segment', () => {
   test.each([
     ['onMetaData without codec ids (yasea)', YASEA_ONMETADATA],
     ['no onMetaData (FFmpeg -flvflags no_metadata)', null],
-  ])('%s: the tracks are decided from the sequence headers that arrive before the first frame', (_, object) => {
-    // AAC の初期化情報が届く時刻と、初期化セグメントに入るトラック
-    // (最初のフレームより後に初期化情報が届いた音声は、初期化セグメントにないので送らない)
-    const cases: [number, string[], number[]][] = [
-      [0, ['avc1', 'mp4a'], [1, 2]],
-      [500, ['avc1'], [1]],
+  ])('%s: the tracks are decided from the sequence headers that arrive within 1 second of the first frame', (_, object) => {
+    // AVC と AAC の初期化情報が届く時刻と、初期化セグメントに入るトラック
+    // (yasea などは、それぞれのトラックの初期化情報をそのトラックの最初のフレームの直前に送ってくるので、もう一方のトラックの初期化情報は最初のフレームより後に届くことがある)
+    // (最初のフレームから 1 秒以上たってから初期化情報が届いたトラックは、初期化セグメントにないので送らない)
+    const cases: [number, number, string[], number[]][] = [
+      [0, 0, ['avc1', 'mp4a'], [1, 2]],
+      [0, 500, ['avc1', 'mp4a'], [1, 2]],
+      [300, 0, ['avc1', 'mp4a'], [1, 2]],
+      [0, 1500, ['avc1'], [1]],
+      [1500, 0, ['mp4a'], [2]],
     ];
-    for (const [audioStart, expected, ids] of cases) {
+    for (const [videoStart, audioStart, expected, ids] of cases) {
       const transmuxer = new FMP4Transmuxer();
       if (object != null) { transmuxer.feed(onmetadata(object)); }
-      transmuxer.feed(video(0, AVC_SEQUENCE_HEADER));
       const fragments: (FMP4Fragment | null)[] = [];
-      for (let t = 0; t < 3000; t += 100) {
+      for (let t = 0; t < 4000; t += 100) {
+        if (t === videoStart) { transmuxer.feed(video(t, AVC_SEQUENCE_HEADER)); }
+        if (t >= videoStart) { fragments.push(transmuxer.feed(video(t, keyframes(t - videoStart)))); }
         if (t === audioStart) { transmuxer.feed(audio(t, AAC_SEQUENCE_HEADER)); }
-        fragments.push(transmuxer.feed(video(t, keyframes(t))));
         if (t >= audioStart) { fragments.push(transmuxer.feed(audio(t + 8, AAC_FRAME))); }
       }
 
@@ -119,6 +123,28 @@ describe('Tracks in the initialization segment', () => {
     expect(trackIds(fragments)).toStrictEqual(new Set([1, 2]));
   });
 
+  test.each<[AMF0Value, AMF0Value]>([
+    [7, 10],
+    // コーデックを数値ではなく 'avc1' や 'mp4a' の文字列で送ってくる配信ソフトもある
+    ['avc1', 'mp4a'],
+  ])('onMetaData with %s and %s, sent again before the first frame without the codecs: the declared AAC is still waited for', (videocodecid, audiocodecid) => {
+    const transmuxer = new FMP4Transmuxer();
+    transmuxer.feed(metadata(videocodecid, audiocodecid));
+    transmuxer.feed(video(0, AVC_SEQUENCE_HEADER));
+    // 最初のフレームより前に、曲名だけを書いた onMetaData が送り直される
+    transmuxer.feed(onmetadata({ title: 'next' }));
+    const fragments: (FMP4Fragment | null)[] = [];
+    for (let t = 0; t < 3000; t += 100) {
+      fragments.push(transmuxer.feed(video(t, keyframes(t))));
+      // AAC の初期化情報は、最初の映像のフレームより後 (最初の AAC のフレームの直前) に届く
+      if (t === 0) { transmuxer.feed(audio(t + 45, AAC_SEQUENCE_HEADER)); }
+      fragments.push(transmuxer.feed(audio(t + 45, AAC_FRAME)));
+    }
+
+    expect(tracks(transmuxer)).toStrictEqual(['avc1', 'mp4a']);
+    expect(trackIds(fragments.filter((fragment) => fragment != null))).toStrictEqual(new Set([1, 2]));
+  });
+
   test('an onMetaData sent again during the publish does not change where viewers can start', () => {
     const transmuxer = new FMP4Transmuxer();
     transmuxer.feed(metadata(7, 10));
@@ -136,25 +162,83 @@ describe('Tracks in the initialization segment', () => {
 });
 
 describe('Sequence headers without the configuration', () => {
-  // FFmpeg は、配信を始める時にまだ初期化情報がないと、中身が空の初期化情報を先に送り、最初のフレームの直前に本当の初期化情報を送り直す
+  // FFmpeg は、配信を始める時にまだ初期化情報がないと、中身が空の初期化情報を先に送り、そのトラックの最初のフレームの直前に本当の初期化情報を送り直す
+  // そのため、もう一方のトラックのフレームが、本当の初期化情報より先に届くことがある (FFmpeg 6.1 で確かめた順番で送る)
   test.each([
-    ['AAC (FFmpeg -c copy from ADTS AAC)', AVC_SEQUENCE_HEADER, Buffer.from('af00', 'hex')],
-    ['AVC (FFmpeg with an encoder that does not output a global header)', Buffer.from('1700000000', 'hex'), AAC_SEQUENCE_HEADER],
-  ])('%s: the empty sequence header is ignored until the real one arrives', (_, videoHeader, audioHeader) => {
-    const transmuxer = new FMP4Transmuxer();
-    transmuxer.feed(metadata(7, 10));
-    transmuxer.feed(video(0, videoHeader));
-    transmuxer.feed(audio(0, audioHeader));
-    const fragments: (FMP4Fragment | null)[] = [];
-    for (let t = 0; t < 3000; t += 100) {
-      // 本当の初期化情報は、最初のフレームの直前に届く
-      if (t === 0) { transmuxer.feed(video(t, AVC_SEQUENCE_HEADER)); }
-      fragments.push(transmuxer.feed(video(t, keyframes(t))));
-      if (t === 0) { transmuxer.feed(audio(t + 45, AAC_SEQUENCE_HEADER)); }
-      fragments.push(transmuxer.feed(audio(t + 45, AAC_FRAME)));
-    }
+    // B フレームのある H.264 と ADTS の AAC (MPEG-TS などの入力) を -c copy で送る時は、映像のキーフレームが先に届く
+    ['AAC (FFmpeg -c copy from ADTS AAC)', AVC_SEQUENCE_HEADER, Buffer.from('af00', 'hex'), 0, 45],
+    // B フレームのない H.264 を -flags -global_header で AAC と送る時は、AAC のフレームが先に届く
+    ['AVC (FFmpeg with an encoder that does not output a global header)', Buffer.from('1700000000', 'hex'), AAC_SEQUENCE_HEADER, 23, 0],
+  ])('%s: the empty sequence header is ignored until the real one arrives', (_, videoHeader, audioHeader, videoStart, audioStart) => {
+    // onMetaData のコーデックが数値の時と、'avc1' や 'mp4a' の文字列の時
+    const codecs: [AMF0Value, AMF0Value][] = [[7, 10], ['avc1', 'mp4a']];
+    for (const [videocodecid, audiocodecid] of codecs) {
+      const transmuxer = new FMP4Transmuxer();
+      transmuxer.feed(metadata(videocodecid, audiocodecid));
+      transmuxer.feed(video(0, videoHeader));
+      transmuxer.feed(audio(0, audioHeader));
+      // 本当の初期化情報をそのトラックの最初のフレームの直前に置いて、timestamp 順に送る
+      const messages = [
+        video(videoStart, AVC_SEQUENCE_HEADER),
+        ... Array.from({ length: 30 }, (_, i) => video(videoStart + i * 100, keyframes(i * 100))),
+        audio(audioStart, AAC_SEQUENCE_HEADER),
+        ... Array.from({ length: 30 }, (_, i) => audio(audioStart + i * 100, AAC_FRAME)),
+      ].sort((a, b) => a.timestamp - b.timestamp);
+      const fragments = messages.map((message) => transmuxer.feed(message));
 
-    expect(tracks(transmuxer)).toStrictEqual(['avc1', 'mp4a']);
-    expect(trackIds(fragments.filter((fragment) => fragment != null))).toStrictEqual(new Set([1, 2]));
+      expect(tracks(transmuxer)).toStrictEqual(['avc1', 'mp4a']);
+      expect(trackIds(fragments.filter((fragment) => fragment != null))).toStrictEqual(new Set([1, 2]));
+    }
+  });
+
+  // FFmpeg 9.0 が ADTS の AAC (MPEG-TS や HLS などの入力) を -c copy で送った時に、本当の AAC の初期化情報より前に届く音声のメッセージ
+  // 最初の映像のフレームより前に、中身が空の AAC の初期化情報 (af00) と、(FFmpeg 8.0 以降は) Enhanced RTMP の形式 (SoundFormat 9) の
+  // 5.1ch などの MultichannelConfig や、2 つ目の音声トラックの初期化情報が届く。2 つ目の音声トラックは、最初の映像のフレームの後にも届く
+  test.each<[string, string[], string[]]>([
+    ['stereo', ['af00'], []],
+    ['5.1ch (MultichannelConfig)', ['af00', '946d70346101060000003f'], []],
+    ['2 AAC tracks (Multitrack)', ['af00', '95006d70346101', '95046d70346101010200000003'], ['95006d703461011210', '95046d70346101010200000003', '95016d7034610121']],
+    ['AAC + Opus tracks (Multitrack)', ['af00', '95004f707573014f707573486561640102000080bb0000000000', '95044f70757301010200000003'], ['95014f70757301fc']],
+  ])('FFmpeg -c copy from ADTS AAC, %s: the AAC track is waited for, with or without onMetaData', (_, beforeVideo, afterVideo) => {
+    for (const object of [{ videocodecid: 7, audiocodecid: 10 }, null]) {
+      const transmuxer = new FMP4Transmuxer();
+      if (object != null) { transmuxer.feed(onmetadata(object)); }
+      transmuxer.feed(video(0, AVC_SEQUENCE_HEADER));
+      for (const hex of beforeVideo) { transmuxer.feed(audio(0, Buffer.from(hex, 'hex'))); }
+      const fragments: (FMP4Fragment | null)[] = [];
+      for (let t = 0; t < 3000; t += 100) {
+        fragments.push(transmuxer.feed(video(t, keyframes(t))));
+        // 本当の初期化情報は、最初の音声のフレームの直前 (最初の映像のフレームより後) に届く
+        if (t === 0) {
+          for (const hex of afterVideo) { transmuxer.feed(audio(43, Buffer.from(hex, 'hex'))); }
+          transmuxer.feed(audio(45, AAC_SEQUENCE_HEADER));
+        }
+        fragments.push(transmuxer.feed(audio(t + 45, AAC_FRAME)));
+      }
+
+      expect(tracks(transmuxer)).toStrictEqual(['avc1', 'mp4a']);
+      expect(trackIds(fragments.filter((fragment) => fragment != null))).toStrictEqual(new Set([1, 2]));
+    }
+  });
+});
+
+describe('RTMP timestamps that wrap around', () => {
+  test.each([
+    ['the RTMP specification (32bit)', 2 ** 32],
+    ['FFmpeg (31bit)', 2 ** 31],
+  ])('the decode time of the video keeps increasing after the timestamps of %s wrap around', (_, wrap) => {
+    const transmuxer = new FMP4Transmuxer();
+    // 配信を始めてから 1.5 秒後に timestamp が一周して 0 に戻る
+    const timestamp = (t: number): number => (wrap - 1500 + t) % wrap;
+    transmuxer.feed(metadata(7, 0));
+    transmuxer.feed(video(timestamp(0), AVC_SEQUENCE_HEADER));
+    const fragments: FMP4Fragment[] = [];
+    for (let t = 0; t < 3000; t += 100) {
+      const fragment = transmuxer.feed(video(timestamp(t), keyframes(t)));
+      if (fragment != null) { fragments.push(fragment); }
+    }
+    // tfdt (version 1): size (4byte), 'tfdt' (4byte), version と flags (4byte), baseMediaDecodeTime (8byte)
+    const decodeTimes = fragments.map(({ data }) => Number(data.readBigUInt64BE(data.indexOf('tfdt') + 8)));
+    expect(decodeTimes).toStrictEqual(Array.from({ length: 29 }, (_, i) => wrap - 1500 + i * 100));
   });
 });

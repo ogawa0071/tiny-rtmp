@@ -5,6 +5,7 @@
 ## 主要コンポーネント
 
 - rtmp-accepter.mts - RTMPコネクション処理を再利用可能な形でラップ
+- flv-relay.mts - 届いたメッセージから視聴者に中継するFLV Tagを作り、途中から視聴を始めた視聴者に最初に送るもの (FLV Header, onMetaData, 初期化情報) を覚えておく
 - bandwidth-estimator.mts - 帯域幅推定ユーティリティ
 
 ## 実行方法

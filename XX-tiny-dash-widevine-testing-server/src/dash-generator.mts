@@ -6,7 +6,7 @@ import type { Message } from '../../01-tiny-rtmp-server/src/message.mts';
 import type { AMF0Object } from '../../01-tiny-rtmp-server/src/amf0-reader.mts';
 
 import { read_audio_specific_config } from '../../03-tiny-http-ts-server/src/aac.mts';
-import handle_rtmp_payload, { AACPacketType, AudioCodecType, FrameType, PacketType, read_onmetadata } from '../../03-tiny-http-ts-server/src/rtmp-handler.mts';
+import handle_rtmp_payload, { AACPacketType, AudioCodecType, FrameType, PacketType, read_onmetadata, TimestampUnwrapper } from '../../03-tiny-http-ts-server/src/rtmp-handler.mts';
 import { read_avc_decoder_configuration_record } from '../../03-tiny-http-ts-server/src/avc.mts';
 
 import { initialize, make } from '../../06-tiny-http-fmp4-server/src/fmp4.mts';
@@ -32,12 +32,13 @@ const WIDEVINE_SYSTEM_ID = Buffer.from('edef8ba9-79d6-4ace-a3c8-27dcd51d21ed'.re
 const WIDEVINE_PSSH_DATA = Buffer.from('CAESEJA1GVFoa14boiJDns7B8SoaDXdpZGV2aW5lX3Rlc3QiASo', 'base64'); // テスト用の PSSH (Protocol Buffers のデータ)
 
 export default class DASHGenerator {
+  private timestamps = new TimestampUnwrapper();
   private avcDecoderConfigurationRecord: Buffer | null = null;
   private parameterSets: ParameterSets | null = null; // slice_header を読むのに使う SPS/PPS (映像データの中で送られてきたものも含む)
   private audioSpecificConfig: Buffer | null = null;
   private onMetadata: AMF0Object | null = null;
-  // AAC の初期化情報より先に、AAC 以外の音声 (MP3 など) が届いたか
-  private unsupportedAudio = false;
+  // 最初に届いた音声のメッセージの SoundFormat (AudioTagHeader の先頭 4bit: 10 は AAC、2 は MP3、9 は Enhanced RTMP の形式)
+  private firstAudioFormat: number | null = null;
   // MPD に載せるトラック (MPD を作れるようになった時に決めて、後から増やしたり減らしたりしない: decideTracks)
   private tracks: { video: boolean; audio: boolean; } | null = null;
 
@@ -104,8 +105,10 @@ export default class DASHGenerator {
   private hasAudio(): boolean {
     if (this.tracks != null) { return this.tracks.audio; }
     if (this.audioSpecificConfig != null) { return true; }
-    // onMetaData に AAC と書かれていても、AAC の初期化情報より先に AAC 以外の音声が届いたなら、AAC は届かない
-    if (this.unsupportedAudio) { return false; }
+    // 音声がもう届いていれば、onMetaData ではなく最初に届いた音声のコーデックで決める
+    // (onMetaData に AAC と書かれていても、最初に AAC 以外の音声が届いたなら AAC は届かない。
+    //  onMetaData に書かれていなくても、最初に AAC が届いたなら待つ: 中身が空の初期化情報が先に届いても、本当の初期化情報は後から届く)
+    if (this.firstAudioFormat != null) { return this.firstAudioFormat === AudioCodecType.AAC; }
     return this.onMetadata?.audiocodecid === 10 || this.onMetadata?.audiocodecid === 'mp4a';
   }
 
@@ -209,12 +212,15 @@ export default class DASHGenerator {
     }
   }
 
-  public feed(message: Message): void {
-    // AAC の初期化情報より先に AAC 以外の音声が届いたら、onMetaData に AAC と書かれていても AAC は届かないので、音声を待たない (09 と同じ)
-    // (handle_rtmp_payload は AAC 以外の音声には null を返すので、AudioTagHeader の先頭 4bit の SoundFormat を見る)
-    // (AAC の初期化情報の後に届く Enhanced RTMP の音声 (FFmpeg が 5.1ch などの AAC の後に送る MultichannelConfig や、OBS や FFmpeg の 2 つ目の音声トラック) では AAC をやめない)
-    if (message.message_type_id === MessageType.Audio && this.audioSpecificConfig == null && message.data.byteLength >= 1 && (message.data[0] >> 4) !== AudioCodecType.AAC) {
-      this.unsupportedAudio = true;
+  public feed(received: Message): void {
+    // RTMP の timestamp が一周して戻っても (rtmp-handler.mts の TimestampUnwrapper)、時刻が戻らないように直してから使う
+    const message = this.timestamps.unwrap(received);
+    // 音声のコーデックは、最初に届いた音声のメッセージで決める (06 や 09 と同じ)
+    // (handle_rtmp_payload は AAC 以外の音声や中身が空の AAC の初期化情報には null を返すので、AudioTagHeader の先頭 4bit の SoundFormat を見る)
+    // (AAC の配信でも、FFmpeg 8.0 以降の 5.1ch などの MultichannelConfig や、OBS や FFmpeg の 2 つ目の音声トラックは、Enhanced RTMP の形式 (SoundFormat 9) で届く。
+    //  ADTS の AAC (MPEG-TS や HLS の入力など) を -c copy で送る時は、それが本当の AAC の初期化情報より先に届くが、その前に中身が空の AAC の初期化情報が届く)
+    if (message.message_type_id === MessageType.Audio && message.data.byteLength >= 1) {
+      this.firstAudioFormat ??= message.data[0] >> 4;
     }
     const payload = handle_rtmp_payload(message);
     if (payload == null) { return; }
