@@ -181,6 +181,45 @@ describe('Partial Segment', () => {
     expect(partTarget(playlist.m3u8())).toStrictEqual(target);
   });
 
+  // 映像が少しだけ途切れると、短く区切ったパーシャルセグメントの次のパーシャルセグメントは、いつもより長いフレームから始まる
+  // そこから PART-TARGET を決めたり、その長さに合わせて PART-TARGET を長くしたりすると、その後のいつも通りのパーシャルセグメントがどれも 85% に届かない
+  test.each([
+    // 0 番は 2 フレーム (0.133 秒) で短く区切り、1 番は長いフレームと次のフレーム (0.185 秒、2 フレーム) になる
+    ['15 fps, the 3rd frame 51 ms longer', 15, 30, 3, 51, 0.201],
+    ['15 fps, the 3rd frame 59 ms longer', 15, 30, 3, 59, 0.201],
+    // 1 番は長いフレームだけ (0.184 秒、1 フレーム) になる
+    ['15 fps, the 2nd frame 118 ms longer', 15, 30, 2, 118, 0.201],
+    // 1 番 (0.244 秒、2 フレーム) に合わせた PART-TARGET (0.244 秒以上) では、3 フレーム (0.2 秒) が 85% に届かない
+    ['15 fps, the 3rd frame 110 ms longer', 15, 30, 3, 110, 0.201],
+    // 1 番 (0.228 秒、4 フレーム) は 85% 以上なので、そこから決めると PART-TARGET が 0.25 秒のままになり、5 フレーム (0.209 秒) で区切ることがある
+    ['23.976 fps, the 5th frame 60 ms longer', 24000 / 1001, 48, 5, 60, 0.251],
+  ])('%s: PART-TARGET is not decided from the part that starts with the long frame', (_, fps, keyint, from, delay, expected) => {
+    const playlist = new MediaPlaylist({ partialSegmentDuration: 0.25 });
+    // from 番目以降のフレームの timestamp が delay ミリ秒遅れる (from - 1 番目のフレームが delay ミリ秒長い)
+    for (let i = 0; i < keyint * 8; i++) {
+      const timestamp = PlaylistTimestamp.fromRTMP(Math.round(i * 1000 / fps) + (i >= from ? delay : 0));
+      const keyframe = i % keyint === 0;
+      if (keyframe) { playlist.append(timestamp); }
+      playlist.feed([Buffer.from([i % 256])], timestamp, true, keyframe);
+    }
+
+    const m3u8 = playlist.m3u8();
+    const target = partTarget(m3u8);
+    expect(target).toStrictEqual(expected);
+    // プレイリストに残っているのは映像が途切れた後のセグメントだけ
+    const list = segments(m3u8);
+    expect(list.length).toBeGreaterThan(0);
+    for (const { parts } of list) {
+      for (const duration of parts) {
+        expect(duration).toBeLessThanOrEqual(target);
+      }
+      // 最初のパーシャルセグメント (キーフレームから始まるので INDEPENDENT=YES) とセグメントの最後のパーシャルセグメントは除く (RFC 8216bis 4.4.4.9)
+      for (const duration of parts.slice(1, -1)) {
+        expect(duration).toBeGreaterThanOrEqual(0.85 * target);
+      }
+    }
+  });
+
   test('PART-TARGET decided after a part cut short is not shorter than that part', () => {
     const playlist = new MediaPlaylist({ partialSegmentDuration: 0.25 });
     // 23.976 fps の映像 (48 フレームごとにキーフレーム) で、最初の 12 フレームの timestamp が数ミリ秒揺れている

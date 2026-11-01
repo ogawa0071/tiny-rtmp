@@ -55,6 +55,8 @@ export default class MediaPlaylist {
   private partialSegmentFrames: number = 0;
   // 最後にパーシャルセグメントに入れた映像のフレームの長さ (フレームが欠けたり映像が途切れたりしたかを見るのに使う)
   private lastFrameLength: number | null = null;
+  // 今書き込んでいるパーシャルセグメントが、いつもより長いフレーム (次のフレームが欠けた、映像が途切れた) から始まっているか (flush)
+  private partialSegmentStalled: boolean = false;
   // PART-TARGET を決める前に作ったパーシャルセグメントの長さの最大 (秒、1 フレームだけで PART-TARGET より長いものは除く)
   private longestPartialSegment: number = 0;
 
@@ -100,7 +102,7 @@ export default class MediaPlaylist {
   }
 
   // 最初にセグメントの途中でパーシャルセグメントをいつも通りの長さで区切った時に、そのパーシャルセグメントの長さ (duration) から PART-TARGET を決める
-  // (フレームが欠けたり映像が途切れたりして短く区切ったものからは決めない: flush)
+  // (フレームが欠けたり映像が途切れたりして短く区切ったものと、その次の、いつもより長いフレームから始まるものからは決めない: flush)
   // パーシャルセグメントは PART-TARGET 以下で、INDEPENDENT=YES のものとセグメントの最後のもの以外は PART-TARGET の 85% 以上でなければならない (RFC 8216bis 4.4.4.9)
   // 映像のフレームの境目で区切るので、指定の長さのままでは 85% に届かないことがある
   // (例: 15 fps で 0.25 秒なら 3 フレーム (0.2 秒、80%) しか入らない。23.976 fps で 0.25 秒なら、6 フレーム (約 0.250 秒) は入ったり入らなかったりして、入らない時は 5 フレーム (約 0.209 秒、83%) になる)
@@ -112,7 +114,8 @@ export default class MediaPlaylist {
     this.partialSegmentDurationDecided = true;
 
     // timestamp はミリ秒に丸められているので、同じフレーム数のパーシャルセグメントでも 1 ミリ秒長くなったり短くなったりする
-    // (ここで考えるのはこの丸めによるずれだけで、timestamp がそれ以上に揺れる配信では 85% に届かないこともある)
+    // (ここで考えるのはこの丸めによるずれだけで、timestamp がそれ以上に揺れる配信では、1 フレーム少なく区切って 85% に届かないこともある。
+    //  1 フレームだけのパーシャルセグメントは、それより短く区切れないので、代わりに PART-TARGET を超えてしまう)
     const margin = timescale / 1000;
     // 1 ミリ秒長くなると PART-TARGET に入らないなら、1 フレーム少ないパーシャルセグメントもできる
     // (指定の長さがちょうどフレームの長さの整数倍の時もこちら: 24 fps で 0.25 秒の 6 フレームはいつも 0.250 秒だが、
@@ -128,6 +131,7 @@ export default class MediaPlaylist {
   // パーシャルセグメントは映像のフレームの境目で区切るので、1 フレームより短くはできない
   // フレームの間隔が PART-TARGET より長い (フレームレートが低い) と、1 フレームだけのパーシャルセグメントでも PART-TARGET を超えてしまう (RFC 8216bis 4.4.4.9)
   // そこで、直近 2 つの間隔がどちらも PART-TARGET より長ければ、PART-TARGET を 1 フレームの長さ (と timestamp の丸めの 1 ミリ秒) にする
+  // (考えるのは丸めによるずれだけなので、timestamp がそれ以上に揺れてフレームが長くなると、1 フレームだけのパーシャルセグメントが PART-TARGET を超えてしまう)
   // (間隔が 1 つだけ長いのは映像が途切れた時などなので、配信の最初の 2 フレームの間隔だけでは決めない。2 回続けて途切れた時は見分けられないので、フレームレートが低いとみなす)
   // (1 fps 以下でどのフレームもキーフレームの映像では、セグメントが 1 フレームだけになって途中で区切ることがないので、decidePartialSegmentDuration とは別にここで決める)
   private decidePartialSegmentDurationForLowFrameRate(timescale: number): void {
@@ -140,21 +144,25 @@ export default class MediaPlaylist {
 
   // PART-TARGET を決める前に作ったパーシャルセグメントの長さを覚えておく (decidePartialSegmentDuration で、これより短い PART-TARGET にしないため)
   // (1 フレームだけで PART-TARGET より長いもの (映像が途切れた時など) は、どのみち PART-TARGET に入らないので除く)
+  // (いつもより長いフレームから始まるものも除く: その長さに合わせると、その後のいつも通りのパーシャルセグメントが配信の最後まで 85% に届かないことがある。
+  //  除いたものは PART-TARGET を超えることがあるが、それはこの 1 つだけで、プレイリストから外れればなくなる)
   private recordPartialSegment(seconds: number): void {
-    if (this.partialSegmentDurationDecided || seconds > this.partialSegmentDuration) { return; }
+    if (this.partialSegmentDurationDecided || this.partialSegmentStalled || seconds > this.partialSegmentDuration) { return; }
     this.longestPartialSegment = Math.max(this.longestPartialSegment, seconds);
   }
 
   // 今書き込んでいるパーシャルセグメントを timestamp までで完成させて、timestamp から次のパーシャルセグメントを始める
   // now: 今届いた映像のフレームの timestamp (完成したパーシャルセグメントは、この時刻にプレイリストに追加される)
   // decide: このパーシャルセグメントの長さから PART-TARGET を決めてよいか (いつもより短く区切ったものからは決めない)
+  // (いつもより長いフレームから始まるものからも決めない: そのフレームの分だけ、いつもと長さやフレーム数が違う)
   private completePartialSegment(timestamp: number, timescale: number, now: number, decide: boolean): void {
     const segment = this.currentSegment!;
     const duration = timestamp - segment.latestBegin();
-    if (decide) { this.decidePartialSegmentDuration(duration, timescale); }
+    if (decide && !this.partialSegmentStalled) { this.decidePartialSegmentDuration(duration, timescale); }
     this.recordPartialSegment(duration / timescale);
     segment.partialComplete(timestamp, timescale);
     this.partialSegmentFrames = 0;
+    this.partialSegmentStalled = false;
     this.addedAt = now;
     this.updated();
   }
@@ -171,9 +179,11 @@ export default class MediaPlaylist {
     const target = this.partialSegmentDuration * frame.timescale;
     if (begin != null && frame.timestamp > begin && end - begin > target) {
       // このフレームが 1 つ前のフレームと同じ長さ (と timestamp の丸めの 1 ミリ秒) でも入らないなら、いつも通りの長さで区切っている
-      // 入ったはずなのに入らなかった時 (次のフレームが欠けた、映像が途切れた) は、このパーシャルセグメントはいつもより短いので、PART-TARGET を決めるのには使わない (次に区切った時に決める)
+      // 入ったはずなのに入らなかった時 (次のフレームが欠けた、映像が途切れた) は、このパーシャルセグメントはいつもより短いので、PART-TARGET を決めるのには使わない
+      // その時はこのフレームがいつもより長いので、このフレームから始まる次のパーシャルセグメントも使わない (その次に区切った時に決める)
       const regular = this.lastFrameLength != null && frame.timestamp + this.lastFrameLength + frame.timescale / 1000 - begin > target;
       this.completePartialSegment(frame.timestamp, frame.timescale, end, regular);
+      this.partialSegmentStalled = !regular;
     }
     for (const buffer of frame.buffers) {
       this.currentSegment?.feed(buffer, frame.keyframe);
@@ -236,6 +246,7 @@ export default class MediaPlaylist {
     const pdt = this.origin.pdt.add({ milliseconds: Math.round((timestamp - this.origin.timestamp) * 1000 / timescale) });
     this.currentSegment = new ConcatenatedSegment(timestamp, timescale, pdt);
     this.partialSegmentFrames = 0;
+    this.partialSegmentStalled = false;
     // 1 つ前のセグメントの最後のパーシャルセグメントは、このキーフレームが届いた今、プレイリストに追加した
     this.addedAt = timestamp;
     this.updated();
