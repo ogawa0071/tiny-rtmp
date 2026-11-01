@@ -49,9 +49,11 @@ export default class FLVWriter {
   }
 
   private write_header(onMetaData?: AMF0Object): void {
-    // onMetaData があれば、そこに書かれているコーデックから音声/映像の有無を判断する
-    const has_audio = onMetaData == null ? true : onMetaData.audiocodecid != null;
-    const has_video = onMetaData == null ? true : onMetaData.videocodecid != null;
+    // onMetaData にコーデックが書かれていれば、そこから音声/映像の有無を判断する
+    // (onMetaData がない時と、コーデックが 1 つも書かれていない時 (yasea などの配信ソフト) は、両方あるとみなす)
+    const declared = onMetaData?.audiocodecid != null || onMetaData?.videocodecid != null;
+    const has_audio = !declared || onMetaData?.audiocodecid != null;
+    const has_video = !declared || onMetaData?.videocodecid != null;
     this.output.write(write_flv_header(has_audio, has_video));
     this.initialized = true;
   }

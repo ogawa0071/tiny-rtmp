@@ -70,11 +70,14 @@ const handle_avc = (reader: ByteReader): AVCData | null => {
   const compositionTimeOffset = reader.readI24BE();
 
   switch (packetType) {
-    case PacketType.SequenceStart: return {
-      codec: 'AVC',
-      packetType,
-      avcDecoderConfigurationRecord: reader.read(),
-    };
+    case PacketType.SequenceStart: {
+      // FFmpeg は、配信を始める時にまだ初期化情報がないと、中身が空の初期化情報を送ってくる
+      // (エンコーダが初期化情報 (グローバルヘッダ) を出さない時や、ADTS の AAC (MPEG-TS や HLS の入力など) を -c copy で送る時)
+      // 本当の初期化情報は、最初のフレームから取り出して、そのフレームの直前に送り直してくるので、中身が空のものは無視する
+      const avcDecoderConfigurationRecord = reader.read();
+      if (avcDecoderConfigurationRecord.byteLength === 0) { return null; }
+      return { codec: 'AVC', packetType, avcDecoderConfigurationRecord };
+    }
     case PacketType.CodedFrames: return {
       codec: 'AVC',
       packetType,
@@ -112,11 +115,12 @@ export const handle_video = ({ timestamp, data }: { timestamp: number; data: Buf
 const handle_aac = (reader: ByteReader): AACData | null => {
   const packetType = reader.readU8();
   switch (packetType) {
-    case AACPacketType.SequenceHeader: return {
-      codec: 'AAC',
-      packetType,
-      audioSpecificConfig: reader.read(),
-    };
+    case AACPacketType.SequenceHeader: {
+      // 中身が空の初期化情報は無視する (FFmpeg が ADTS の AAC を -c copy で送る時など: handle_avc)
+      const audioSpecificConfig = reader.read();
+      if (audioSpecificConfig.byteLength === 0) { return null; }
+      return { codec: 'AAC', packetType, audioSpecificConfig };
+    }
     case AACPacketType.Raw: return {
       codec: 'AAC',
       packetType,

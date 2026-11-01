@@ -40,11 +40,13 @@ export type VideoData = (AVCData | HEVCData | UnsupportedVideoData) & {
 
 const handle_hevc = (packetType: number, reader: ByteReader): HEVCData | null => {
   switch (packetType) {
-    case PacketType.SequenceStart: return {
-      codec: 'HEVC',
-      packetType,
-      hevcDecoderConfigurationRecord: reader.read(),
-    };
+    case PacketType.SequenceStart: {
+      // 中身が空の初期化情報は無視する (FFmpeg はエンコーダが初期化情報を出さない時、空の初期化情報を先に送り、最初のフレームの直前に本当の初期化情報を送り直す)
+      // (従来の形式の AVC と AAC も同じ: 03-tiny-http-ts-server の handle_avc)
+      const hevcDecoderConfigurationRecord = reader.read();
+      if (hevcDecoderConfigurationRecord.byteLength === 0) { return null; }
+      return { codec: 'HEVC', packetType, hevcDecoderConfigurationRecord };
+    }
     case PacketType.CodedFrames: {
       const compositionTimeOffset = reader.readI24BE();
       return {
@@ -118,6 +120,7 @@ export type AudioData = (AACData | UnsupportedAudioData) & {
 export const handle_audio = (message: { timestamp: number; data: Buffer; }): AudioData | null => {
   if (message.data.byteLength < 1) { return null; }
   // AudioTagHeader の先頭 4bit が SoundFormat: AAC 以外はこのサーバでは fMP4 にしないので、対応していないコーデックとして返す
+  // (SoundFormat 9 は Enhanced RTMP の ExAudioTagHeader で、AAC のトラックの MultichannelConfig や 2 つ目の音声トラックのこともある: HLSGenerator)
   const soundFormat = (message.data[0] & 0xF0) >> 4;
   if (soundFormat !== AudioCodecType.AAC) {
     return { kind: 'Audio', timestamp: message.timestamp, codec: 'Unsupported', soundFormat };

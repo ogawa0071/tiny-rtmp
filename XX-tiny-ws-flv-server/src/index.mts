@@ -87,6 +87,10 @@ const handle = async (connection: Duplex) => {
           // (FrameType 5 は AVCPacketType を持たないコマンドで、先頭 1bit が立っていれば Enhanced RTMP の別の形式)
           const frameType = header >> 4;
           if ((header & 0x0F) !== 7 || frameType < 1 || frameType > 4) { continue; }
+          // 中身が空の初期化情報は中継しない (途中から視聴を始めた視聴者に最初に送る初期化情報にもしない)
+          // (FFmpeg は、配信を始める時にまだ初期化情報がないと空の初期化情報を送り、最初のフレームの直前に本当の初期化情報を送り直す)
+          // (AVC の初期化情報は VideoTagHeader, AVCPacketType, CompositionTime (5 byte) の後ろに AVCDecoderConfigurationRecord が続く)
+          if (packetType === 0 && message.data.byteLength <= 5) { continue; }
           tag = write_flv_tag(message);
           if (packetType === 0) { avcConfig = tag; } // AVC sequence header
           keyframe = frameType === 1 && packetType === 1; // キーフレームの AVC NALU
@@ -96,6 +100,8 @@ const handle = async (connection: Duplex) => {
           if (message.data.byteLength < 2) { continue; }
           const [header, packetType] = message.data;
           if ((header >> 4) !== 10) { continue; } // AAC (SoundFormat: 10) のみ受け付ける
+          // 中身が空の初期化情報は中継しない (AudioTagHeader, AACPacketType (2 byte) の後ろに AudioSpecificConfig がないもの: 映像と同じ)
+          if (packetType === 0 && message.data.byteLength <= 2) { continue; }
           tag = write_flv_tag(message);
           if (packetType === 0) { aacConfig = tag; } // AAC sequence header
           break;
@@ -109,8 +115,11 @@ const handle = async (connection: Duplex) => {
           onMetaData = tag;
           // 中継するのは AAC (SoundFormat: 10) と AVC (CodecID: 7) だけなので、それ以外のコーデックなら送らないことを伝える
           // (コーデックを 'mp4a' や 'avc1' の文字列で書く配信ソフトもある)
-          has_audio = metadata.audiocodecid === 10 || metadata.audiocodecid === 'mp4a';
-          has_video = metadata.videocodecid === 7 || metadata.videocodecid === 'avc1';
+          // コーデックが 1 つも書かれていない onMetaData (yasea などの配信ソフトや、曲名だけを送り直す配信ソフト) では変えない
+          if (metadata.audiocodecid != null || metadata.videocodecid != null) {
+            has_audio = metadata.audiocodecid === 10 || metadata.audiocodecid === 'mp4a';
+            has_video = metadata.videocodecid === 7 || metadata.videocodecid === 'avc1';
+          }
           break;
         }
         default: continue;

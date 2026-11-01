@@ -30,6 +30,29 @@ const MULTICHANNEL_CONFIG = Buffer.from('946d70346101060000060f', 'hex');
 const SECOND_TRACK_SEQUENCE_HEADER = Buffer.from('95006d70346101120856e500', 'hex');
 const SECOND_TRACK_FRAME = Buffer.from('95016d7034610121', 'hex');
 
+// 6 秒間、10 fps の映像 (1 秒ごとにキーフレーム) と、audioStart から AAC (初期化情報と 100 ミリ秒ごとのフレーム) を送る
+// 映像を送るたびに、firstRequest 以降は MPD を取りに行く (届いた MPD を返す)
+const publish = (generator: DASHGenerator, { audioStart, firstRequest, beforeVideo }: { audioStart: number | null; firstRequest: number; beforeVideo?: (t: number) => void; }): (string | null)[] => {
+  const mpds: (string | null)[] = [];
+  for (let t = 0; t < 6000; t += 100) {
+    beforeVideo?.(t);
+    if (t === audioStart) { generator.feed(audio(t, AAC_SEQUENCE_HEADER)); }
+    generator.feed(video(t, avc(t % 1000 === 0 ? 1 : 2)));
+    if (audioStart != null && t >= audioStart) { generator.feed(audio(t + 8, AAC_FRAME)); }
+    if (t >= firstRequest) { mpds.push(generator.mpd()); }
+  }
+  return mpds;
+};
+
+// 一度 MPD を返したら返し続けて、載っているトラックは変わらない
+const expectTracks = (mpds: (string | null)[], tracks: string[]): void => {
+  const served = mpds.findIndex((mpd) => mpd != null);
+  expect(served).not.toBe(-1);
+  for (const mpd of mpds.slice(served)) {
+    expect([... (mpd ?? '').matchAll(/contentType="([a-z]+)"/g)].map(([, type]) => type)).toStrictEqual(tracks);
+  }
+};
+
 describe('MPD', () => {
   test('an AAC sequence header that arrives late is waited for, so the MPD never disappears or gains a track', () => {
     const generator = new DASHGenerator();
@@ -95,35 +118,75 @@ describe('MPD', () => {
   });
 
   test('an onMetaData sent again during the publish does not add or drop a track, whether or not the MPD was requested before it', () => {
-    // 最初の onMetaData、配信の途中で送り直される onMetaData、MPD に載るトラック
-    // (送り直されるのは、コーデックの書かれていない曲名の更新、音声の書かれていないもの、最初になかった音声を足すもの)
-    const cases: [AMF0Object, AMF0Object, string[]][] = [
-      [{ videocodecid: 7, audiocodecid: 10 }, { title: 'next' }, ['video', 'audio']],
-      [{ videocodecid: 7, audiocodecid: 10 }, { videocodecid: 7 }, ['video', 'audio']],
-      [{ videocodecid: 7 }, { videocodecid: 7, audiocodecid: 10 }, ['video']],
+    // 最初の onMetaData、配信の途中で送り直される onMetaData、AAC が届き始める時刻、MPD に載るトラック
+    // (送り直されるのは、コーデックの書かれていない曲名の更新、音声の書かれていないもの、後から始めた音声を足すもの)
+    const cases: [AMF0Object, AMF0Object, number, string[]][] = [
+      [{ videocodecid: 7, audiocodecid: 10 }, { title: 'next' }, 0, ['video', 'audio']],
+      [{ videocodecid: 7, audiocodecid: 10 }, { videocodecid: 7 }, 0, ['video', 'audio']],
+      [{ videocodecid: 7 }, { videocodecid: 7, audiocodecid: 10 }, 3000, ['video']],
     ];
-    for (const [first, again, tracks] of cases) {
+    for (const [first, again, audioStart, tracks] of cases) {
       // 配信の最初から MPD を取りに来る視聴者がいる時と、onMetaData が送り直された後に最初の視聴者が来た時
       for (const firstRequest of [0, 4000]) {
         const generator = new DASHGenerator();
         generator.feed(onmetadata(first));
         generator.feed(video(0, AVC_SEQUENCE_HEADER));
-        generator.feed(audio(0, AAC_SEQUENCE_HEADER));
-        const mpds: (string | null)[] = [];
-        for (let t = 0; t < 6000; t += 100) {
+        const mpds = publish(generator, { audioStart, firstRequest, beforeVideo: (t) => {
           if (t === 3000) { generator.feed(onmetadata(again, t)); }
-          generator.feed(video(t, avc(t % 1000 === 0 ? 1 : 2)));
-          generator.feed(audio(t + 8, AAC_FRAME));
-          if (t >= firstRequest) { mpds.push(generator.mpd()); }
-        }
-
-        // 一度 MPD を返したら返し続けて、載っているトラックは変わらない
-        const served = mpds.findIndex((mpd) => mpd != null);
-        expect(served).not.toBe(-1);
-        for (const mpd of mpds.slice(served)) {
-          expect([... (mpd ?? '').matchAll(/contentType="([a-z]+)"/g)].map(([, type]) => type)).toStrictEqual(tracks);
-        }
+        } });
+        expectTracks(mpds, tracks);
       }
     }
+  });
+
+  // yasea は、videocodecid も audiocodecid もない onMetaData を NetStream.Publish.Start の後に 1 回だけ送ってくる
+  const YASEA_ONMETADATA = { duration: 0, width: 320, height: 240, videodatarate: 0, framerate: 0, audiodatarate: 0, audiosamplerate: 44100, audiosamplesize: 16, stereo: true, filesize: 0 };
+  test.each([
+    ['onMetaData without codec ids (yasea)', YASEA_ONMETADATA],
+    ['no onMetaData (FFmpeg -flvflags no_metadata)', null],
+    ['onMetaData that declares only the video', { videocodecid: 7 }],
+  ])('%s: the tracks whose sequence headers arrive by the time the MPD can be made are used', (_, object) => {
+    // AAC の初期化情報が届く時刻 (null なら音声なし)、MPD に載るトラック
+    // (最初の映像のセグメントができて MPD を作れるようになる 1 秒より後に届いた音声は、MPD に足さない)
+    const cases: [number | null, string[]][] = [
+      [0, ['video', 'audio']],
+      [300, ['video', 'audio']],
+      [null, ['video']],
+      [3000, ['video']],
+    ];
+    for (const [audioStart, tracks] of cases) {
+      for (const firstRequest of [0, 4000]) {
+        const generator = new DASHGenerator();
+        if (object != null) { generator.feed(onmetadata(object)); }
+        generator.feed(video(0, AVC_SEQUENCE_HEADER));
+        expectTracks(publish(generator, { audioStart, firstRequest }), tracks);
+      }
+    }
+  });
+});
+
+describe('Sequence headers without the configuration', () => {
+  // FFmpeg は、配信を始める時にまだ初期化情報がないと、中身が空の初期化情報を先に送り、最初のフレームの直前に本当の初期化情報を送り直す
+  test.each([
+    // ADTS の AAC (MPEG-TS などの入力) を -c copy で送る時は、AAC の初期化情報が空 (AudioSpecificConfig がない)
+    ['AAC (FFmpeg -c copy from ADTS AAC)', AVC_SEQUENCE_HEADER, Buffer.from('af00', 'hex')],
+    // エンコーダが初期化情報を出さない時 (-flags -global_header など) は、AVC の初期化情報が空 (AVCDecoderConfigurationRecord がない)
+    ['AVC (FFmpeg with an encoder that does not output a global header)', Buffer.from('1700000000', 'hex'), AAC_SEQUENCE_HEADER],
+  ])('%s: the empty sequence header is ignored until the real one arrives', (_, videoHeader, audioHeader) => {
+    const generator = new DASHGenerator();
+    generator.feed(metadata(7, 10));
+    generator.feed(video(0, videoHeader));
+    generator.feed(audio(0, audioHeader));
+    for (let t = 0; t < 3000; t += 100) {
+      // 本当の初期化情報は、最初のフレームの直前に届く
+      if (t === 0) { generator.feed(video(t, AVC_SEQUENCE_HEADER)); }
+      generator.feed(video(t, avc(t % 1000 === 0 ? 1 : 2)));
+      if (t === 0) { generator.feed(audio(t + 45, AAC_SEQUENCE_HEADER)); }
+      generator.feed(audio(t + 45, AAC_FRAME));
+    }
+
+    const mpd = generator.mpd();
+    expect(mpd).toContain('codecs="avc1.4D400D"');
+    expect(mpd).toContain('codecs="mp4a.40.2"');
   });
 });

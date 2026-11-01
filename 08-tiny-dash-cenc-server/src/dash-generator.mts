@@ -37,6 +37,8 @@ export default class DASHGenerator {
   private onMetadata: AMF0Object | null = null;
   // AAC の初期化情報より先に、AAC 以外の音声 (MP3 など) が届いたか
   private unsupportedAudio = false;
+  // MPD に載せるトラック (MPD を作れるようになった時に決めて、後から増やしたり減らしたりしない: decideTracks)
+  private tracks: { video: boolean; audio: boolean; } | null = null;
 
   private previousVideoInformation: VideoInformation | null = null;
   private aacLatestTimestamp: number | null = null;
@@ -89,27 +91,38 @@ export default class DASHGenerator {
     });
   }
 
-  // 配信の映像が、このサーバで扱える AVC か (onMetaData の videocodecid で判断する)
-  // (コーデックを数値ではなく 'avc1' の文字列で送ってくる配信ソフトもある)
+  // MPD に載せる映像のトラックがあるか
+  // onMetaData にこのサーバで扱える AVC と書かれていれば、初期化情報が遅れて届いても待つ (コーデックを数値ではなく 'avc1' の文字列で送ってくる配信ソフトもある)
+  // onMetaData に書かれていなくても、初期化情報が届いていれば載せる (onMetaData を送ってこない配信ソフトや、onMetaData にコーデックを書かない配信ソフト (yasea など) もある)
   private hasVideo(): boolean {
-    return this.onMetadata?.videocodecid === 7 || this.onMetadata?.videocodecid === 'avc1';
+    if (this.tracks != null) { return this.tracks.video; }
+    return this.avcDecoderConfigurationRecord != null || this.onMetadata?.videocodecid === 7 || this.onMetadata?.videocodecid === 'avc1';
   }
 
-  // 配信の音声が、このサーバで扱える AAC か (onMetaData の audiocodecid で判断する)
-  // (コーデックを数値ではなく 'mp4a' の文字列で送ってくる配信ソフトもある)
+  // MPD に載せる音声のトラックがあるか (hasVideo と同じ。コーデックを数値ではなく 'mp4a' の文字列で送ってくる配信ソフトもある)
   private hasAudio(): boolean {
+    if (this.tracks != null) { return this.tracks.audio; }
+    if (this.audioSpecificConfig != null) { return true; }
     // onMetaData に AAC と書かれていても、AAC の初期化情報より先に AAC 以外の音声が届いたなら、AAC は届かない
     if (this.unsupportedAudio) { return false; }
     return this.onMetadata?.audiocodecid === 10 || this.onMetadata?.audiocodecid === 'mp4a';
   }
 
-  // MPD を作る (まだ MPD に載せられるセグメントがなければ null)
+  // SegmentTimeline には S が 1 つ以上必要なので、MPD に載せる全てのトラックにセグメントができるまでは MPD を作らない
+  // (トラックを後から MPD に足しても再生を始めたプレイヤーには使われないので、初期化情報が遅れて届くトラックも待つ)
+  // MPD を作れるようになったら、MPD に載せるトラックを決めて、後から変えない
+  // (視聴者が最初に MPD を取りに来た時刻によって載せるトラックが変わらないように、映像・音声が届いた時に決める)
+  private decideTracks(): void {
+    if (this.tracks != null) { return; }
+    if (!this.hasVideo() && !this.hasAudio()) { return; }
+    if (this.hasVideo() && !(this.videoTimeline?.hasSegments() ?? false)) { return; }
+    if (this.hasAudio() && !(this.audioTimeline?.hasSegments() ?? false)) { return; }
+    this.tracks = { video: this.hasVideo(), audio: this.hasAudio() };
+  }
+
+  // MPD を作る (まだ MPD に載せるトラックが決まっていなければ null)
   public mpd(): string | null {
-    // SegmentTimeline には S が 1 つ以上必要なので、onMetaData に書かれた (このサーバで扱える) 全てのトラックにセグメントができるまでは MPD を作らない
-    // (トラックを後から MPD に足しても再生を始めたプレイヤーには使われないので、初期化情報が遅れて届くトラックも待つ)
-    if (!this.hasVideo() && !this.hasAudio()) { return null; }
-    if (this.hasVideo() && !(this.videoTimeline?.hasSegments() ?? false)) { return null; }
-    if (this.hasAudio() && !(this.audioTimeline?.hasSegments() ?? false)) { return null; }
+    if (this.tracks == null) { return null; }
 
     const declaration = '<?xml version="1.0" encoding="UTF-8"?>';
 
@@ -220,13 +233,12 @@ export default class DASHGenerator {
         break;
       case 'Data': {
         const metadata = read_onmetadata(payload.values);
-        // MPD に載せるトラックは最初の onMetaData で決める (配信の途中で onMetaData が送り直されても、トラックを増やしたり減らしたりしない)
+        // 最初の onMetaData を使う (配信の途中で onMetaData が送り直されても、MPD に載せるトラックを増やしたり減らしたりしない)
         if (metadata != null) { this.onMetadata ??= metadata; }
         return;
       }
     }
 
-    if (this.onMetadata == null) { return; }
     // RTMP の timestamp は 0 から始まるとは限らないので、timestamp が 0 になる時刻を availabilityStartTime にする
     this.availabilityStartTime ??= Temporal.Now.instant().subtract({ milliseconds: payload.timestamp });
 
@@ -285,7 +297,7 @@ export default class DASHGenerator {
           cto: payload.compositionTimeOffset,
           data: payload.data,
         };
-        return;
+        break;
       }
       case 'Audio': {
         if (this.audioTimeline == null) { return; }
@@ -325,8 +337,10 @@ export default class DASHGenerator {
             vector
           );
         }));
-        return;
+        break;
       }
     }
+    // 映像・音声でセグメントができたら、MPD に載せるトラックを決める
+    this.decideTracks();
   }
 }

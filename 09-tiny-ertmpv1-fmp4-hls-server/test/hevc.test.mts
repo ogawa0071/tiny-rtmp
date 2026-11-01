@@ -37,6 +37,12 @@ const record = (lengthSizeMinusOne: number): Buffer => {
   return Buffer.concat([fixed, Buffer.from([4]), array(32, VPS), array(33, SPS), array(34, PPS), Buffer.from([0x80 | 39, 0x00, 0x01, 0x00, 0x03]), Buffer.from(SEI, 'hex')]);
 };
 
+// Enhanced RTMP の ExVideoTagHeader: IsExHeader (1bit), FrameType (3bit), PacketType (4bit), FourCC (32bit), (CodedFrames なら) CompositionTime (24bit)
+const hevc = (timestamp: number, frameType: number, packetType: number, body: Buffer): Message => {
+  const header = Buffer.concat([Buffer.from([0x80 | (frameType << 4) | packetType]), Buffer.from('hvc1', 'ascii'), packetType === 1 ? Buffer.alloc(3) : Buffer.alloc(0)]);
+  return { message_type_id: MessageType.Video, message_stream_id: 1, timestamp, data: Buffer.concat([header, body]) };
+};
+
 describe('hvc1 parameter sets', () => {
   test('VPS/SPS/PPS in the samples are removed, other NAL units are kept', () => {
     expect(strip_parameter_sets(sized(4, AUD, VPS, SPS, PPS, SEI, IDR), 4)).toStrictEqual(sized(4, AUD, SEI, IDR));
@@ -67,11 +73,6 @@ describe('hvc1 parameter sets', () => {
   });
 
   test('HLSGenerator removes VPS/SPS/PPS from the samples of the segments', () => {
-    // Enhanced RTMP の ExVideoTagHeader: IsExHeader (1bit), FrameType (3bit), PacketType (4bit), FourCC (32bit), (CodedFrames なら) CompositionTime (24bit)
-    const hevc = (timestamp: number, frameType: number, packetType: number, body: Buffer): Message => {
-      const header = Buffer.concat([Buffer.from([0x80 | (frameType << 4) | packetType]), Buffer.from('hvc1', 'ascii'), packetType === 1 ? Buffer.alloc(3) : Buffer.alloc(0)]);
-      return { message_type_id: MessageType.Video, message_stream_id: 1, timestamp, data: Buffer.concat([header, body]) };
-    };
     const generator = new HLSGenerator();
     generator.feed({ message_type_id: MessageType.DataAMF0, message_stream_id: 1, timestamp: 0, data: ['@setDataFrame', 'onMetaData', { videocodecid: 0x68766331 }] });
     generator.feed(hevc(0, 1, 0, record(3)));
@@ -89,5 +90,22 @@ describe('hvc1 parameter sets', () => {
       expect(segment.includes(Buffer.from(SPS, 'hex'))).toBe(false);
       expect(segment.includes(Buffer.from(PPS, 'hex'))).toBe(false);
     }
+  });
+});
+
+describe('HEVC sequence header without the configuration', () => {
+  test('an empty HEVCDecoderConfigurationRecord (FFmpeg with an encoder that does not output a global header) is ignored until the real one arrives', () => {
+    const generator = new HLSGenerator();
+    generator.feed({ message_type_id: MessageType.DataAMF0, message_stream_id: 1, timestamp: 0, data: ['@setDataFrame', 'onMetaData', { videocodecid: 0x68766331 }] });
+    // FFmpeg は、エンコーダが初期化情報を出さない時、中身が空の初期化情報を先に送り、最初のフレームの直前に本当の初期化情報を送り直す
+    generator.feed(hevc(0, 1, 0, Buffer.alloc(0)));
+    for (let t = 0; t < 3000; t += 100) {
+      if (t === 0) { generator.feed(hevc(t, 1, 0, record(3))); }
+      generator.feed(t % 1000 === 0 ? hevc(t, 1, 1, sized(4, IDR)) : hevc(t, 2, 1, sized(4, TRAIL)));
+    }
+    generator.end();
+
+    expect(generator.initialize()?.includes('hvcC')).toBe(true);
+    expect([... generator.m3u8().matchAll(/^(\d+)\.m4s$/gm)].length).toBe(3);
   });
 });
