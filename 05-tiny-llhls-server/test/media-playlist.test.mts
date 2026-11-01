@@ -93,16 +93,65 @@ describe('Partial Segment', () => {
     expect(part).toStrictEqual(1);
   });
 
+  test('a frame longer than PART-TARGET (the video stalled) becomes a part of its own, completed when the next frame arrives', () => {
+    const playlist = new MediaPlaylist({ partialSegmentDuration: 0.25 });
+    // 30 fps の映像 (60 フレームごとにキーフレーム) で、プレイリストを公開した後のセグメントの 2 フレーム目の後に、映像が約 0.33 秒途切れる
+    publish(playlist, 30, 60, 60 * 3 + 12, (i) => i >= 60 * 3 + 2 && i < 60 * 3 + 11);
+
+    // 途切れる前のフレームは PART-TARGET より長いので、1 フレームだけで 1 番のパーシャルセグメントになって、次のフレームが届いた時にはもう完成している
+    const [, part] = preload(playlist.m3u8());
+    expect(part).toStrictEqual(2);
+  });
+
+  // パーシャルセグメントは、1 つ前のものを追加してから PART-TARGET 以内に追加しなければならない (RFC 8216bis 6.2.1)
+  // 映像のフレームは timestamp の時刻に届くものとして、それぞれのパーシャルセグメントがプレイリストに載った時刻を調べる
+  // (セグメントの最後のパーシャルセグメントはキーフレームが届いた時に載るので、次のセグメントの 0 番が遅れやすい)
   test.each([
-    ['23.976 fps', 24000 / 1001, 48],
-    ['15 fps', 15, 30],
-    ['10 fps', 10, 20],
-  ])('%s with a 0.25 s PART-TARGET: PART-TARGET is adjusted so that parts are at least 85% of it', (_, fps, keyint) => {
+    ['25 fps, 2 s GOP, PART-TARGET 0.5', 25, 50, 0.5, 0.5],
+    ['30 fps, 2 s GOP, PART-TARGET 0.25', 30, 60, 0.25, 0.25],
+    ['24 fps, 2 s GOP, PART-TARGET 0.25 (6 frames, PART-TARGET 0.251)', 24, 48, 0.25, 0.251],
+    ['23.976 fps, 2 s GOP, PART-TARGET 0.25 (6 frames, PART-TARGET 0.251)', 24000 / 1001, 48, 0.25, 0.251],
+    ['15 fps, 2 s GOP, PART-TARGET 0.25 (3 frames, PART-TARGET 0.201)', 15, 30, 0.25, 0.201],
+    ['3 fps, 2 s GOP, PART-TARGET 0.25 (1 frame, PART-TARGET 0.334)', 3, 6, 0.25, 0.334],
+  ])('%s: each part is added within PART-TARGET after the previous one', (_, fps, keyint, target, decided) => {
+    const playlist = new MediaPlaylist({ partialSegmentDuration: target });
+    // パーシャルセグメントの URI と、それがプレイリストに載った時刻 (ミリ秒)
+    const added = new Map<string, number>();
+    for (let i = 0; i < keyint * 8; i++) {
+      const ms = Math.round(i * 1000 / fps);
+      const timestamp = PlaylistTimestamp.fromRTMP(ms);
+      const keyframe = i % keyint === 0;
+      if (keyframe) { playlist.append(timestamp); }
+      playlist.feed([Buffer.alloc(1)], timestamp, true, keyframe);
+      for (const [, uri] of playlist.m3u8().matchAll(/#EXT-X-PART:DURATION=[\d.]+,URI="([^"]+)"/g)) {
+        if (!added.has(uri)) { added.set(uri, ms); }
+      }
+    }
+
+    // プレイリストを公開した後 (4 つ目のセグメントが始まってから) の間隔
+    const times = [... added.values()].filter((ms) => ms >= Math.round(keyint * 3 * 1000 / fps));
+    expect(times.length).toBeGreaterThan(8);
+    expect(partTarget(playlist.m3u8())).toStrictEqual(decided);
+    for (let i = 1; i < times.length; i++) {
+      expect(times[i] - times[i - 1]).toBeLessThanOrEqual(decided * 1000);
+    }
+  });
+
+  // 15 fps と 10 fps は、0.25 秒に入るフレーム (3 フレーム、2 フレーム) では 80% にしかならない
+  // 24 fps と 12 fps はちょうど 0.25 秒に入るが、23.976 fps (6 フレームが 0.251 秒になることがある) と最初のパーシャルセグメントだけでは見分けられない
+  test.each([
+    ['23.976 fps', 24000 / 1001, 48, 0.251],
+    ['24 fps', 24, 48, 0.251],
+    ['15 fps', 15, 30, 0.201],
+    ['12 fps', 12, 24, 0.251],
+    ['10 fps', 10, 20, 0.201],
+  ])('%s with a 0.25 s PART-TARGET: PART-TARGET is adjusted so that parts are at least 85% of it', (_, fps, keyint, expected) => {
     const playlist = new MediaPlaylist({ partialSegmentDuration: 0.25 });
     publish(playlist, fps, keyint, keyint * 8);
 
     const m3u8 = playlist.m3u8();
     const target = partTarget(m3u8);
+    expect(target).toStrictEqual(expected);
     const list = segments(m3u8);
     expect(list.length).toBeGreaterThan(0);
     for (const { parts } of list) {
@@ -112,6 +161,67 @@ describe('Partial Segment', () => {
       // 最初のパーシャルセグメント (キーフレームから始まるので INDEPENDENT=YES) とセグメントの最後のパーシャルセグメントは除く (RFC 8216bis 4.4.4.9)
       for (const duration of parts.slice(1, -1)) {
         expect(duration).toBeGreaterThanOrEqual(0.85 * target);
+      }
+    }
+  });
+
+  // フレームが欠けたり映像が途切れたりしても、それで短く区切ったパーシャルセグメントや、1 フレームだけの長いパーシャルセグメントからは PART-TARGET を決めない
+  test.each([
+    // 30 fps で 0.25 秒なら 7 フレーム (約 0.233 秒、93%) ごとに区切れるが、最初のパーシャルセグメントの 7 番目のフレームの次が欠けている
+    ['a dropped frame at the end of the first part', 0.25, (i: number) => i === 7],
+    // 最初の 2 フレームの後、映像が約 1 秒途切れる (配信を始めた直後のエンコーダなど)
+    ['a 1 s stall after the first 2 frames', 1, (i: number) => i >= 2 && i < 32],
+    // 最初のフレームの後、映像が約 1 秒途切れる (フレームの間隔が 1 つだけ長いので、フレームレートが低いとはみなさない)
+    ['a 1 s stall after the first frame', 0.25, (i: number) => i >= 1 && i < 31],
+  ])('30 fps, %s: PART-TARGET stays as specified', (_, target, dropped) => {
+    const playlist = new MediaPlaylist({ partialSegmentDuration: target });
+    publish(playlist, 30, 60, 60 * 8, dropped);
+
+    // フレームが欠けていなければ 85% 以上に区切れるので、指定の PART-TARGET のまま
+    expect(partTarget(playlist.m3u8())).toStrictEqual(target);
+  });
+
+  test('PART-TARGET decided after a part cut short is not shorter than that part', () => {
+    const playlist = new MediaPlaylist({ partialSegmentDuration: 0.25 });
+    // 23.976 fps の映像 (48 フレームごとにキーフレーム) で、最初の 12 フレームの timestamp が数ミリ秒揺れている
+    // 0 番のパーシャルセグメント (5 フレーム、0.210 秒) は、次のフレームが 1 つ前のフレームと同じ長さなら入ったので、短く区切ったものとして PART-TARGET を決めず、
+    // 1 番 (5 フレーム、0.208 秒) で決める。その PART-TARGET が 0 番より短いと、0 番が PART-TARGET を超えてしまう
+    const jittered = [0, 43, 85, 128, 171, 210, 252, 294, 335, 376, 418, 461];
+    // 3 つ目のセグメントが完成して、プレイリストを公開するところまで入れる
+    for (let i = 0; i <= 48 * 3; i++) {
+      const timestamp = PlaylistTimestamp.fromRTMP(jittered[i] ?? Math.round(i * 1001 / 24));
+      const keyframe = i % 48 === 0;
+      if (keyframe) { playlist.append(timestamp); }
+      playlist.feed([Buffer.from([i % 256])], timestamp, true, keyframe);
+    }
+
+    const m3u8 = playlist.m3u8();
+    const target = partTarget(m3u8);
+    const list = segments(m3u8);
+    expect(list.length).toStrictEqual(3);
+    for (const { parts } of list) {
+      for (const duration of parts) {
+        expect(duration).toBeLessThanOrEqual(target);
+      }
+    }
+  });
+
+  // パーシャルセグメントは 1 フレームより短くできないので、フレームの間隔が PART-TARGET より長いと、PART-TARGET を 1 フレームの長さ (と 1 ミリ秒) にする
+  test.each([
+    ['3 fps, 2 s GOP, PART-TARGET 0.25', 3, 6, 0.25, 0.334],
+    ['2 fps, 2 s GOP, PART-TARGET 0.25', 2, 4, 0.25, 0.501],
+    ['1 fps, every frame a keyframe, PART-TARGET 0.5', 1, 1, 0.5, 1.001],
+  ])('%s: a frame is longer than PART-TARGET, so PART-TARGET becomes one frame', (_, fps, keyint, target, expected) => {
+    const playlist = new MediaPlaylist({ partialSegmentDuration: target });
+    publish(playlist, fps, keyint, fps * 12);
+
+    const m3u8 = playlist.m3u8();
+    expect(partTarget(m3u8)).toStrictEqual(expected);
+    const list = segments(m3u8);
+    expect(list.length).toBeGreaterThan(0);
+    for (const { parts } of list) {
+      for (const duration of parts) {
+        expect(duration).toBeLessThanOrEqual(expected);
       }
     }
   });
