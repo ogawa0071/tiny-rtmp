@@ -11,6 +11,7 @@ import handle_rtmp from '../../02-tiny-http-flv-server/src/rtmp-accepter.mts';
 import { AuthConfiguration } from '../../01-tiny-rtmp-server/src/auth.mts';
 
 import MPEGTSTransmuxer from './mpegts-transmuxer.mts';
+import { TimestampUnwrapper } from './rtmp-handler.mts';
 
 const options = {
   rtmp: {
@@ -67,12 +68,16 @@ const viewers = new Set<Viewer>();
 
 const handle = async (connection: Duplex) => {
   const rtmp_to_mpegts = new MPEGTSTransmuxer();
+  // RTMP の timestamp が一周して戻っても (rtmp-handler.mts の TimestampUnwrapper)、時刻が戻らないように直してから使う
+  // (そのままだと、FFmpeg の 31bit の timestamp が一周した時や負の DTS (0x7FFFFFxx) で PTS/DTS が 2^32 (90kHz で約 13 時間) 飛ぶ。
+  //  また時刻が戻ると、PAT/PMT/PCR を出力する間隔を測れなくなり、それらが出力されなくなる)
+  const timestamps = new TimestampUnwrapper();
   let published = false;
 
   try {
     for await (const message of handle_rtmp(connection, { auth, limit: { bandwidth } })) {
       published = true;
-      for (const packet of rtmp_to_mpegts.feed(message)) {
+      for (const packet of rtmp_to_mpegts.feed(timestamps.unwrap(message))) {
         for (const viewer of viewers) { viewer.write(packet); }
       }
     }

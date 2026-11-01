@@ -2,7 +2,8 @@ import { describe, expect, test } from 'vitest';
 
 import { MessageType } from '../../01-tiny-rtmp-server/src/message.mts';
 import type { Message } from '../../01-tiny-rtmp-server/src/message.mts';
-import type { AMF0Object } from '../../01-tiny-rtmp-server/src/amf0-reader.mts';
+import read_amf0 from '../../01-tiny-rtmp-server/src/amf0-reader.mts';
+import type { AMF0Object, AMF0Value } from '../../01-tiny-rtmp-server/src/amf0-reader.mts';
 
 import FLVRelay from '../src/flv-relay.mts';
 
@@ -48,7 +49,7 @@ describe('FLV Header', () => {
 });
 
 describe('Sequence headers without the configuration', () => {
-  // FFmpeg は、配信を始める時にまだ初期化情報がないと、中身が空の初期化情報を先に送り、最初のフレームの直前に本当の初期化情報を送り直す
+  // FFmpeg は、配信を始める時にまだ初期化情報がないと、中身が空の初期化情報を先に送り、そのトラックの最初のフレームの直前に本当の初期化情報を送り直す (H.264 は FFmpeg 6.1 以降)
   test('empty AVC / AAC sequence headers are neither relayed nor sent to viewers who start later', () => {
     const relay = new FLVRelay();
     relay.accept(onmetadata({ videocodecid: 7, audiocodecid: 10 }));
@@ -71,5 +72,57 @@ describe('Sequence headers without the configuration', () => {
     expect(relay.accept(video(0, avc(1)))).toMatchObject({ initial: false, keyframe: true });
     expect(relay.accept(video(33, avc(2)))).toMatchObject({ initial: false, keyframe: false });
     expect(relay.accept(audio(23, AAC_FRAME))).toMatchObject({ initial: false, keyframe: false });
+  });
+});
+
+describe('Messages that are not relayed', () => {
+  const data_message = (values: AMF0Value[]): Message => ({ message_type_id: MessageType.DataAMF0, message_stream_id: 1, timestamp: 0, data: values });
+
+  test.each([
+    ['MP3 (SoundFormat 2)', audio(0, Buffer.from('2fff', 'hex'))],
+    ['Enhanced RTMP audio (SoundFormat 9, MultichannelConfig)', audio(0, Buffer.from('946d70346101060000003f', 'hex'))],
+    ['Enhanced RTMP video (HEVC)', video(0, Buffer.from('91687663310000000000', 'hex'))],
+    ['Sorenson H.263 (CodecID 2)', video(0, Buffer.from('22000084001f0000', 'hex'))],
+    // FrameType 5 の映像は、VideoTagHeader の後ろに 1 byte のコマンド (0: シーク開始, 1: シーク終了) が続く
+    ['a video info / command frame (FrameType 5)', video(0, Buffer.from('5701', 'hex'))],
+    // Enhanced RTMP の ExVideoTagHeader (先頭 1bit が立っている) は、下位 4bit が 7 でも AVC の CodecID ではなく PacketType
+    ['an Enhanced RTMP video packet whose PacketType is 7', video(0, Buffer.from('97617663310000000000', 'hex'))],
+    ['a video message that is too short', video(0, Buffer.from('17', 'hex'))],
+    ['onTextData', data_message(['@setDataFrame', 'onTextData', { text: 'hello' }])],
+    ['onMetaData that is not an object', data_message(['@setDataFrame', 'onMetaData', 'hello'])],
+  ])('%s is not relayed', (_, message) => {
+    const relay = new FLVRelay();
+    expect(relay.accept(message)).toBeNull();
+    expect(relay.initials()).toHaveLength(1); // FLV Header だけ
+  });
+
+  test.each<[string, AMF0Value[]]>([
+    ['with @setDataFrame', ['@setDataFrame', 'onMetaData', { videocodecid: 7, audiocodecid: 10 }]],
+    ['without @setDataFrame', ['onMetaData', { videocodecid: 7, audiocodecid: 10 }]],
+  ])('onMetaData %s is relayed without @setDataFrame', (_, values) => {
+    const relay = new FLVRelay();
+    const relayed = relay.accept(data_message(values));
+    expect(relayed).not.toBeNull();
+    expect(read_amf0(data(relayed!.tag))).toEqual(['onMetaData', { videocodecid: 7, audiocodecid: 10 }]);
+  });
+
+  test('viewers who start later get the latest onMetaData and sequence headers, not an end of sequence', () => {
+    const relay = new FLVRelay();
+    relay.accept(onmetadata({ videocodecid: 7, audiocodecid: 10 }));
+    relay.accept(video(0, AVC_SEQUENCE_HEADER));
+    relay.accept(audio(0, AAC_SEQUENCE_HEADER));
+    // 曲名を更新した onMetaData と、解像度や音声の設定を変えた初期化情報が送り直され、AVC の end of sequence が届く
+    relay.accept(onmetadata({ videocodecid: 7, audiocodecid: 10, title: 'next' }));
+    const avc2 = Buffer.from(AVC_SEQUENCE_HEADER);
+    avc2[8] = 0x1e;
+    const aac2 = Buffer.from('af00121056e500', 'hex');
+    relay.accept(video(1000, avc2));
+    relay.accept(audio(1000, aac2));
+    expect(relay.accept(video(2000, Buffer.from('1702000000', 'hex')))).toMatchObject({ initial: false, keyframe: false });
+
+    const [, meta, avcInitial, aacInitial] = relay.initials();
+    expect(read_amf0(data(meta))).toEqual(['onMetaData', { videocodecid: 7, audiocodecid: 10, title: 'next' }]);
+    expect(data(avcInitial).equals(avc2)).toBe(true);
+    expect(data(aacInitial).equals(aac2)).toBe(true);
   });
 });

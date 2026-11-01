@@ -1,13 +1,18 @@
 import { MessageType } from '../../01-tiny-rtmp-server/src/message.mts';
 import type { Message } from '../../01-tiny-rtmp-server/src/message.mts';
 import type { AMF0Object } from '../../01-tiny-rtmp-server/src/amf0-reader.mts';
+import { logger } from '../../01-tiny-rtmp-server/src/logger.mts';
 
 import { read_audio_specific_config } from '../../03-tiny-http-ts-server/src/aac.mts';
 import handle_rtmp_payload, { AACPacketType, AudioCodecType, FrameType, PacketType, read_onmetadata, TimestampUnwrapper, VideoCodecType } from '../../03-tiny-http-ts-server/src/rtmp-handler.mts';
+import type { AudioData, VideoData } from '../../03-tiny-http-ts-server/src/rtmp-handler.mts';
 
 import { write_mp4_aac_track_information } from './aac.mts';
 import { fragment, initialize, make } from './fmp4.mts';
 import { write_mp4_avc_track_information } from './avc.mts';
+
+// 映像・音声のフレーム (初期化情報を除いたもの)
+type Frame = Extract<VideoData, { packetType: typeof PacketType.CodedFrames; }> | Extract<AudioData, { packetType: typeof AACPacketType.Raw; }>;
 
 type VideoInformation = {
   type: number;
@@ -34,10 +39,16 @@ export default class FMP4Transmuxer {
   private avcDecoderConfigurationRecord: Buffer | null = null;
   private audioSpecificConfig: Buffer | null = null;
   private onMetadata: AMF0Object | null = null;
+  // 最初に届いた映像のメッセージが、従来の形式の H.264 (AVC) か (Enhanced RTMP の HEVC などや Sorenson H.263 なら false: このサーバでは fMP4 にしない)
+  private firstVideoIsAVC: boolean | null = null;
   // 最初に届いた音声のメッセージの SoundFormat (AudioTagHeader の先頭 4bit: 10 は AAC、2 は MP3、9 は Enhanced RTMP の形式)
   private firstAudioFormat: number | null = null;
+  // 初期化情報より先に H.264 のフレームが届いたか (その映像は fMP4 にできないので、映像のトラックがない配信として扱う: feed)
+  private videoSequenceHeaderMissing = false;
   // 最初に届いたフレームの timestamp (onMetaData にコーデックが書かれていない時に、UNDECLARED_TRACK_WAIT の間だけ届いていないトラックを待つ)
   private firstFrameTimestamp: number | null = null;
+  // UNDECLARED_TRACK_WAIT の間に届いたフレーム (初期化セグメントを作ってから fMP4 にする)
+  private waitingFrames: Frame[] = [];
 
   private initializeSegment: Buffer | null = null;
   // 初期化セグメントに入れたトラック (初期化セグメントを作る時に決めて、後から変えない)
@@ -52,30 +63,39 @@ export default class FMP4Transmuxer {
   }
 
   // 初期化セグメント (ftyp + moov) を作る (まだ作れなければ null)
-  // timestamp: いま届いたフレームの timestamp
-  private create_initialize_segment(timestamp: number): Buffer | null {
+  // frame: いま届いたフレーム
+  private create_initialize_segment(frame: Frame): Buffer | null {
     // このサーバが fMP4 にするコーデック (H.264, AAC) のトラックは、初期化情報が届くまで待つ
-    // 映像は、onMetaData に H.264 と書かれていれば待つ (コーデックを数値ではなく 'avc1' や 'mp4a' の文字列で送ってくる配信ソフトもある)
-    // 音声は、もう届いていれば最初に届いた音声のコーデックで、まだ届いていなければ onMetaData で決める
+    // 映像・音声は、もう届いていれば最初に届いたもののコーデックで、まだ届いていなければ onMetaData で決める
+    // (コーデックを数値ではなく 'avc1' や 'mp4a' の文字列で送ってくる配信ソフトもある)
     // (onMetaData に AAC と書かれていても、最初に AAC 以外の音声が届いたなら AAC は届かないので待たない。
     //  onMetaData に書かれていなくても、最初に AAC が届いたなら待つ: 中身が空の初期化情報が先に届いても、本当の初期化情報は後から届く)
     // それ以外のコーデック (MP3 や Sorenson H.263 など) のトラックは待たない (このサーバでは fMP4 にしないので、そのトラックがない配信として扱う)
-    const video_expected = this.onMetadata?.videocodecid === VideoCodecType.AVC || this.onMetadata?.videocodecid === 'avc1';
+    // (初期化情報より先にフレームが届いた H.264 も fMP4 にできないので待たない: feed)
+    const video_expected = (this.firstVideoIsAVC ?? (this.onMetadata?.videocodecid === VideoCodecType.AVC || this.onMetadata?.videocodecid === 'avc1')) && !this.videoSequenceHeaderMissing;
     const audio_expected = this.firstAudioFormat != null
       ? this.firstAudioFormat === AudioCodecType.AAC
       : (this.onMetadata?.audiocodecid === AudioCodecType.AAC || this.onMetadata?.audiocodecid === 'mp4a');
-    if (video_expected && this.avcDecoderConfigurationRecord == null) { return null; }
-    if (audio_expected && this.audioSpecificConfig == null) { return null; }
+    if ((video_expected && this.avcDecoderConfigurationRecord == null) || (audio_expected && this.audioSpecificConfig == null)) {
+      // 待っている間に届いたフレームは捨てる
+      // (下の UNDECLARED_TRACK_WAIT の間に取っておいたフレームがあれば、それも捨てる。取っておいたフレームを送ると、捨てたフレームの分だけ間が空く)
+      this.waitingFrames = [];
+      return null;
+    }
     if (this.avcDecoderConfigurationRecord == null && this.audioSpecificConfig == null) { return null; }
 
     // onMetaData にコーデックが 1 つも書かれていない時 (onMetaData を送ってこない配信ソフトや、yasea など) は、どのトラックが届くか分からない
     // yasea などは、それぞれのトラックの初期化情報をそのトラックの最初のフレームの直前に送ってくるので、もう一方のトラックの初期化情報は最初のフレームより後に届く
-    // そこで、まだ初期化情報が届いていないトラックを、最初のフレームから少しの間 (UNDECLARED_TRACK_WAIT) だけ待つ (待っている間に届いたフレームは捨てる)
+    // そこで、まだ何も届いていないトラックを、最初のフレームから少しの間 (UNDECLARED_TRACK_WAIT) だけ待つ
+    // (待っている間に届いたフレームは取っておく: 捨てると最初のキーフレームがなくなり、視聴者は次のキーフレームまで見始められない)
     const declared = this.onMetadata?.videocodecid != null || this.onMetadata?.audiocodecid != null;
-    const missing = this.avcDecoderConfigurationRecord == null || (this.audioSpecificConfig == null && this.firstAudioFormat == null);
+    const missing = (this.avcDecoderConfigurationRecord == null && this.firstVideoIsAVC == null) || (this.audioSpecificConfig == null && this.firstAudioFormat == null);
     if (!declared && missing) {
-      this.firstFrameTimestamp ??= timestamp;
-      if (timestamp - this.firstFrameTimestamp < UNDECLARED_TRACK_WAIT) { return null; }
+      this.firstFrameTimestamp ??= frame.timestamp;
+      if (frame.timestamp - this.firstFrameTimestamp < UNDECLARED_TRACK_WAIT) {
+        this.waitingFrames.push(frame);
+        return null;
+      }
     }
 
     // 初期化セグメントには、それまでに初期化情報が届いたトラックを全て入れる
@@ -99,44 +119,67 @@ export default class FMP4Transmuxer {
     });
   }
 
-  public feed(received: Message): FMP4Fragment | null {
+  // RTMP のメッセージを fMP4 の断片にする (初期化セグメントを作った時は、待っている間に取っておいたフレームの断片もまとめて返す)
+  public feed(received: Message): FMP4Fragment[] {
     // RTMP の timestamp が一周して戻っても (rtmp-handler.mts の TimestampUnwrapper)、時刻が戻らないように直してから使う
     const message = this.timestamps.unwrap(received);
-    // 音声のコーデックは、最初に届いた音声のメッセージで決める
-    // (handle_rtmp_payload は AAC 以外の音声や中身が空の AAC の初期化情報には null を返すので、AudioTagHeader の先頭 4bit の SoundFormat を見る)
+    // 映像と音声のコーデックは、最初に届いた映像と音声のメッセージで決める
+    // (handle_rtmp_payload は H.264 以外の映像や AAC 以外の音声、中身が空の初期化情報には null を返すので、VideoTagHeader と AudioTagHeader の先頭を見る)
+    // (映像は先頭 1bit が立っていれば Enhanced RTMP の形式で、そうでなければ下位 4bit が CodecID。音声は先頭 4bit が SoundFormat)
     // (AAC の配信でも、FFmpeg 8.0 以降は 5.1ch などの MultichannelConfig や 2 つ目の音声トラックを Enhanced RTMP の形式 (SoundFormat 9) で送ってくる。
     //  ADTS の AAC (MPEG-TS や HLS の入力など) を -c copy で送る時は、それが本当の AAC の初期化情報より先に届くが、その前に中身が空の AAC の初期化情報が届く)
+    if (message.message_type_id === MessageType.Video && message.data.byteLength >= 1) {
+      this.firstVideoIsAVC ??= (message.data[0] & 0x80) === 0 && (message.data[0] & 0x0F) === VideoCodecType.AVC;
+    }
     if (message.message_type_id === MessageType.Audio && message.data.byteLength >= 1) {
       this.firstAudioFormat ??= message.data[0] >> 4;
     }
     const payload = handle_rtmp_payload(message);
-    if (payload == null) { return null; }
+    if (payload == null) { return []; }
 
     // 初期化セグメントに必要な情報を集める
     switch (payload.kind) {
       case 'Video':
         if (payload.packetType === PacketType.SequenceStart) {
           this.avcDecoderConfigurationRecord = payload.avcDecoderConfigurationRecord;
-          return null;
+          return [];
+        }
+        // 初期化情報より先に映像のフレームが届いたら、その映像は fMP4 にできないので、映像のトラックがない配信として扱う (09 の HLSGenerator と同じ)
+        // (FFmpeg 6.0 以前で初期化情報を出さないエンコーダの H.264 を送ると、中身が空の初期化情報しか届かない: 03 の handle_avc)
+        if (this.avcDecoderConfigurationRecord == null && !this.videoSequenceHeaderMissing) {
+          logger.warn('Video sequence header is missing, video is ignored', { codec: payload.codec });
+          this.videoSequenceHeaderMissing = true;
         }
         break;
       case 'Audio':
         if (payload.packetType === AACPacketType.SequenceHeader) {
           this.audioSpecificConfig = payload.audioSpecificConfig;
-          return null;
+          return [];
         }
         break;
       case 'Data': {
         const metadata = read_onmetadata(payload.values);
         // 初期化情報が届くまで待つトラック (create_initialize_segment) は、最初の onMetaData で決める (初期化セグメントを作る前に onMetaData が送り直されても変えない)
         if (metadata != null) { this.onMetadata ??= metadata; }
-        return null;
+        return [];
       }
     }
 
-    this.initializeSegment ??= this.create_initialize_segment(payload.timestamp);
-    if (this.initializeSegment == null) { return null; }
+    if (this.initializeSegment == null) {
+      this.initializeSegment = this.create_initialize_segment(payload);
+      if (this.initializeSegment == null) { return []; }
+      // 待っている間に取っておいたフレームがあれば、いま届いたフレームより先に fMP4 にする
+      const frames = [... this.waitingFrames, payload];
+      this.waitingFrames = [];
+      return frames.map((frame) => this.write(frame)).filter((fragment) => fragment != null);
+    }
 
+    const fragment = this.write(payload);
+    return fragment == null ? [] : [fragment];
+  }
+
+  // フレームを fMP4 の断片にする (初期化セグメントにないトラックのフレームや、映像の最初のフレームなら null)
+  private write(payload: Frame): FMP4Fragment | null {
     switch (payload.kind) {
       case 'Video': {
         if (!this.hasVideo) { return null; }

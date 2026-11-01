@@ -11,8 +11,12 @@ import { write_mp4_avc_track_information } from '../../06-tiny-http-fmp4-server/
 import { write_mp4_aac_track_information } from '../../06-tiny-http-fmp4-server/src/aac.mts';
 
 import handle_rtmp_payload, { FrameType, PacketType } from './rtmp-handler.mts';
+import type { AudioData, VideoData } from './rtmp-handler.mts';
 import { read_nal_unit_length_size, strip_parameter_sets, write_mp4_hevc_track_information } from './hevc.mts';
 import MediaPlaylist from './media-playlist.mts';
+
+// 映像・音声のフレーム (初期化情報や、対応していないコーデックのものを除いたもの)
+type Frame = Extract<VideoData, { packetType: typeof PacketType.CodedFrames; }> | Extract<AudioData, { packetType: typeof AACPacketType.Raw; }>;
 
 type VideoInformation = {
   frameType: number;
@@ -55,6 +59,8 @@ export default class HLSGenerator {
   private firstAudioFormat: number | null = null;
   // 最初に届いたフレームの timestamp (onMetaData にコーデックが書かれていない時に、UNDECLARED_TRACK_WAIT の間だけ届いていないトラックを待つ)
   private firstFrameTimestamp: number | null = null;
+  // UNDECLARED_TRACK_WAIT の間に届いたフレーム (初期化セグメントを作ってから書き出す)
+  private waitingFrames: Frame[] = [];
   private sequenceNumber = 0; // mfhd の sequence_number (moof ごとに 1 から増やす)
 
   private initialization: Buffer | null = null;
@@ -163,17 +169,25 @@ export default class HLSGenerator {
       const audio_expected = this.firstAudioFormat != null
         ? this.firstAudioFormat === AudioCodecType.AAC
         : (audiocodecid === AudioCodecType.AAC || audiocodecid === 'mp4a');
-      if (video_expected && this.videoTrack == null && this.unsupportedVideoCodec == null) { return; }
-      if (audio_expected && this.audioTrack == null) { return; }
+      if ((video_expected && this.videoTrack == null && this.unsupportedVideoCodec == null) || (audio_expected && this.audioTrack == null)) {
+        // 待っている間に届いたフレームは捨てる
+        // (下の UNDECLARED_TRACK_WAIT の間に取っておいたフレームがあれば、それも捨てる。取っておいたフレームを書き出すと、捨てたフレームの分だけ間が空く)
+        this.waitingFrames = [];
+        return;
+      }
       if (this.videoTrack == null && this.audioTrack == null) { return; }
       // onMetaData にコーデックが 1 つも書かれていない時 (onMetaData を送ってこない配信ソフトや、yasea など) は、どのトラックが届くか分からない
       // yasea などは、それぞれのトラックの初期化情報をそのトラックの最初のフレームの直前に送ってくるので、もう一方のトラックの初期化情報は最初のフレームより後に届く
-      // そこで、まだ初期化情報が届いていないトラックを、最初のフレームから少しの間 (UNDECLARED_TRACK_WAIT) だけ待つ (待っている間に届いたフレームは捨てる)
+      // そこで、まだ何も届いていないトラックを、最初のフレームから少しの間 (UNDECLARED_TRACK_WAIT) だけ待つ
+      // (待っている間に届いたフレームは取っておく: 捨てると最初のキーフレームがなくなり、次のキーフレームまでの映像がセグメントにならない)
       const declared = videocodecid != null || audiocodecid != null;
       const missing = (this.videoTrack == null && this.unsupportedVideoCodec == null) || (this.audioTrack == null && this.firstAudioFormat == null);
       if (!declared && missing) {
         this.firstFrameTimestamp ??= payload.timestamp;
-        if (payload.timestamp - this.firstFrameTimestamp < UNDECLARED_TRACK_WAIT) { return; }
+        if (payload.timestamp - this.firstFrameTimestamp < UNDECLARED_TRACK_WAIT) {
+          this.waitingFrames.push(payload);
+          return;
+        }
       }
 
       // 初期化セグメントに入れたトラックだけを書き出す (後から初期化情報が届いたトラックは、初期化セグメントにないので使えない)
@@ -187,6 +201,14 @@ export default class HLSGenerator {
       });
     }
 
+    // 待っている間に取っておいたフレームがあれば、いま届いたフレームより先に書き出す
+    for (const frame of this.waitingFrames) { this.write(frame); }
+    this.waitingFrames = [];
+    this.write(payload);
+  }
+
+  // フレームを fMP4 にしてセグメントに書き出す (初期化セグメントにないトラックのフレームは書き出さない)
+  private write(payload: Frame): void {
     switch (payload.kind) {
       case 'Video': {
         if (!this.hasVideo) { return; }

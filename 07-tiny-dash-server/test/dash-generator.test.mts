@@ -3,6 +3,7 @@ import { describe, expect, test } from 'vitest';
 import { MessageType } from '../../01-tiny-rtmp-server/src/message.mts';
 import type { Message } from '../../01-tiny-rtmp-server/src/message.mts';
 import type { AMF0Object, AMF0Value } from '../../01-tiny-rtmp-server/src/amf0-reader.mts';
+import { NoopLogger, registerLogger } from '../../01-tiny-rtmp-server/src/logger.mts';
 
 import DASHGenerator from '../src/dash-generator.mts';
 
@@ -227,6 +228,25 @@ describe('Sequence headers without the configuration', () => {
       for (const hex of headers) { generator.feed(audio(0, Buffer.from(hex, 'hex'))); }
       expectTracks(publish(generator, { audioStart: 2500, firstRequest }), ['video', 'audio']);
     }
+  });
+
+  test('H.264 whose real sequence header never arrives (FFmpeg 6.0 or earlier): the video is reported as ignored and the AAC track is put into the MPD', () => {
+    // FFmpeg 6.0 以前は、エンコーダが初期化情報を出さない時、中身が空の AVC の初期化情報しか送らず、フレームも開始コード付き (Annex B) のまま送ってくる
+    const warnings: string[] = [];
+    registerLogger(Object.assign(new NoopLogger(), { warn: (message: string) => { warnings.push(message); } }));
+    let mpds: (string | null)[] = [];
+    try {
+      const generator = new DASHGenerator();
+      generator.feed(metadata(7, 10));
+      generator.feed(video(0, Buffer.from('1700000000', 'hex')));
+      mpds = publish(generator, { audioStart: 0, firstRequest: 0 });
+    } finally {
+      registerLogger(new NoopLogger());
+    }
+
+    // 映像は使えないと警告して、音声だけを MPD に載せる (映像の初期化情報を待ち続けて、MPD を作れないことはない)
+    expect(warnings).toStrictEqual(['Video sequence header is missing, video is ignored']);
+    expectTracks(mpds, ['audio']);
   });
 });
 

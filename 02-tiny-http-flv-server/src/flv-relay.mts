@@ -46,7 +46,9 @@ export default class FLVRelay {
         const frameType = header >> 4;
         if ((header & 0x0F) !== 7 || frameType < 1 || frameType > 4) { return null; }
         // 中身が空の初期化情報は中継しない (途中から視聴を始めた視聴者に最初に送る初期化情報にもしない)
-        // (FFmpeg は、配信を始める時にまだ初期化情報がないと空の初期化情報を送り、最初のフレームの直前に本当の初期化情報を送り直す)
+        // (FFmpeg は、配信を始める時にまだ初期化情報がないと空の初期化情報を送り、最初のフレームの直前に本当の初期化情報を送り直す。
+        //  ただし H.264 の初期化情報を送り直すのは FFmpeg 6.1 以降で、それより前の FFmpeg はフレームも開始コード付き (Annex B) のまま送ってくるので、
+        //  視聴者は再生できない: 03-tiny-http-ts-server の handle_avc)
         // (AVC の初期化情報は VideoTagHeader, AVCPacketType, CompositionTime (5 byte) の後ろに AVCDecoderConfigurationRecord が続く)
         if (packetType === 0 && message.data.byteLength <= 5) { return null; }
         const tag = write_flv_tag(message);

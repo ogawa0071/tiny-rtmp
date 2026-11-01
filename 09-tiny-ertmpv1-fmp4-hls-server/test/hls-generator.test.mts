@@ -43,9 +43,13 @@ const trackIds = (generator: HLSGenerator): Set<number> => {
 };
 
 describe('Tracks of codecs that this server does not put into fMP4', () => {
-  test('H.264 + MP3: segments start from the first keyframe even when it arrives before the first MP3 frame', () => {
+  test.each([
+    ['onMetaData says MP3', { videocodecid: 7, audiocodecid: 2 }],
+    // onMetaData がないと、最初の MP3 のフレームが届くまで音声のトラックを待つが、その間に届いたキーフレームは取っておく
+    ['no onMetaData', null],
+  ])('H.264 + MP3 (%s): segments start from the first keyframe even when it arrives before the first MP3 frame', (_, object) => {
     const generator = new HLSGenerator();
-    generator.feed(metadata(7, 2));
+    if (object != null) { generator.feed(onmetadata(object)); }
     generator.feed(video(0, AVC_SEQUENCE_HEADER));
     // FFmpeg の -c:v libx264 (と既定の MP3) と同じく、0 ms のキーフレームが最初の MP3 (8 ms) より先に届く
     for (let t = 0; t < 3000; t += 100) {
@@ -126,16 +130,54 @@ describe('Tracks decided from the sequence headers', () => {
     }
   });
 
+  test.each([
+    ['onMetaData without codec ids (yasea)', { duration: 0, width: 320, height: 240, framerate: 0, audiosamplerate: 44100, stereo: true }],
+    ['no onMetaData (FFmpeg -flvflags no_metadata)', null],
+  ])('%s: the frames that arrive while the other track is waited for are kept, so the first segment starts at the first keyframe', (_, object) => {
+    // AAC の初期化情報が届く時刻 (null なら映像だけの配信で、音声は届かない)
+    for (const audioStart of [300, null]) {
+      const generator = new HLSGenerator();
+      if (object != null) { generator.feed(onmetadata(object)); }
+      generator.feed(video(0, AVC_SEQUENCE_HEADER));
+      for (let t = 0; t < 3000; t += 100) {
+        generator.feed(video(t, avc(t % 1000 === 0 ? 1 : 2)));
+        if (t === audioStart) { generator.feed(audio(t, AAC_SEQUENCE_HEADER)); }
+        if (audioStart != null && t >= audioStart) { generator.feed(audio(t + 8, AAC_FRAME)); }
+      }
+      generator.end();
+      // 0, 1000, 2000 ms のキーフレームから始まる 3 つのセグメントができる (最後は最後のフレームの先頭 2900 ms まで)
+      expect(extinfs(generator)).toStrictEqual([1, 1, 0.9]);
+      expect(trackIds(generator)).toStrictEqual(new Set(audioStart == null ? [1] : [1, 2]));
+    }
+  });
+
+  test('an onMetaData that arrives after the first frames and declares AAC: the frames kept until then are not written before the gap', () => {
+    const generator = new HLSGenerator();
+    generator.feed(video(0, AVC_SEQUENCE_HEADER));
+    for (let t = 0; t < 5000; t += 100) {
+      // H.264 と AAC が書かれた onMetaData が最初のフレームより後に届き、AAC の初期化情報はさらに後に届く (その間の映像は捨てる)
+      if (t === 500) { generator.feed(metadata(7, 10)); }
+      if (t === 2000) { generator.feed(audio(t, AAC_SEQUENCE_HEADER)); }
+      generator.feed(video(t, avc(t % 1000 === 0 ? 1 : 2)));
+      if (t >= 2000) { generator.feed(audio(t + 8, AAC_FRAME)); }
+    }
+    generator.end();
+    // 2000 ms のキーフレームからセグメントを始める (onMetaData が届く前に取っておいた 0 ms からのフレームを書き出すと、間が空いた長いセグメントになる)
+    expect(extinfs(generator)).toStrictEqual([1, 1, 0.9]);
+  });
+
   test('a title-only onMetaData sent while waiting does not stop waiting for the AAC declared by the first onMetaData', () => {
     const generator = new HLSGenerator();
     generator.feed(metadata(7, 10));
     generator.feed(video(0, AVC_SEQUENCE_HEADER));
-    // AAC の初期化情報が 1 秒遅れて届き (FFmpeg の -c copy で、音声が映像より後から始まる入力など)、それを待っている間に曲名だけを書いた onMetaData が送り直される
+    // AAC の初期化情報が 2 秒遅れて届き (音声が映像より後から始まり、初期化情報を音声の最初のフレームの直前に送ってくる配信ソフトなど)、
+    // それを待っている間に曲名だけを書いた onMetaData が送り直される
+    // (送り直された onMetaData で決めると、コーデックが書かれていないので 1 秒 (UNDECLARED_TRACK_WAIT) しか待たず、映像だけを書き出してしまう)
     for (let t = 0; t < 4000; t += 100) {
       if (t === 500) { generator.feed(onmetadata({ title: 'next' })); }
-      if (t === 1000) { generator.feed(audio(t, AAC_SEQUENCE_HEADER)); }
+      if (t === 2000) { generator.feed(audio(t, AAC_SEQUENCE_HEADER)); }
       generator.feed(video(t, avc(t % 1000 === 0 ? 1 : 2)));
-      if (t >= 1000) { generator.feed(audio(t + 8, AAC_FRAME)); }
+      if (t >= 2000) { generator.feed(audio(t + 8, AAC_FRAME)); }
     }
     generator.end();
     // 最初の onMetaData に書かれた AAC を待つので、映像と音声の両方のトラックが書き出される
@@ -188,6 +230,22 @@ describe('Enhanced RTMP audio after the AAC sequence header', () => {
       generator.end();
     })).toStrictEqual([]);
     expect(trackIds(generator)).toStrictEqual(new Set([1, 2]));
+  });
+
+  test('H.264 + MP3 (onMetaData says AAC but MP3 arrives): the AAC track is not waited for', () => {
+    const generator = new HLSGenerator();
+    expect(warnings(() => {
+      generator.feed(metadata(7, 10));
+      generator.feed(video(0, AVC_SEQUENCE_HEADER));
+      for (let t = 0; t < 3000; t += 100) {
+        generator.feed(video(t, avc(t % 1000 === 0 ? 1 : 2)));
+        generator.feed(audio(t + 8, MP3_FRAME));
+      }
+      generator.end();
+    })).toStrictEqual(['Unsupported audio codec, audio is ignored']);
+    expect(trackIds(generator)).toStrictEqual(new Set([1]));
+    // 0 ms のキーフレームは、onMetaData に書かれた AAC を待っている間 (最初の MP3 のフレームが届くまで) に届くので書き出さず、1000 ms のキーフレームから始める
+    expect(extinfs(generator)).toStrictEqual([1, 0.9]);
   });
 
   test('H.264 + MP3: audio of a codec that this server does not put into fMP4 is still reported', () => {

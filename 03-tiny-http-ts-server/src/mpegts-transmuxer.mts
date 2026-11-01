@@ -30,6 +30,16 @@ const PMT_DATA = {
     elementary_PID: AAC_PID,
   }],
 } as const satisfies PMT;
+// 映像のない配信の PMT には、AAC の ES だけを載せる
+// (データの届かない AVC の ES まで載せると、届かない映像のフレームを待ってしまうプレイヤーがある)
+const PMT_DATA_WITHOUT_VIDEO = {
+  program_number: 1,
+  pcr_pid: PCR_PID,
+  streams: [{
+    stream_type: StreamType.AAC_ADTS,
+    elementary_PID: AAC_PID,
+  }],
+} as const satisfies PMT;
 // 途中から受信した側もデコードを始められるように、PAT/PMT を定期的 (ミリ秒) に出力する
 const PSI_INTERVAL = 100;
 // PCR (デコーダの時計) は 100ms 以内の間隔で出力する必要がある (H.222.0 2.7.2)
@@ -54,6 +64,8 @@ export default class MPEGTSTransmuxer {
   private aacPacketizer = new PESPacketizer(AAC_PID);
   private last_PSI_timestamp: number | null = null;
   private last_PCR_timestamp: number | null = null;
+  // 映像のない配信か (PMT に AVC の ES を載せない。HLS で映像のない配信を音声のフレームで区切る時に設定する)
+  public audioOnly = false;
 
   // 次の映像/音声の前に必ず PAT/PMT から出力させる (HLS でセグメントの先頭にする時などに使う)
   public resetPSI(): void {
@@ -64,7 +76,7 @@ export default class MPEGTSTransmuxer {
   private *emitPSIAndPCR(timestamp: number): Generator<Buffer> {
     if (this.last_PSI_timestamp == null || (timestamp - this.last_PSI_timestamp) >= PSI_INTERVAL) {
       yield* this.patPacketizer.packetize(write_pat(PAT_DATA));
-      yield* this.pmtPacketizer.packetize(write_pmt(PMT_DATA));
+      yield* this.pmtPacketizer.packetize(write_pmt(this.audioOnly ? PMT_DATA_WITHOUT_VIDEO : PMT_DATA));
       this.last_PSI_timestamp = timestamp;
     }
     // 映像と音声の timestamp は前後しうるが、PCR は巻き戻ってはいけないので、前の PCR より進んだ時だけ出力する

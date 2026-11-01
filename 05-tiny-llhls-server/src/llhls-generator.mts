@@ -30,7 +30,10 @@ export default class LLHLSGenerator {
 
   public constructor(option?: Partial<LLHLSGeneratorOption>) {
     const { liveWindowLength, partialSegmentDuration } = LLHLSGeneratorOption.from(option);
-    this.playlist = new MediaPlaylist({ liveWindowLength, partialSegmentDuration });
+    // セグメントの途中で新しいパーシャルセグメントを始めた時も、その先頭に PAT/PMT を入れる
+    // (MPEG-TS のパーシャルセグメントも PAT と PMT を含み、先頭の 2 つのパケットは PAT と PMT にする: RFC 8216bis 3.2, 3.1.1。
+    //  INDEPENDENT=YES のパーシャルセグメントから再生を始める視聴者も、その PAT/PMT から読み始められる)
+    this.playlist = new MediaPlaylist({ liveWindowLength, partialSegmentDuration }, () => { this.transmuxer.resetPSI(); });
   }
 
   public published(): Promise<boolean> {
@@ -68,6 +71,8 @@ export default class LLHLSGenerator {
       this.audioOnly = metadata.videocodecid !== VideoCodecType.AVC && metadata.videocodecid !== 'avc1';
     }
     if (payload?.kind === 'Video') { this.audioOnly = false; }
+    // 映像のない配信では、PMT にも音声だけを載せる (HLS (04-tiny-hls-server) と同じ)
+    this.transmuxer.audioOnly = this.audioOnly;
 
     const video = payload?.kind === 'Video' && payload.packetType === PacketType.CodedFrames;
     const keyframe = video && payload.frameType === FrameType.KEY_FRAME;
@@ -75,8 +80,11 @@ export default class LLHLSGenerator {
     // (AAC のフレームはどれも単体でデコードできる。セグメントは 1 秒以上たったら区切る)
     const audio = this.audioOnly && payload?.kind === 'Audio' && payload.packetType === AACPacketType.Raw;
     // キーフレームから新しいセグメントを始める
-    if ((keyframe || audio) && this.playlist.append(timestamp)) {
-      // セグメント単体でもデコードを始められるように、セグメントの先頭に PAT/PMT を入れる
+    const started = (keyframe || audio) && this.playlist.append(timestamp);
+    // セグメント単体でもデコードを始められるように、セグメントの先頭に PAT/PMT を入れる
+    // セグメントの途中のキーフレームの前にも入れる (FFmpeg の MPEG-TS も、映像のキーフレームの前には PAT/PMT を入れる)
+    // (映像のない配信では、音声のフレームごとに入れると多すぎるので、セグメントの先頭だけにする。パーシャルセグメントの先頭には MediaPlaylist が入れる)
+    if (started || keyframe) {
       this.transmuxer.resetPSI();
     }
 

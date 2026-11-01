@@ -73,19 +73,19 @@ const handle = async (connection: Duplex) => {
   try {
     for await (const message of handle_rtmp(connection, { auth, limit: { bandwidth } })) {
       published = true;
-      const fragment = rtmp_to_fmp4.feed(message);
-      if (fragment == null) { continue; }
-
-      for (const viewer of viewers) {
-        // 視聴を始めた視聴者には、最初に初期化セグメントを送る
-        // 映像は、キーフレームから送り始める (それより前のフレームは、参照するフレームがないのでデコードできない)
-        if (!viewer.initialized) {
-          const initialize = rtmp_to_fmp4.initialize();
-          if (initialize == null || !fragment.independent) { continue; }
-          viewer.write(initialize);
-          viewer.initialized = true;
+      // 初期化セグメントを作った時は、それまで待っていたフレームの断片もまとめて返ってくる
+      for (const fragment of rtmp_to_fmp4.feed(message)) {
+        for (const viewer of viewers) {
+          // 視聴を始めた視聴者には、最初に初期化セグメントを送る
+          // 映像は、キーフレームから送り始める (それより前のフレームは、参照するフレームがないのでデコードできない)
+          if (!viewer.initialized) {
+            const initialize = rtmp_to_fmp4.initialize();
+            if (initialize == null || !fragment.independent) { continue; }
+            viewer.write(initialize);
+            viewer.initialized = true;
+          }
+          viewer.write(fragment.data);
         }
-        viewer.write(fragment.data);
       }
     }
   } catch (e) {

@@ -48,14 +48,19 @@ export default class HLSGenerator {
     }
     // AVC の映像が届いたら、映像のキーフレームで区切る
     if (payload?.kind === 'Video') { this.audioOnly = false; }
+    // 映像のない配信では、PMT にも音声だけを載せる (届かない映像を待ってしまうプレイヤーがある)
+    this.transmuxer.audioOnly = this.audioOnly;
 
     // キーフレームから新しいセグメントを始める
     // 映像のない配信では、音声のフレームから (1 秒以上たったら) 新しいセグメントを始める (AAC のフレームはどれも単体でデコードできる)
     const video = payload?.kind === 'Video' && payload.packetType === PacketType.CodedFrames;
     const audio = this.audioOnly && payload?.kind === 'Audio' && payload.packetType === AACPacketType.Raw;
     const keyframe = video && payload.frameType === FrameType.KEY_FRAME;
-    if ((keyframe || audio) && this.playlist.append(timestamp)) {
-      // セグメント単体でもデコードを始められるように、セグメントの先頭に PAT/PMT を入れる
+    const started = (keyframe || audio) && this.playlist.append(timestamp);
+    // セグメント単体でもデコードを始められるように、セグメントの先頭に PAT/PMT を入れる
+    // セグメントの途中のキーフレームの前にも入れる (FFmpeg の MPEG-TS も、映像のキーフレームの前には PAT/PMT を入れる)
+    // (映像のない配信では、音声のフレームごとに入れると多すぎるので、セグメントの先頭だけにする)
+    if (started || keyframe) {
       this.transmuxer.resetPSI();
     }
 

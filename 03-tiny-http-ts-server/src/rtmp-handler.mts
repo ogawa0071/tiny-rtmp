@@ -170,6 +170,9 @@ export const read_onmetadata = (values: AMF0Value[]): AMF0Object | null => {
 // 一周して戻った timestamp のままではセグメントを区切れなくなるので、配信ごとにこのクラスで一周しない時刻に直してから使う
 export class TimestampUnwrapper {
   private previous: { received: number; timestamp: number; } | null = null;
+  // 最初の映像・音声の時刻と、これまでで一番進んだ時刻 (配信の最初の 1 秒の間かを見る)
+  private first: number | null = null;
+  private latest: number | null = null;
   private offset = 0;
 
   // 映像・音声の timestamp を直す (onMetaData は映像・音声と同じ時計とは限らないので、そのまま返す)
@@ -183,10 +186,14 @@ export class TimestampUnwrapper {
       timestamp = this.previous.timestamp + delta;
     }
     this.previous = { received: message.timestamp, timestamp };
+    this.first ??= timestamp;
+    this.latest = Math.max(this.latest ?? timestamp, timestamp);
     // 0 より前の時刻 (FFmpeg の負の DTS など) は fMP4 などで表せないので、
-    // FFmpeg の -avoid_negative_ts make_non_negative と同じく、負にならないように全体をずらす
-    this.offset = Math.max(this.offset, -timestamp);
-    return { ... message, timestamp: timestamp + this.offset };
+    // FFmpeg の -avoid_negative_ts make_non_negative と同じく、配信の最初 (1 秒の間) に届いたものが負にならないように全体をずらす
+    // ずらす量は配信の最初に決めて、その後は変えない (FFmpeg も最初に決める。途中で変えると、そこから後の時刻が全部ずれて隙間ができる)
+    if (this.latest - this.first < 1000) { this.offset = Math.max(this.offset, -timestamp); }
+    // その後に 0 より前の時刻が届いたら (配信ソフトの不具合など)、そのメッセージだけを 0 にする
+    return { ... message, timestamp: Math.max(0, timestamp + this.offset) };
   }
 }
 

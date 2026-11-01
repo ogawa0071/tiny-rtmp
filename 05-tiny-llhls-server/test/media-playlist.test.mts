@@ -198,6 +198,10 @@ describe('Partial Segment', () => {
     // (この配信なら、1 番から決めても (0.202 秒) 4 フレーム (0.2 秒) ごとに区切れて 85% 以上になるが、
     //  長いフレームから始まるものから決めると、その後のいつも通りのパーシャルセグメントが配信の最後まで 85% に届かないことがあるので、決めない)
     ['20 fps, the 2nd frame 151 ms longer', 20, 40, 2, 151, 0.251, [], [0.201]],
+    // 0 番は 1 フレーム (0.111 秒) で短く区切り、1 番は長いフレームだけ (0.144 秒、1 フレーム) になる
+    // 長いフレームは 1 つ前のフレームの 1.3 倍ほどだが、1 番から決めると (0.145 秒)、いつもの 1 フレーム (0.111 秒) が 85% に届かないので決めない。
+    // その後のいつも通りの 2 フレーム (0.222 秒) で区切れるので PART-TARGET は 0.25 秒のままで、1 番だけが 85% に届かない
+    ['9 fps, the 2nd frame 33 ms longer', 9, 18, 2, 33, 0.25, [], [0.144]],
   ])('%s: PART-TARGET is not decided from the part that starts with the long frame', (_, fps, keyint, from, delay, expected, exceeding, short) => {
     const playlist = new MediaPlaylist({ partialSegmentDuration: 0.25 });
     // プレイリストを公開した時 (3 つ目のセグメントが完成した時) のプレイリスト
@@ -258,6 +262,34 @@ describe('Partial Segment', () => {
     // 長いフレームのあるセグメントも載っている
     const list = segments(m3u8);
     expect(list.length).toStrictEqual(3);
+    for (const { parts } of list) {
+      for (const duration of parts) {
+        expect(duration).toBeLessThanOrEqual(target);
+      }
+      for (const duration of parts.slice(1, -1)) {
+        expect(duration).toBeGreaterThanOrEqual(0.85 * target);
+      }
+    }
+  });
+
+  test('12 fps with truncated timestamps, the 3rd frame 33 ms longer: PART-TARGET is not decided from the part that starts with the long frame', () => {
+    const playlist = new MediaPlaylist({ partialSegmentDuration: 0.25 });
+    // OBS などは timestamp をミリ秒に切り捨てて送る (12 fps なら 0, 83, 166, 250, ...)
+    // 3 フレーム目だけが 33 ミリ秒 (1 つ前のフレームの 1.4 倍ほど) 長いと、0 番は 2 フレーム (0.166 秒) で短く区切り、1 番は長いフレームと次のフレーム (0.2 秒、2 フレーム) になる
+    // 1 番から決めると PART-TARGET が 0.201 秒になり、いつも通りの 2 フレーム (0.166 秒か 0.167 秒) のパーシャルセグメントがどれも 85% に届かない
+    for (let i = 0; i < 24 * 8; i++) {
+      const timestamp = PlaylistTimestamp.fromRTMP(Math.floor(i * 1000 / 12) + (i >= 3 ? 33 : 0));
+      const keyframe = i % 24 === 0;
+      if (keyframe) { playlist.append(timestamp); }
+      playlist.feed([Buffer.from([i % 256])], timestamp, true, keyframe);
+    }
+
+    const m3u8 = playlist.m3u8();
+    const target = partTarget(m3u8);
+    // その後のいつも通りの 3 フレーム (0.25 秒) から決める
+    expect(target).toStrictEqual(0.251);
+    const list = segments(m3u8);
+    expect(list.length).toBeGreaterThan(0);
     for (const { parts } of list) {
       for (const duration of parts) {
         expect(duration).toBeLessThanOrEqual(target);

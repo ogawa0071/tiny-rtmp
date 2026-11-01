@@ -112,4 +112,9 @@ describe('TimestampUnwrapper', () => {
     // FFmpeg は初期化情報を 0 ms で送ってから、-67 ms のキーフレーム, -33 ms の映像, -21 ms の音声, 0 ms の映像と音声を 31bit で送る
     expect(unwrap([video(0), audio(0), video(0x7FFFFFBD), video(0x7FFFFFDF), audio(0x7FFFFFEB), video(0), audio(0)])).toStrictEqual([0, 0, 0, 34, 46, 67, 67]);
   });
+
+  test('a negative timestamp that arrives later becomes 0 and does not move the time of the video and audio after it', () => {
+    // 配信の途中 (5 秒) で -96 ms の音声が 1 つだけ届いても、ずらす量は最初に決めた 67 ms のままにする
+    expect(unwrap([video(0), audio(0), video(0x7FFFFFBD), video(0), audio(5000), audio(0xFFFFFFA0), video(5033), audio(5023)])).toStrictEqual([0, 0, 0, 67, 5067, 0, 5100, 5090]);
+  });
 });

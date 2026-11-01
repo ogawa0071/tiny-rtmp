@@ -1,6 +1,7 @@
 import { MessageType } from '../../01-tiny-rtmp-server/src/message.mts';
 import type { Message } from '../../01-tiny-rtmp-server/src/message.mts';
 import type { AMF0Object } from '../../01-tiny-rtmp-server/src/amf0-reader.mts';
+import { logger } from '../../01-tiny-rtmp-server/src/logger.mts';
 
 import { read_audio_specific_config } from '../../03-tiny-http-ts-server/src/aac.mts';
 import { read_avc_decoder_configuration_record } from '../../03-tiny-http-ts-server/src/avc.mts';
@@ -31,6 +32,8 @@ export default class DASHGenerator {
   private onMetadata: AMF0Object | null = null;
   // 最初に届いた音声のメッセージの SoundFormat (AudioTagHeader の先頭 4bit: 10 は AAC、2 は MP3、9 は Enhanced RTMP の形式)
   private firstAudioFormat: number | null = null;
+  // 初期化情報より先に H.264 のフレームが届いたか (その映像は fMP4 にできないので、MPD に載せない: feed)
+  private videoSequenceHeaderMissing = false;
   // MPD に載せるトラック (MPD を作れるようになった時に決めて、後から増やしたり減らしたりしない: decideTracks)
   private tracks: { video: boolean; audio: boolean; } | null = null;
 
@@ -60,7 +63,10 @@ export default class DASHGenerator {
   // onMetaData に書かれていなくても、初期化情報が届いていれば載せる (onMetaData を送ってこない配信ソフトや、onMetaData にコーデックを書かない配信ソフト (yasea など) もある)
   private hasVideo(): boolean {
     if (this.tracks != null) { return this.tracks.video; }
-    return this.avcDecoderConfigurationRecord != null || this.onMetadata?.videocodecid === 7 || this.onMetadata?.videocodecid === 'avc1';
+    if (this.avcDecoderConfigurationRecord != null) { return true; }
+    // 初期化情報より先にフレームが届いた映像は、onMetaData に AVC と書かれていても載せない
+    if (this.videoSequenceHeaderMissing) { return false; }
+    return this.onMetadata?.videocodecid === 7 || this.onMetadata?.videocodecid === 'avc1';
   }
 
   // MPD に載せる音声のトラックがあるか (hasVideo と同じ。コーデックを数値ではなく 'mp4a' の文字列で送ってくる配信ソフトもある)
@@ -178,6 +184,12 @@ export default class DASHGenerator {
         if (payload.packetType === PacketType.SequenceStart) {
           this.avcDecoderConfigurationRecord = payload.avcDecoderConfigurationRecord;
           return;
+        }
+        // 初期化情報より先に映像のフレームが届いたら、その映像は fMP4 にできないので、映像のトラックがない配信として扱う (09 の HLSGenerator と同じ)
+        // (FFmpeg 6.0 以前で初期化情報を出さないエンコーダの H.264 を送ると、中身が空の初期化情報しか届かない: 03 の handle_avc)
+        if (this.avcDecoderConfigurationRecord == null && !this.videoSequenceHeaderMissing) {
+          logger.warn('Video sequence header is missing, video is ignored', { codec: payload.codec });
+          this.videoSequenceHeaderMissing = true;
         }
         break;
       case 'Audio':

@@ -36,11 +36,23 @@ const segments = (generator: HLSGenerator): Buffer[] => {
 const pids = (segment: Buffer): number[] => {
   return Array.from({ length: segment.byteLength / 188 }, (_, i) => segment.readUInt16BE(i * 188 + 1) & 0x1FFF);
 };
+// セグメントの最初の PMT (PID 256) に載っている ES の stream_type の一覧 (0x1B: AVC, 0x0F: AAC)
+const streamTypes = (segment: Buffer): number[] => {
+  const packet = segment.subarray(pids(segment).indexOf(256) * 188);
+  const section = packet.subarray(5 + packet[4]); // TS パケットのヘッダ (4 byte) と pointer_field の後ろから
+  const end = 3 + (section.readUInt16BE(1) & 0x0FFF) - 4; // CRC_32 の前まで
+  const types: number[] = [];
+  // program_info の後ろに、ES ごとに stream_type (1 byte), elementary_PID (2 byte), ES_info_length (2 byte), ES_info が並ぶ
+  for (let i = 12 + (section.readUInt16BE(10) & 0x0FFF); i < end; i += 5 + (section.readUInt16BE(i + 3) & 0x0FFF)) {
+    types.push(section[i]);
+  }
+  return types;
+};
 
 describe('End of stream', () => {
   // FFmpeg が 30 fps (1 秒ごとにキーフレーム、B フレーム 2 枚) と AAC の 5 秒のファイルを -c copy で送る時と同じ timestamp
   // 映像の timestamp は DTS で表示時刻より 67 ミリ秒早く、FFmpeg は DTS が負にならないように全体を 67 ミリ秒遅らせるので、
-  // 映像と同時に終わる音声でも、最後の音声の timestamp (5060) は映像の最後のフレーム (4967) どころか次のキーフレームの時刻 (5000) より後になる
+  // 映像と同時に終わる音声でも、最後の音声の timestamp (5059) は映像の最後のフレーム (4967) どころか次のキーフレームの時刻 (5000) より後になる
   test.each([
     ['with the AVC end of sequence (FFmpeg)', true],
     ['without the AVC end of sequence (FFmpeg -flvflags no_sequence_end)', false],
@@ -48,7 +60,7 @@ describe('End of stream', () => {
     const generator = new HLSGenerator();
     generator.feed(video(0, AVC_SEQUENCE_HEADER));
     generator.feed(audio(0, AAC_SEQUENCE_HEADER));
-    const audios = Array.from({ length: 216 }, (_, i) => Math.round(i * 1024 / 44.1) + 67); // 1024 サンプルずつの AAC (最後は 4993 + 67 ミリ秒)
+    const audios = Array.from({ length: 216 }, (_, i) => Math.round(i * 1024 / 44.1) + 67); // 1024 サンプルずつの AAC (最後は 4992 + 67 ミリ秒)
     for (let i = 0; i < 150; i++) {
       const timestamp = Math.round(i * 1000 / 30);
       while (audios.length > 0 && audios[0] < timestamp) { generator.feed(audio(audios.shift()!, AAC_FRAME)); }
@@ -62,6 +74,17 @@ describe('End of stream', () => {
     const final = generator.m3u8();
     expect(targetduration(final)).toStrictEqual(targetduration(live));
     expect(extinfs(final)).toStrictEqual([1, 1, 1, 0.967]);
+  });
+
+  test('audio only (FFmpeg -vn): the last segment ends at the last AAC frame', () => {
+    const generator = new HLSGenerator();
+    generator.feed(onmetadata({ audiocodecid: 10 }));
+    generator.feed(audio(0, AAC_SEQUENCE_HEADER));
+    for (let i = 0; aac(i) < 4500; i++) { generator.feed(audio(aac(i), AAC_FRAME)); }
+    generator.end();
+
+    // 映像のない配信では、最後のセグメントは最後の AAC のフレーム (4480 ミリ秒) までで完成させる
+    expect(extinfs(generator.m3u8())).toStrictEqual([1.003, 1.002, 1.003, 1.003, 0.469]);
   });
 });
 
@@ -85,6 +108,8 @@ describe('Streams without video', () => {
       // セグメントは PAT/PMT から始まり、PAT/PMT はいつも通り 100 ミリ秒ごとに入れる (AAC のフレームごとには入れない)
       expect(pids(segment).slice(0, 2)).toStrictEqual([0, 256]);
       expect(pids(segment).filter((pid) => pid === 0).length).toBeLessThanOrEqual(11);
+      // PMT には AAC の ES だけを載せる (データの届かない AVC の ES まで載せると、届かない映像のフレームを待ってしまうプレイヤーがある)
+      expect(streamTypes(segment)).toStrictEqual([0x0F]);
     }
   });
 });
@@ -92,6 +117,8 @@ describe('Streams without video', () => {
 describe('Streams with video', () => {
   test.each([
     ['onMetaData with AVC', { videocodecid: 7, audiocodecid: 10 }],
+    // コーデックを数値ではなく 'avc1' や 'mp4a' の文字列で送ってくる配信ソフトもある
+    ['onMetaData with AVC and AAC as strings', { videocodecid: 'avc1', audiocodecid: 'mp4a' }],
     // yasea は、videocodecid も audiocodecid もない onMetaData を送ってくる
     ['onMetaData without codec ids (yasea)', { width: 320, height: 240, audiosamplerate: 44100, stereo: true }],
     ['no onMetaData', null],
@@ -110,6 +137,55 @@ describe('Streams with video', () => {
 
     // 音声だけのセグメントは作らない (最初のセグメントは 2 秒のキーフレームから)
     expect(extinfs(generator.m3u8())).toStrictEqual([2, 2, 2, 0.9]);
+    // PMT には AVC と AAC の ES を載せる
+    for (const segment of segments(generator)) {
+      expect(streamTypes(segment)).toStrictEqual([0x1B, 0x0F]);
+    }
+  });
+
+  test('onMetaData without the video: segments are cut at the keyframes once the AVC video arrives', () => {
+    const generator = new HLSGenerator();
+    generator.feed(onmetadata({ audiocodecid: 10 }));
+    generator.feed(audio(0, AAC_SEQUENCE_HEADER));
+    // onMetaData には書かれていない映像 (10 fps、1 秒ごとにキーフレーム) が 2.5 秒から届く
+    let i = 0;
+    for (let t = 0; t < 7000; t += 100) {
+      for (; aac(i) <= t; i++) { generator.feed(audio(aac(i), AAC_FRAME)); }
+      if (t === 2500) { generator.feed(video(t, AVC_SEQUENCE_HEADER)); }
+      if (t >= 2500) { generator.feed(video(t, avc((t - 2500) % 1000 === 0 ? 1 : 2))); }
+    }
+    generator.end();
+
+    // 映像が届くまでは AAC のフレーム (0, 1003, 2005 ミリ秒) で区切り、届いてからは 1 秒以上たったキーフレーム (3500, 4500, 5500, 6500 ミリ秒) で区切る
+    // (2500 ミリ秒のキーフレームは、2005 ミリ秒からのセグメントがまだ 1 秒に満たないので区切らない。最後のセグメントは最後の映像のフレームの 6900 ミリ秒まで)
+    expect(extinfs(generator.m3u8())).toStrictEqual([1.003, 1.002, 1.495, 1, 1, 1, 0.4]);
+  });
+
+  test('keyframes inside a segment also get PAT and PMT in front of them', () => {
+    const generator = new HLSGenerator();
+    generator.feed(video(0, AVC_SEQUENCE_HEADER));
+    generator.feed(audio(0, AAC_SEQUENCE_HEADER));
+    // 25 fps の映像 (0.4 秒ごとにキーフレーム) と AAC (セグメントは 1 秒以上たってからのキーフレームで区切るので 1.2 秒)
+    let i = 0;
+    for (let t = 0; t < 6000; t += 40) {
+      for (; aac(i) <= t; i++) { generator.feed(audio(aac(i), AAC_FRAME)); }
+      generator.feed(video(t, avc(t % 400 === 0 ? 1 : 2)));
+    }
+
+    expect(extinfs(generator.m3u8())).toStrictEqual([1.2, 1.2, 1.2, 1.2]);
+    // FFmpeg の MPEG-TS と同じく、どのキーフレームの前にも PAT と PMT がある
+    for (const segment of segments(generator)) {
+      const list = pids(segment);
+      // 映像の PES の始まり (payload_unit_start_indicator が立っている PID 258 の TS パケット)
+      const frames = list.flatMap((pid, index) => pid === 258 && (segment[index * 188 + 1] & 0x40) !== 0 ? [index] : []);
+      // 1.2 秒のセグメントには 30 フレームが入り、0, 10, 20 番目がキーフレーム
+      expect(frames.length).toStrictEqual(30);
+      for (const index of [frames[0], frames[10], frames[20]]) {
+        // キーフレームの直前 (1 つ前のフレームより後) に PAT がある
+        const before = list.slice(0, index);
+        expect(before.lastIndexOf(0)).toBeGreaterThan(before.lastIndexOf(258));
+      }
+    }
   });
 });
 
