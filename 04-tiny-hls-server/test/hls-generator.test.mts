@@ -172,7 +172,8 @@ describe('Streams with video', () => {
     }
   });
 
-  test('onMetaData without the video: segments are cut at the keyframes once the AVC video arrives', () => {
+  // 載せずに PMT を出力した ES は、後からそのトラックが届いても載せない (03 の MPEGTSTransmuxer の hasVideo)
+  test('onMetaData without the video: the AVC video that arrives later is not used, and segments are cut at the AAC frames', () => {
     const generator = new HLSGenerator();
     generator.feed(onmetadata({ audiocodecid: 10 }));
     generator.feed(audio(0, AAC_SEQUENCE_HEADER));
@@ -185,13 +186,13 @@ describe('Streams with video', () => {
     }
     generator.end();
 
-    // 映像が届くまでは AAC のフレーム (0, 1003, 2005 ミリ秒) で区切り、届いてからは 1 秒以上たったキーフレーム (3500, 4500, 5500, 6500 ミリ秒) で区切る
-    // (2500 ミリ秒のキーフレームは、2005 ミリ秒からのセグメントがまだ 1 秒に満たないので区切らない。最後のセグメントは最後の映像のフレームの 6900 ミリ秒まで)
-    expect(extinfs(generator.m3u8())).toStrictEqual([1.003, 1.002, 1.495, 1, 1, 1, 0.4]);
-    // 映像が届いたら PMT に AVC の ES を加えて、PMT の version_number を 1 増やす (PMT の中身を変えたら増やす: H.222.0 2.4.4.9)
-    // (2005 ミリ秒からのセグメントの途中で変わる。HLS ではトラックが変わる所に EXT-X-DISCONTINUITY が必要だが (RFC 8216 4.3.2.3)、そこでセグメントを区切れないので付けない)
+    // 映像は音声を TS パケットにし始めた後から届いたので使わず、最後まで AAC のフレームで区切る (最後のセグメントは最後の AAC のフレームの 6891 ミリ秒まで)
+    // (トラックを増やす所には EXT-X-DISCONTINUITY が必要で (RFC 8216 4.3.2.3)、再生を始めたプレイヤーは途中からトラックを増やせない)
+    expect(extinfs(generator.m3u8())).toStrictEqual([1.003, 1.002, 1.003, 1.003, 1.002, 1.003, 0.875]);
+    // PMT は変わらず (AAC の ES だけ)、映像は出力しない
     const changes = segments(generator).flatMap(pmts).filter(([version, types], index, list) => index === 0 || version !== list[index - 1][0] || types.join() !== list[index - 1][1].join());
-    expect(changes).toStrictEqual([[0, [0x0F]], [1, [0x1B, 0x0F]]]);
+    expect(changes).toStrictEqual([[0, [0x0F]]]);
+    expect(segments(generator).flatMap(pids)).not.toContain(258);
   });
 
   test('keyframes inside a segment also get PAT and PMT in front of them', () => {
@@ -223,7 +224,7 @@ describe('Streams with video', () => {
 });
 
 describe('H.264 whose real sequence header never arrives (FFmpeg 6.0 or earlier with an encoder without global header)', () => {
-  // 中身が空の初期化情報しか届かず、フレームは開始コード付き (Annex B) のまま届くので、その映像は MPEG-TS にできない
+  // 中身が空の初期化情報しか届かず、フレームは開始コード付き (Annex B) のまま届く (このサーバはフレームを長さ付きの NAL Unit として読むので、その映像は使わない)
   test('with AAC: the video is reported as ignored, and segments are cut at the AAC frames with a PMT that lists only AAC', async () => {
     const generator = new HLSGenerator();
     expect(warnings(() => {

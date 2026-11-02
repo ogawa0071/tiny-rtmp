@@ -166,7 +166,7 @@ export default class HLSGenerator {
     //  onMetaData に書かれていなくても、最初に AAC が届いたなら待つ: 中身が空の初期化情報が先に届いても、本当の初期化情報は後から届く)
     // このサーバが fMP4 にしないコーデック (MP3 や Sorenson H.263 など) のトラックは待たない
     // (MP3 も 'mp4a' の esds の ObjectTypeIndication を 0x6B (MPEG-1 Audio) か 0x69 (MPEG-2 Audio) にすれば MP4 に入れられるが、このサーバでは扱わない。Sorenson H.263 は MP4 に入れる方法がない)
-    // (MP3 などには初期化情報がなく、最初のフレームが届くまで対応していないと分からないので、待つとそれまでに届いた映像・音声が捨てられる)
+    // (MP3 などには初期化情報がなく、このサーバでは初期化セグメントにも入れないので、待っても入れるものは届かない)
     if (this.initialization == null) {
       const videocodecid = this.onMetadata?.videocodecid;
       const audiocodecid = this.onMetadata?.audiocodecid;

@@ -190,10 +190,10 @@ describe('Tracks in the initialization segment', () => {
     expect(decodeTime(fragments[0])).toStrictEqual(Math.floor(8 * 44100 / 1000));
   });
 
-  test('no onMetaData, an empty AVC sequence header first (FFmpeg 6.1 or later, encoder without global header): the real one that arrives later is waited for', () => {
+  test('no onMetaData, an empty AVC sequence header first (FFmpeg 6.1 or later, encoder without global header): the real one that arrives later is waited for, and the AAC frames that arrive until then are kept', () => {
     const transmuxer = new FMP4Transmuxer();
     // 配信の始めに中身が空の AVC の初期化情報と AAC の初期化情報が届き、本当の AVC の初期化情報は最初の映像のフレーム (300 ms) の直前に届く
-    // (エンコーダの遅延で、最初の映像のフレームより先に AAC のフレームが届く。それは映像の初期化情報を待っている間に届くので捨てる)
+    // (エンコーダの遅延で、最初の映像のフレームより先に AAC のフレームが届く。それは映像の初期化情報を待っている間に届くが、取っておいて、初期化セグメントを作った時に fMP4 の断片にする)
     transmuxer.feed(video(0, Buffer.from('1700000000', 'hex')));
     transmuxer.feed(audio(0, AAC_SEQUENCE_HEADER));
     const fragments: FMP4Fragment[] = [];
@@ -205,6 +205,8 @@ describe('Tracks in the initialization segment', () => {
 
     expect(tracks(transmuxer)).toStrictEqual(['avc1', 'mp4a']);
     expect(trackIds(fragments)).toStrictEqual(new Set([1, 2]));
+    // 映像の初期化情報を待っている間に届いた 8 ms のフレームから、全ての AAC のフレームが fMP4 の断片になる
+    expect(fragments.filter((fragment) => trackId(fragment) === 2).map(decodeTime)).toStrictEqual(Array.from({ length: 30 }, (_, i) => Math.floor((8 + i * 100) * 44100 / 1000)));
   });
 
   test('no onMetaData, H.264 + MP3: the keyframe that arrives before the first MP3 frame is sent too', () => {

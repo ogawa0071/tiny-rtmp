@@ -62,6 +62,7 @@ type Viewer = {
   write: (buffer: Buffer) => void;
   exit: () => void;
   initialized: boolean; // FLV Header と、途中から視聴を始めた時に必要なメタデータとコーデックの初期化情報を送ったか
+  checking: boolean; // 送信が詰まっていないかを、この tick の終わりに確かめることにしたか
 };
 const viewers = new Set<Viewer>();
 
@@ -122,11 +123,21 @@ const web_server = http.createServer({ highWaterMark }, (req, res) => {
   const viewer: Viewer = {
     write: (chunk: Buffer) => {
       if (res.closed) { return; }
+      res.write(chunk);
+      if (highWaterMark == null || viewer.checking) { return; }
       // highWaterMark を超えて送信が詰まっている視聴者は切断する
-      if (!res.write(chunk) && highWaterMark != null) { res.destroy(); }
+      // ただし Node.js の http は、同じ tick に書いたデータを tick の終わりにまとめて送るので、それまでは全て writableLength に数えられる
+      // (大きなキーフレームや、配信の始めなどにまとめて届いたメッセージを 1 つの tick に書くと、詰まっていなくても highWaterMark を超え、res.write も false を返す)
+      // そこで tick の終わりに送った後 (setImmediate) に、まだ送れずに残っているバイト数で確かめる (配信が終わって end した後は、残りを送り終わるまで待つ)
+      viewer.checking = true;
+      setImmediate(() => {
+        viewer.checking = false;
+        if (!res.writableEnded && res.writableLength > highWaterMark) { res.destroy(); }
+      });
     },
     exit: () => { res.end(); viewers.delete(viewer); },
     initialized: false,
+    checking: false,
   };
   viewers.add(viewer);
 

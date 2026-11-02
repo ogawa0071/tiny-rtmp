@@ -4,7 +4,7 @@
 
 ## 主要コンポーネント
 
-- mpegts-transmuxer.mts - FLVからMPEG-TSへの変換処理 (PMT には、データの届く映像 (H.264) と音声 (AAC) の ES だけを載せる。onMetaData と、最初に届いた映像・音声のコーデックで決める)
+- mpegts-transmuxer.mts - FLVからMPEG-TSへの変換処理 (PMT には、映像 (H.264) と音声 (AAC) のうち、データの届く ES を載せる。トラックごとに、最初に届いたメッセージのコーデックで決め、まだ届いていなければ onMetaData で決める。onMetaData がない時や、onMetaData にコーデックが書かれていない時は、届くまで分からないので載せておく (そのトラックが届かない配信 (FFmpeg の -vn や -an に -flvflags no_metadata を付けた時など) では、データの届かない ES が載ったままになる)。載せずに PMT を出力した ES は、後からそのトラックが届いても載せない。HTTP-TS 配信 (index.mts) は、配信の始めは PMT に載せる ES が決まるまで (1 秒まで) 待ってから送る)
 - mpegts.mts - MPEG-TSフォーマットのパケット生成
 - aac.mts / avc.mts - AACとAVCコーデックの処理
 - bit-reader.mts / bit-builder.mts - ビットレベルでのデータ操作ユーティリティ

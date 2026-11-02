@@ -61,7 +61,7 @@ export default class MPEGTSTransmuxer {
   private firstVideoIsAVC: boolean | null = null;
   // 最初に届いた音声のメッセージが AAC か (MP3 などなら false)
   private firstAudioIsAAC: boolean | null = null;
-  // 初期化情報より先に AVC のフレームが届いたか (その映像は MPEG-TS にできないので、映像のない配信として扱う: feed)
+  // 初期化情報より先に AVC のフレームが届いたか (その映像は使わずに、映像のない配信として扱う: feed)
   private videoSequenceHeaderMissing = false;
   // 最後に出力した PMT に載せた ES (映像, 音声) と、その PMT の version_number
   private pmtStreams: [boolean, boolean] | null = null;
@@ -73,8 +73,11 @@ export default class MPEGTSTransmuxer {
   // 映像・音声は、もう届いていれば最初に届いたメッセージのコーデックで、まだ届いていなければ onMetaData で決める (06 の FMP4Transmuxer と同じ)
   // (コーデックを数値ではなく 'avc1' や 'mp4a' の文字列で送ってくる配信ソフトもある)
   // onMetaData を送ってこない配信ソフトや、onMetaData にコーデックを書かない配信ソフト (yasea など) では、届くまで分からないので載せておく
+  // 載せずに PMT を出力した ES は、後からそのトラックが届いても載せない (FFmpeg も、出力を始めた後から届いたトラックは使わない。06 以降の初期化セグメントと同じ)
+  // (MSE で再生するプレイヤー (mpegts.js や hls.js など) は、再生を始めた後からトラックを増やせずにエラーになる)
   public hasVideo(): boolean {
     if (this.videoSequenceHeaderMissing) { return false; }
+    if (this.pmtStreams?.[0] === false) { return false; }
     if (this.firstVideoIsAVC != null) { return this.firstVideoIsAVC; }
     if (!this.declared()) { return true; }
     return this.onMetadata?.videocodecid === VideoCodecType.AVC || this.onMetadata?.videocodecid === 'avc1';
@@ -82,9 +85,18 @@ export default class MPEGTSTransmuxer {
 
   // PMT に AAC の ES を載せて、音声を MPEG-TS にするか (hasVideo と同じように決める)
   public hasAudio(): boolean {
+    if (this.pmtStreams?.[1] === false) { return false; }
     if (this.firstAudioIsAAC != null) { return this.firstAudioIsAAC; }
     if (!this.declared()) { return true; }
     return this.onMetadata?.audiocodecid === AudioCodecType.AAC || this.onMetadata?.audiocodecid === 'mp4a';
+  }
+
+  // PMT に載せる ES が決まったか (映像・音声のそれぞれで、載せないと分かったか、載せると分かったか)
+  // 映像は AVC の初期化情報が届いたら決まり (中身が空の初期化情報しか届かずにフレームが届いたら、載せないと決まる: feed)、音声は最初の音声のメッセージが届いたら決まる
+  // (HTTP-TS 配信 (index.mts) は、配信の始めは決まるまで TS パケットにするのを待つ。決まる前に出力した PMT に、後から載せないと分かった ES が載っていると、
+  //  version_number を増やした PMT でその ES を外しても、mpegts.js などは最初の PMT に載っていた ES のデータを待って再生を始めない)
+  public decided(): boolean {
+    return (!this.hasVideo() || this.avcDecoderConfigurationRecord != null) && (!this.hasAudio() || this.firstAudioIsAAC != null);
   }
 
   // onMetaData に映像か音声のコーデックが書かれているか
@@ -99,7 +111,7 @@ export default class MPEGTSTransmuxer {
 
   // 映像/音声の PES の前に、必要なら PAT/PMT/PCR を出力する (時刻は映像/音声の timestamp で決める)
   private *emitPSIAndPCR(timestamp: number): Generator<Buffer> {
-    // PMT に載せる ES が変わったら (onMetaData に書かれていなかった映像が届いた、映像を MPEG-TS にできないと分かった、など)、
+    // PMT に載せる ES が変わったら (最初に届いた映像が H.264 ではなかった、初期化情報より先に映像のフレームが届いた、など。ES が増えることはない: hasVideo)、
     // version_number を 1 増やして (32 で 0 に戻る)、すぐに PMT を出力する
     // (PMT の中身を変えたら version_number を 1 増やす: H.222.0 2.4.4.9。version_number が同じ PMT を読み直さないプレイヤー (VLC や GStreamer など) は、増やさないと変わったことに気付かない)
     const video = this.hasVideo();
@@ -149,8 +161,9 @@ export default class MPEGTSTransmuxer {
           this.avcDecoderConfigurationRecord = read_avc_decoder_configuration_record(payload.avcDecoderConfigurationRecord);
           return [];
         }
-        // 初期化情報より先に映像のフレームが届いたら、その映像は MPEG-TS にできないので、映像のない配信として扱う (06 以降のサーバと同じ。後から初期化情報が届いても使わない)
-        // (FFmpeg 6.0 以前で初期化情報を出さないエンコーダの H.264 を送ると、中身が空の初期化情報しか届かない: rtmp-handler.mts の handle_avc)
+        // 初期化情報より先に映像のフレームが届いたら、その映像は使わずに、映像のない配信として扱う (06 以降のサーバと同じ。後から初期化情報が届いても使わない)
+        // (FFmpeg 6.0 以前で初期化情報を出さないエンコーダの H.264 を送ると、中身が空の初期化情報しか届かない: rtmp-handler.mts の handle_avc。
+        //  その時のフレームは開始コード付き (Annex B) のままで、FFmpeg はそれを MPEG-TS にするが、このサーバはフレームを長さ付きの NAL Unit として読むので扱わない: write_annexb_avc)
         if (this.avcDecoderConfigurationRecord == null) {
           logger.warn('Video sequence header is missing, video is ignored', { codec: payload.codec });
           this.videoSequenceHeaderMissing = true;

@@ -161,7 +161,7 @@ describe('Streams with video', () => {
     expect(extinfs(generator)).toStrictEqual([2, 2, 2]);
   });
 
-  test('onMetaData without the video: segments are cut at the keyframes once the AVC video arrives', async () => {
+  test('onMetaData without the video: the AVC video that arrives later is not used, and segments are cut at the AAC frames', async () => {
     // 区切ったセグメントが全てプレイリストに残るように、ライブウィンドウを長くする
     const generator = new LLHLSGenerator({ liveWindowLength: 10, partialSegmentDuration: 0.3 });
     generator.feed(onmetadata({ audiocodecid: 10 }));
@@ -174,12 +174,12 @@ describe('Streams with video', () => {
       if (t >= 2500) { generator.feed(video(t, avc((t - 2500) % 1000 === 0 ? 1 : 2))); }
     }
 
-    // HLS (04-tiny-hls-server) と同じく、映像が届くまでは AAC のフレーム (0, 1003, 2005 ミリ秒) で区切り、
-    // 届いてからは 1 秒以上たったキーフレーム (3500, 4500, 5500, 6500 ミリ秒) で区切る
-    expect(extinfs(generator)).toStrictEqual([1.003, 1.002, 1.495, 1, 1, 1]);
-    // 映像が届いたら PMT に AVC の ES を加えて、PMT の version_number を 1 増やす (H.222.0 2.4.4.9)
+    // HLS (04-tiny-hls-server) と同じく、映像は音声を TS パケットにし始めた後から届いたので使わず、最後まで AAC のフレームで区切る
+    expect(extinfs(generator)).toStrictEqual([1.003, 1.002, 1.003, 1.003, 1.002, 1.003]);
+    // PMT は変わらず (AAC の ES だけ)、映像は出力しない
     const changes = (await segments(generator)).flatMap(pmts).filter(([version, types], index, list) => index === 0 || version !== list[index - 1][0] || types.join() !== list[index - 1][1].join());
-    expect(changes).toStrictEqual([[0, [0x0F]], [1, [0x1B, 0x0F]]]);
+    expect(changes).toStrictEqual([[0, [0x0F]]]);
+    expect((await segments(generator)).flatMap(pids)).not.toContain(258);
   });
 
   // キーフレームの間隔が 1 秒より短い配信では、セグメントの途中のキーフレームを含むパーシャルセグメントも INDEPENDENT=YES になる
@@ -270,7 +270,7 @@ describe('Partial segments in the middle of a GOP', () => {
 });
 
 describe('H.264 whose real sequence header never arrives (FFmpeg 6.0 or earlier with an encoder without global header)', () => {
-  // HLS (04-tiny-hls-server) と同じく、その映像は MPEG-TS にできないので、映像のない配信として扱う
+  // HLS (04-tiny-hls-server) と同じく、その映像は使わずに、映像のない配信として扱う
   test('with AAC: the video is reported as ignored, and every partial segment is cut at the AAC frames with a PMT that lists only AAC', async () => {
     const generator = new LLHLSGenerator({ liveWindowLength: 3, partialSegmentDuration: 0.3 });
     expect(warnings(() => {

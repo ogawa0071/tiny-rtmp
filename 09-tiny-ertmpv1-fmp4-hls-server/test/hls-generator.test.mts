@@ -78,7 +78,7 @@ describe('Tracks of codecs that this server does not put into fMP4', () => {
     const generator = new HLSGenerator();
     generator.feed(metadata(0x68766331, 10));
     generator.feed(audio(0, AAC_SEQUENCE_HEADER));
-    // 映像の初期化情報が届く前の AAC は捨てる (映像のない初期化セグメントを作らない)
+    // 映像の初期化情報が届く前の AAC は取っておくが、まだ初期化セグメントは作らない (映像のない初期化セグメントを作らない)
     generator.feed(audio(0, AAC_FRAME));
     expect(generator.initialize()).toBeNull();
   });

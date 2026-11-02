@@ -21,6 +21,11 @@ const MP3_FRAME = Buffer.from('2fff', 'hex');
 const HEVC_FRAME = Buffer.from('9168766331000000', 'hex');
 // Enhanced RTMP の onMetaData の videocodecid ('hvc1' の FourCC を数値にしたもの)
 const HEVC_FOURCC = 0x68766331;
+// 従来の形式の Sorenson H.263 (CodecID 2) のフレーム (このサーバでは扱わない)
+const SORENSON_FRAME = Buffer.from('1200008400', 'hex');
+// FFmpeg 8.0 以降が 2 つ目の映像トラックを送る、Enhanced RTMP の Multitrack (PacketType 6) の形式の H.264 のフレーム (このサーバでは扱わない)
+// (ExVideoTagHeader の 1 byte の後に、AvMultitrackType (OneTrack は 0) と PacketType (1 は CodedFrames) の 1 byte, 'avc1', トラック番号 1 が続く)
+const SECOND_TRACK_FRAME = Buffer.from('96016176633101000000', 'hex');
 
 const onmetadata = (object: AMF0Object): Message => ({
   message_type_id: MessageType.DataAMF0, message_stream_id: 1, timestamp: 0, data: ['@setDataFrame', 'onMetaData', object],
@@ -38,18 +43,23 @@ const AVC: Track = { header: AVC_SEQUENCE_HEADER, frame: (t) => avc(t % 1000 ===
 // 初期化情報の届かない AVC (FFmpeg 6.0 以前で、初期化情報を出さないエンコーダの H.264 を送った時)
 const AVC_WITHOUT_HEADER: Track = { header: null, frame: AVC.frame };
 const HEVC: Track = { header: null, frame: () => HEVC_FRAME };
+const SORENSON: Track = { header: null, frame: () => SORENSON_FRAME };
 const AAC: Track = { header: AAC_SEQUENCE_HEADER, frame: () => AAC_FRAME };
 const MP3: Track = { header: null, frame: () => MP3_FRAME };
 
-// 2 秒分の映像 (10 fps) と音声 (48 kHz) のメッセージを、timestamp の順に並べる (同じ時刻なら音声が先。映像は from ミリ秒から)
-const stream = (videoTrack: Track | null, audioTrack: Track | null, from = 0): Message[] => {
+// 2 秒分の映像 (10 fps) と音声 (48 kHz) のメッセージを、timestamp の順に並べる (同じ時刻なら音声が先。映像は videoFrom ミリ秒から、音声は audioFrom ミリ秒から)
+const stream = (videoTrack: Track | null, audioTrack: Track | null, videoFrom = 0, audioFrom = 0): Message[] => {
   const messages: Message[] = [];
-  if (audioTrack?.header != null) { messages.push(audio(0, audioTrack.header)); }
   let i = 0;
   for (let t = 0; t < 2000; t += 100) {
-    for (; audioTrack != null && aac(i) <= t; i++) { messages.push(audio(aac(i), audioTrack.frame(aac(i)))); }
-    if (videoTrack?.header != null && t === from) { messages.push(video(t, videoTrack.header)); }
-    if (videoTrack != null && t >= from) { messages.push(video(t, videoTrack.frame(t))); }
+    for (; audioTrack != null && aac(i) <= t; i++) {
+      if (aac(i) < audioFrom) { continue; }
+      // 1 つ前のフレームが audioFrom より前なら、これが最初のフレーム
+      if (audioTrack.header != null && aac(i - 1) < audioFrom) { messages.push(audio(aac(i), audioTrack.header)); }
+      messages.push(audio(aac(i), audioTrack.frame(aac(i))));
+    }
+    if (videoTrack?.header != null && t === videoFrom) { messages.push(video(t, videoTrack.header)); }
+    if (videoTrack != null && t >= videoFrom) { messages.push(video(t, videoTrack.frame(t))); }
   }
   return messages;
 };
@@ -109,8 +119,10 @@ describe('Elementary streams in the PMT', () => {
     ['H.264 and AAC as strings', { videocodecid: 'avc1', audiocodecid: 'mp4a' }, AVC, AAC, [0x1B, 0x0F], [0, 256, 257, 258, 259]],
     ['audio only (FFmpeg -vn)', { audiocodecid: 10 }, null, AAC, [0x0F], [0, 256, 257, 259]],
     ['video only (FFmpeg -an)', { videocodecid: 7 }, AVC, null, [0x1B], [0, 256, 257, 258]],
-    // このサーバでは H.265 や MP3 は MPEG-TS にしないので、映像のない配信や、音声のない配信になる
+    // このサーバでは H.265 や Sorenson H.263 や MP3 は MPEG-TS にしないので、映像のない配信や、音声のない配信になる
     ['H.265 + AAC', { videocodecid: HEVC_FOURCC, audiocodecid: 10 }, HEVC, AAC, [0x0F], [0, 256, 257, 259]],
+    // FFmpeg の -f flv は、映像のコーデックを指定しないと Sorenson H.263 になる (従来の形式でも、CodecID が 7 でなければ H.264 ではない)
+    ['Sorenson H.263 + AAC (FFmpeg -f flv without -c:v)', { videocodecid: 2, audiocodecid: 10 }, SORENSON, AAC, [0x0F], [0, 256, 257, 259]],
     ['H.264 + MP3', { videocodecid: 7, audiocodecid: 2 }, AVC, MP3, [0x1B], [0, 256, 257, 258]],
     // onMetaData にコーデックが書かれていない時は、届くまで分からないので両方載せる (yasea は、videocodecid も audiocodecid もない onMetaData を送ってくる)
     ['onMetaData without codec ids (yasea)', { width: 320, height: 240, audiosamplerate: 44100, stereo: true }, AVC, AAC, [0x1B, 0x0F], [0, 256, 257, 258, 259]],
@@ -121,6 +133,22 @@ describe('Elementary streams in the PMT', () => {
 
     expect(pmts(ts)).toStrictEqual([[0, types]]);
     expect(new Set(pids(ts))).toStrictEqual(new Set(expected));
+  });
+
+  // それぞれのトラックの初期化情報を、そのトラックの最初のフレームの直前に送ってくる配信ソフト (yasea など) では、音声が映像より後から届くこともある
+  // 音声が届く前の PMT にも、onMetaData に書かれた AAC (コーデックが書かれていなければ、届くかもしれない AAC) を載せておくので、音声が届いても PMT は変わらない
+  test.each<[string, AMF0Object | null]>([
+    ['H.264 and AAC', { videocodecid: 7, audiocodecid: 10 }],
+    ['H.264 and AAC as strings', { videocodecid: 'avc1', audiocodecid: 'mp4a' }],
+    ['onMetaData without codec ids (yasea)', { width: 320, height: 240, audiosamplerate: 44100, stereo: true }],
+    ['no onMetaData', null],
+  ])('%s, the audio arrives after the first video frames: the PMT lists the AAC stream from the start, and never changes', (_, object) => {
+    const transmuxer = new MPEGTSTransmuxer();
+    // 音声 (と、その初期化情報) は 1 秒から届く
+    const ts = transmux(transmuxer, [... (object != null ? [onmetadata(object)] : []), ... stream(AVC, AAC, 0, 1000)]);
+
+    expect(pmts(ts)).toStrictEqual([[0, [0x1B, 0x0F]]]);
+    expect(new Set(pids(ts))).toStrictEqual(new Set([0, 256, 257, 258, 259]));
   });
 
   test('audio only, then an onMetaData with only the title (a new song): the PMT does not change', () => {
@@ -136,7 +164,8 @@ describe('Elementary streams in the PMT', () => {
 
 describe('Elementary streams decided from the first video and audio messages', () => {
   // onMetaData にコーデックが書かれていなければ、最初に届いた映像と音声のメッセージで決める (06 の FMP4Transmuxer と同じ)
-  // 決まるまでは両方の ES を載せていて、載せる ES が変わったら version_number を 1 増やす (H.222.0 2.4.4.9)
+  // 決まるまでは届くかもしれない ES も載せておき、載せないと分かったら外して version_number を 1 増やす (H.222.0 2.4.4.9)
+  // (載せずに PMT を出力した ES は、後からそのトラックが届いても載せない)
   test('no onMetaData, H.265 + AAC (FFmpeg -flvflags no_metadata): the AVC stream leaves the PMT with the next version_number once the H.265 video arrives', () => {
     const transmuxer = new MPEGTSTransmuxer();
     const ts = transmux(transmuxer, stream(HEVC, AAC));
@@ -162,21 +191,39 @@ describe('Elementary streams decided from the first video and audio messages', (
     expect(pids(ts)).not.toContain(259);
   });
 
-  test('onMetaData without the video, then the AVC video arrives: the AVC stream joins the PMT with the next version_number, before the first video frame', () => {
+  test('H.264 + AAC with a second video track (FFmpeg 8.0 or later): the frames of the second track in the Multitrack format do not change the PMT', () => {
+    const transmuxer = new MPEGTSTransmuxer();
+    // 1 つ目の映像トラックは従来の形式で届くので、映像は H.264 に決まり、後から届く 2 つ目のトラックのフレームでは変わらない (2 つ目のトラックは使わない)
+    const messages = stream(AVC, AAC).flatMap((message) => message.message_type_id === MessageType.Video ? [message, video(message.timestamp, SECOND_TRACK_FRAME)] : [message]);
+    const ts = transmux(transmuxer, [onmetadata({ videocodecid: 7, audiocodecid: 10 }), ... messages]);
+
+    expect(pmts(ts)).toStrictEqual([[0, [0x1B, 0x0F]]]);
+    expect(new Set(pids(ts))).toStrictEqual(new Set([0, 256, 257, 258, 259]));
+  });
+
+  // 載せずに PMT を出力した ES は、後からそのトラックが届いても載せない (FFmpeg も、出力を始めた後から届いたトラックは使わない。06 以降の初期化セグメントと同じ)
+  // (MSE で再生するプレイヤー (mpegts.js など) は、再生を始めた後からトラックを増やせない)
+  test('onMetaData without the video, then the AVC video arrives: the AVC stream does not join the PMT and the video is not output', () => {
     const transmuxer = new MPEGTSTransmuxer();
     // onMetaData には書かれていない映像が 1 秒から届く
     const ts = transmux(transmuxer, [onmetadata({ audiocodecid: 10 }), ... stream(AVC, AAC, 1000)]);
 
-    expect(pmts(ts)).toStrictEqual([[0, [0x0F]], [1, [0x1B, 0x0F]]]);
-    // 新しい PMT は、PAT/PMT を出力する間隔 (100 ミリ秒) を待たずに、最初の映像のフレームの前に出力する
-    const list = pids(ts);
-    const before = ts.subarray(0, list.indexOf(258) * 188);
-    expect(pmts(before).at(-1)).toStrictEqual([1, [0x1B, 0x0F]]);
+    expect(pmts(ts)).toStrictEqual([[0, [0x0F]]]);
+    expect(pids(ts)).not.toContain(258);
+  });
+
+  test('onMetaData without the audio, then the AAC audio arrives: the AAC stream does not join the PMT and the audio is not output', () => {
+    const transmuxer = new MPEGTSTransmuxer();
+    // onMetaData には書かれていない音声 (と、その初期化情報) が 1 秒から届く
+    const ts = transmux(transmuxer, [onmetadata({ videocodecid: 7 }), ... stream(AVC, AAC, 0, 1000)]);
+
+    expect(pmts(ts)).toStrictEqual([[0, [0x1B]]]);
+    expect(pids(ts)).not.toContain(259);
   });
 });
 
 describe('H.264 whose real sequence header never arrives (FFmpeg 6.0 or earlier with an encoder without global header)', () => {
-  // 中身が空の初期化情報しか届かず、フレームは開始コード付き (Annex B) のまま届くので、その映像は MPEG-TS にできない
+  // 中身が空の初期化情報しか届かず、フレームは開始コード付き (Annex B) のまま届く (このサーバはフレームを長さ付きの NAL Unit として読むので、その映像は使わない)
   test('with AAC: the video is reported as ignored and the AVC stream leaves the PMT, even if a sequence header arrives later', () => {
     const transmuxer = new MPEGTSTransmuxer();
     const messages = [onmetadata({ videocodecid: 7, audiocodecid: 10 }), video(0, EMPTY_AVC_SEQUENCE_HEADER), ... stream(AVC_WITHOUT_HEADER, AAC)];
@@ -197,5 +244,53 @@ describe('H.264 whose real sequence header never arrives (FFmpeg 6.0 or earlier 
     expect(warnings(() => { ts = transmux(transmuxer, messages); })).toStrictEqual(['Video sequence header is missing, video is ignored']);
 
     expect(ts.byteLength).toStrictEqual(0);
+  });
+});
+
+describe('Waiting until the elementary streams in the PMT are decided (HTTP-TS server)', () => {
+  // HTTP-TS 配信 (index.mts) と同じく、PMT に載せる ES が決まるまで (decided) feed が返したものを溜めておき、決まったら順に取り出す
+  // (配信が終わったら、決まっていなくても取り出す)
+  const transmux_after_decided = (transmuxer: MPEGTSTransmuxer, messages: Message[]): Buffer => {
+    const pending: Iterable<Buffer>[] = [];
+    const packets: Buffer[] = [];
+    for (const message of messages) {
+      pending.push(transmuxer.feed(message));
+      if (!transmuxer.decided()) { continue; }
+      for (const iterable of pending.splice(0)) { packets.push(... iterable); }
+    }
+    for (const iterable of pending.splice(0)) { packets.push(... iterable); }
+    return Buffer.concat(packets);
+  };
+
+  test('H.264 and AAC: decided by the sequence headers, before the first frame', () => {
+    const transmuxer = new MPEGTSTransmuxer();
+    transmuxer.feed(onmetadata({ videocodecid: 7, audiocodecid: 10 }));
+    transmuxer.feed(video(0, AVC_SEQUENCE_HEADER));
+    expect(transmuxer.decided()).toStrictEqual(false);
+    transmuxer.feed(audio(0, AAC_SEQUENCE_HEADER));
+    expect(transmuxer.decided()).toStrictEqual(true);
+  });
+
+  // FFmpeg が送ってくる順で、最初の映像か音声のフレームより後に ES が決まる配信 (同じ時刻なら映像が先)
+  test.each<[string, Message[], [number, number[]][], [number, number[]][]]>([
+    // FFmpeg -flvflags no_metadata で H.264 + MP3 を送ると、最初の MP3 のフレームは映像のフレームより後に届く
+    ['no onMetaData, H.264 + MP3', [video(0, AVC_SEQUENCE_HEADER), video(0, avc(1)), video(33, avc(2)), audio(42, MP3_FRAME), video(67, avc(2)), audio(68, MP3_FRAME)], [[0, [0x1B, 0x0F]], [1, [0x1B]]], [[0, [0x1B]]]],
+    // FFmpeg 6.0 以前で初期化情報を出さないエンコーダ (B フレームなし) の H.264 と AAC を送ると、最初の AAC のフレームは映像のフレームより先に届く
+    ['H.264 whose real sequence header never arrives, with AAC', [onmetadata({ videocodecid: 7, audiocodecid: 10 }), video(0, EMPTY_AVC_SEQUENCE_HEADER), audio(0, AAC_SEQUENCE_HEADER), audio(0, AAC_FRAME), video(21, avc(1)), audio(21, AAC_FRAME)], [[0, [0x1B, 0x0F]], [1, [0x0F]]], [[0, [0x0F]]]],
+    // FFmpeg -flvflags no_metadata で Sorenson H.263 + AAC を送ると、最初の AAC のフレームは映像のフレームより先に届く
+    ['no onMetaData, Sorenson H.263 + AAC', [audio(0, AAC_SEQUENCE_HEADER), audio(0, AAC_FRAME), video(21, SORENSON_FRAME), audio(21, AAC_FRAME)], [[0, [0x1B, 0x0F]], [1, [0x0F]]], [[0, [0x0F]]]],
+  ])('%s: the first PMT lists only the streams that carry data when the output waits until they are decided', (_, messages, immediate, waited) => {
+    // 待たずに出力すると、最初の PMT には後から載せないと分かった ES も載っている (mpegts.js などは、PMT が変わってもその ES のデータを待って再生を始めない)
+    expect(pmts(transmux(new MPEGTSTransmuxer(), messages))).toStrictEqual(immediate);
+    const transmuxer = new MPEGTSTransmuxer();
+    expect(pmts(transmux_after_decided(transmuxer, messages))).toStrictEqual(waited);
+    // 配信が終わるのを待たずに、最初の映像と音声のメッセージが揃った所で決まる
+    expect(transmuxer.decided()).toStrictEqual(true);
+  });
+
+  test('no onMetaData and no audio: never decided (the HTTP-TS server stops waiting after a while)', () => {
+    const transmuxer = new MPEGTSTransmuxer();
+    transmux(transmuxer, stream(AVC, null));
+    expect(transmuxer.decided()).toStrictEqual(false);
   });
 });

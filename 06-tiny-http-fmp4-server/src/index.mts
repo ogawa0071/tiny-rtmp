@@ -63,6 +63,7 @@ type Viewer = {
   write: (buffer: Buffer) => void;
   exit: () => void;
   initialized: boolean; // 初期化セグメントを送ったか
+  checking: boolean; // 送信が詰まっていないかを、この tick の終わりに確かめることにしたか
   initialBytes: number; // 視聴を始めた時にまとめて送ったバイト数 (初期化セグメントと、待っている間に取っておいたフレームを含む断片)
 };
 const viewers = new Set<Viewer>();
@@ -126,13 +127,21 @@ const web_server = http.createServer({ highWaterMark }, (req, res) => {
     write: (chunk: Buffer) => {
       if (res.closed) { return; }
       res.write(chunk);
+      if (highWaterMark == null || viewer.checking) { return; }
       // highWaterMark を超えて送信が詰まっている視聴者は切断する
-      // (視聴を始めた時にまとめて送ったデータは、速い視聴者でも送り終わるまでに時間がかかるので、その分は詰まりとみなさない。
-      //  Node.js の http は同じ tick に書いたデータを tick の終わりにまとめて送るので、それまでは全て writableLength に数えられる)
-      if (highWaterMark != null && res.writableLength > highWaterMark + viewer.initialBytes) { res.destroy(); }
+      // ただし Node.js の http は、同じ tick に書いたデータを tick の終わりにまとめて送るので、それまでは全て writableLength に数えられる
+      // (配信の始めなどにメッセージがまとめて届くと、1 つの tick に何フレーム分も書くので、詰まっていなくても highWaterMark を超える)
+      // そこで tick の終わりに送った後 (setImmediate) に、まだ送れずに残っているバイト数で確かめる (配信が終わって end した後は、残りを送り終わるまで待つ)
+      // (視聴を始めた時にまとめて送ったデータは、速い視聴者でも送り終わるまでに時間がかかるので、その分は詰まりとみなさない)
+      viewer.checking = true;
+      setImmediate(() => {
+        viewer.checking = false;
+        if (!res.writableEnded && res.writableLength > highWaterMark + viewer.initialBytes) { res.destroy(); }
+      });
     },
     exit: () => { res.end(); viewers.delete(viewer); },
     initialized: false,
+    checking: false,
     initialBytes: 0,
   };
   viewers.add(viewer);
