@@ -93,7 +93,7 @@ export default class MPEGTSTransmuxer {
 
   // PMT に載せる ES が決まったか (映像・音声のそれぞれで、載せないと分かったか、載せると分かったか)
   // 映像は AVC の初期化情報が届いたら決まり (中身が空の初期化情報しか届かずにフレームが届いたら、載せないと決まる: feed)、音声は最初の音声のメッセージが届いたら決まる
-  // (HTTP-TS 配信 (index.mts) は、配信の始めは決まるまで TS パケットにするのを待つ。決まる前に出力した PMT に、後から載せないと分かった ES が載っていると、
+  // (HTTP-TS 配信 (index.mts) は、配信の始めは決まるまで TS パケットにするのを待つ: decision-wait.mts。決まる前に出力した PMT に、後から載せないと分かった ES が載っていると、
   //  version_number を増やした PMT でその ES を外しても、mpegts.js などは最初の PMT に載っていた ES のデータを待って再生を始めない)
   public decided(): boolean {
     return (!this.hasVideo() || this.avcDecoderConfigurationRecord != null) && (!this.hasAudio() || this.firstAudioIsAAC != null);

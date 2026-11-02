@@ -7,6 +7,7 @@ import { NoopLogger, registerLogger } from '../../01-tiny-rtmp-server/src/logger
 import type { Logger } from '../../01-tiny-rtmp-server/src/logger.mts';
 
 import MPEGTSTransmuxer from '../src/mpegts-transmuxer.mts';
+import DecisionWait, { DECISION_WAIT, MAX_PENDING_MESSAGES } from '../src/decision-wait.mts';
 
 // FFmpeg が送ってくる AVC と AAC (44.1 kHz) の初期化情報 (VideoTagHeader / AudioTagHeader 付き)
 const AVC_SEQUENCE_HEADER = Buffer.from('1700000000014d400dffe10018674d400deca0a0fd8088000003000800000301e078a14cb001000468ce0fc8', 'hex');
@@ -248,18 +249,19 @@ describe('H.264 whose real sequence header never arrives (FFmpeg 6.0 or earlier 
 });
 
 describe('Waiting until the elementary streams in the PMT are decided (HTTP-TS server)', () => {
-  // HTTP-TS 配信 (index.mts) と同じく、PMT に載せる ES が決まるまで (decided) feed が返したものを溜めておき、決まったら順に取り出す
+  // HTTP-TS 配信 (index.mts) と同じく、PMT に載せる ES が決まるまで DecisionWait で待ってから TS パケットにする
   // (配信が終わったら、決まっていなくても取り出す)
   const transmux_after_decided = (transmuxer: MPEGTSTransmuxer, messages: Message[]): Buffer => {
-    const pending: Iterable<Buffer>[] = [];
-    const packets: Buffer[] = [];
-    for (const message of messages) {
-      pending.push(transmuxer.feed(message));
-      if (!transmuxer.decided()) { continue; }
-      for (const iterable of pending.splice(0)) { packets.push(... iterable); }
+    const wait = new DecisionWait(transmuxer);
+    const packets = messages.flatMap((message) => wait.feed(message).packets);
+    return Buffer.concat([... packets, ... wait.flush().packets]);
+  };
+  // メッセージを順に DecisionWait に渡して、待っていた間の分をまとめて返したメッセージの番号を返す (返さなければ null)
+  const released = (wait: DecisionWait, messages: Message[]): number | null => {
+    for (const [index, message] of messages.entries()) {
+      if (wait.feed(message).released) { return index; }
     }
-    for (const iterable of pending.splice(0)) { packets.push(... iterable); }
-    return Buffer.concat(packets);
+    return null;
   };
 
   test('H.264 and AAC: decided by the sequence headers, before the first frame', () => {
@@ -305,5 +307,45 @@ describe('Waiting until the elementary streams in the PMT are decided (HTTP-TS s
     const transmuxer = new MPEGTSTransmuxer();
     transmux(transmuxer, stream(AVC, null));
     expect(transmuxer.decided()).toStrictEqual(false);
+  });
+
+  test('H.264 and AAC (FFmpeg): released at the sequence headers, and the frames after them are not held', () => {
+    const wait = new DecisionWait(new MPEGTSTransmuxer());
+    expect(wait.feed(onmetadata({ videocodecid: 7, audiocodecid: 10 }))).toStrictEqual({ packets: [], released: false });
+    expect(wait.feed(video(0, AVC_SEQUENCE_HEADER))).toStrictEqual({ packets: [], released: false });
+    // 初期化情報は TS パケットにならないので、まとめて返すものはまだない
+    expect(wait.feed(audio(0, AAC_SEQUENCE_HEADER))).toStrictEqual({ packets: [], released: true });
+    // 最初のフレームから、PAT と、映像と音声の ES を載せた PMT を付けてすぐに返す
+    const { packets, released } = wait.feed(video(0, avc(1)));
+    expect(released).toStrictEqual(false);
+    expect(pids(Buffer.concat(packets)).slice(0, 2)).toStrictEqual([0, 256]);
+    expect(pmts(Buffer.concat(packets))).toStrictEqual([[0, [0x1B, 0x0F]]]);
+  });
+
+  test('never decided (onMetaData without codec ids, no audio): released after DECISION_WAIT of video timestamps, measured from the first video message and not from the onMetaData', () => {
+    const wait = new DecisionWait(new MPEGTSTransmuxer());
+    // コーデックの書かれていない onMetaData (timestamp は 0) の後に、5 秒から映像だけが届く (音声が届くかもしれないので、決まらない)
+    const messages = [onmetadata({ width: 320, height: 240 }), ... stream(AVC, null).map((message) => ({ ... message, timestamp: message.timestamp + 5000 }))];
+    // 最初の映像のメッセージから DECISION_WAIT たったメッセージで、それまで溜めていた分をまとめて返す
+    expect(released(wait, messages)).toStrictEqual(messages.findIndex((message) => message.timestamp === 5000 + DECISION_WAIT));
+  });
+
+  test('never decided, with timestamps that do not advance: released when MAX_PENDING_MESSAGES messages are held', () => {
+    const wait = new DecisionWait(new MPEGTSTransmuxer());
+    const messages = [video(0, AVC_SEQUENCE_HEADER), ... Array.from({ length: MAX_PENDING_MESSAGES * 2 }, () => video(0, avc(1)))];
+    expect(released(wait, messages)).toStrictEqual(MAX_PENDING_MESSAGES - 1);
+  });
+
+  test('the stream ends before it is decided: flush returns every held packet in order, from the PAT and the PMT', () => {
+    const wait = new DecisionWait(new MPEGTSTransmuxer());
+    // 0.5 秒で終わる、onMetaData のない映像だけの配信 (FFmpeg -an -flvflags no_metadata)
+    const messages = stream(AVC, null).filter((message) => message.timestamp < 500);
+    expect(released(wait, messages)).toBeNull();
+    const { packets, released: flushed } = wait.flush();
+    expect(flushed).toStrictEqual(true);
+    const ts = Buffer.concat(packets);
+    expect(pids(ts).slice(0, 2)).toStrictEqual([0, 256]);
+    // 溜めていた 5 フレームの映像が全て入っている (feed が返したまま、待たずに TS パケットにしたものと同じ)
+    expect(ts).toStrictEqual(transmux(new MPEGTSTransmuxer(), messages));
   });
 });

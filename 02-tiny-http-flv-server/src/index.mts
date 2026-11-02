@@ -9,6 +9,7 @@ import { ConsoleLogger, logger, registerLogger } from '../../01-tiny-rtmp-server
 import { AuthConfiguration } from '../../01-tiny-rtmp-server/src/auth.mts';
 
 import handle_rtmp from './rtmp-accepter.mts';
+import { congestion_checker } from './congestion.mts';
 import FLVRelay from './flv-relay.mts';
 
 const options = {
@@ -62,7 +63,6 @@ type Viewer = {
   write: (buffer: Buffer) => void;
   exit: () => void;
   initialized: boolean; // FLV Header と、途中から視聴を始めた時に必要なメタデータとコーデックの初期化情報を送ったか
-  checking: boolean; // 送信が詰まっていないかを、この tick の終わりに確かめることにしたか
 };
 const viewers = new Set<Viewer>();
 
@@ -120,26 +120,16 @@ const web_server = http.createServer({ highWaterMark }, (req, res) => {
   });
   res.flushHeaders();
 
+  // highWaterMark を超えて送信が詰まっている視聴者は切断する (同じ tick に書いた分を送った後に確かめる: congestion.mts)
+  const check_congestion = congestion_checker(res, highWaterMark);
   const viewer: Viewer = {
     write: (chunk: Buffer) => {
       if (res.closed) { return; }
       res.write(chunk);
-      if (highWaterMark == null || viewer.checking) { return; }
-      // highWaterMark を超えて送信が詰まっている視聴者は切断する
-      // ただし Node.js の http は、同じ tick に書いたデータを tick の終わりにまとめて送るので、それまでは全て writableLength に数えられる
-      // (大きなキーフレームや、配信の始めなどにまとめて届いたメッセージを 1 つの tick に書くと、詰まっていなくても highWaterMark を超え、res.write も false を返す)
-      // そこで tick の終わりに送った後 (setImmediate) に、writableLength で確かめる (配信が終わって end した後は、残りを送り終わるまで待つ)
-      // (writableLength は、まとめて送ったデータを OS が全部受け取るまで、受け取った分も含めて全部数え、その後に書いた分も数える。
-      //  送り始めたばかりの TCP 接続は送信バッファが小さく、一度に少ししか受け取らないので、ネットワーク越しの視聴者は速くても、配信の始めなどに highWaterMark を超えて切断されることがある)
-      viewer.checking = true;
-      setImmediate(() => {
-        viewer.checking = false;
-        if (!res.writableEnded && res.writableLength > highWaterMark) { res.destroy(); }
-      });
+      check_congestion();
     },
     exit: () => { res.end(); viewers.delete(viewer); },
     initialized: false,
-    checking: false,
   };
   viewers.add(viewer);
 
