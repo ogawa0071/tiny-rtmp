@@ -271,9 +271,22 @@ describe('Waiting until the elementary streams in the PMT are decided (HTTP-TS s
     expect(transmuxer.decided()).toStrictEqual(true);
   });
 
+  // onMetaData に書かれていないトラックは待たない。音声は最初の音声のメッセージで決まる (中身が空の AAC の初期化情報でもよい: 本当の初期化情報が届くのを待たない)
+  test.each<[string, AMF0Object, Message[]]>([
+    ['audio only (FFmpeg -vn)', { audiocodecid: 10 }, [audio(0, AAC_SEQUENCE_HEADER)]],
+    ['video only (FFmpeg -an)', { videocodecid: 7 }, [video(0, AVC_SEQUENCE_HEADER)]],
+    ['H.264 and AAC, an empty AAC sequence header first (FFmpeg -c copy from ADTS AAC)', { videocodecid: 7, audiocodecid: 10 }, [video(0, AVC_SEQUENCE_HEADER), audio(0, Buffer.from('af00', 'hex'))]],
+  ])('%s: decided by the sequence headers, before the first frame', (_, object, messages) => {
+    const transmuxer = new MPEGTSTransmuxer();
+    transmuxer.feed(onmetadata(object));
+    for (const message of messages) { transmuxer.feed(message); }
+    expect(transmuxer.decided()).toStrictEqual(true);
+  });
+
   // FFmpeg が送ってくる順で、最初の映像か音声のフレームより後に ES が決まる配信 (同じ時刻なら映像が先)
   test.each<[string, Message[], [number, number[]][], [number, number[]][]]>([
-    // FFmpeg -flvflags no_metadata で H.264 + MP3 を送ると、最初の MP3 のフレームは映像のフレームより後に届く
+    // B フレームのある H.264 と MP3 を FFmpeg -flvflags no_metadata で送ると、最初の MP3 のフレームは映像のフレームより後に届く
+    // (FFmpeg は映像の DTS が負にならないように全体を遅らせる。B フレームがなければ MP3 が先に届くので、待たなくても AAC の ES は載らない)
     ['no onMetaData, H.264 + MP3', [video(0, AVC_SEQUENCE_HEADER), video(0, avc(1)), video(33, avc(2)), audio(42, MP3_FRAME), video(67, avc(2)), audio(68, MP3_FRAME)], [[0, [0x1B, 0x0F]], [1, [0x1B]]], [[0, [0x1B]]]],
     // FFmpeg 6.0 以前で初期化情報を出さないエンコーダ (B フレームなし) の H.264 と AAC を送ると、最初の AAC のフレームは映像のフレームより先に届く
     ['H.264 whose real sequence header never arrives, with AAC', [onmetadata({ videocodecid: 7, audiocodecid: 10 }), video(0, EMPTY_AVC_SEQUENCE_HEADER), audio(0, AAC_SEQUENCE_HEADER), audio(0, AAC_FRAME), video(21, avc(1)), audio(21, AAC_FRAME)], [[0, [0x1B, 0x0F]], [1, [0x0F]]], [[0, [0x0F]]]],

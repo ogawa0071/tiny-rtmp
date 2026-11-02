@@ -165,7 +165,7 @@ describe('Tracks decided from the sequence headers', () => {
     expect(generator.segment(Number(msn))!.toString('latin1').split('moof').length - 1).toStrictEqual(1000);
   });
 
-  test('an onMetaData that arrives after the first frames and declares AAC: only the frames of the last second are kept while the AAC track is waited for', () => {
+  test('an onMetaData that arrives after the first frames and declares AAC: only the frames of the last second and those from the newest keyframe are kept while the AAC track is waited for', () => {
     // 最初のセグメントもプレイリストに残るように、プレイリストに載せるセグメントの数を増やす
     const generator = new HLSGenerator(10);
     generator.feed(video(0, AVC_SEQUENCE_HEADER));
@@ -177,7 +177,7 @@ describe('Tracks decided from the sequence headers', () => {
       if (t >= 2000) { generator.feed(audio(t + 8, AAC_FRAME)); }
     }
     generator.end();
-    // AAC の初期化情報が届く前の 1 秒 (UNDECLARED_TRACK_WAIT) の間に取っておいた、1000 ms のキーフレームからセグメントを始める
+    // 一番新しいキーフレーム (1000 ms) からセグメントを始める (それより前の 0 ms からの GOP は、AAC の初期化情報が届く 1 秒 (UNDECLARED_TRACK_WAIT) より前に届いたので取っておかない)
     expect(extinfs(generator)).toStrictEqual([1, 1, 1, 0.9]);
   });
 

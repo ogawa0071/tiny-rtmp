@@ -46,7 +46,7 @@ export default class FMP4Transmuxer {
   private firstVideoIsAVC: boolean | null = null;
   // 最初に届いた音声のメッセージの SoundFormat (AudioTagHeader の先頭 4bit: 10 は AAC、2 は MP3、9 は Enhanced RTMP の形式)
   private firstAudioFormat: number | null = null;
-  // 初期化情報より先に H.264 のフレームが届いたか (その映像は fMP4 にできないので、映像のトラックがない配信として扱う: feed)
+  // 初期化情報より先に H.264 のフレームが届いたか (その映像は使わずに、映像のトラックがない配信として扱う: feed)
   private videoSequenceHeaderMissing = false;
   // 最初に届いたフレームの timestamp (onMetaData にコーデックが書かれていない時に、UNDECLARED_TRACK_WAIT の間だけ届いていないトラックを待つ)
   private firstFrameTimestamp: number | null = null;
@@ -74,7 +74,7 @@ export default class FMP4Transmuxer {
     // (onMetaData に AAC と書かれていても、最初に AAC 以外の音声が届いたなら AAC は届かないので待たない。
     //  onMetaData に書かれていなくても、最初に AAC が届いたなら待つ: 中身が空の初期化情報が先に届いても、本当の初期化情報は後から届く)
     // それ以外のコーデック (MP3 や Sorenson H.263 など) のトラックは待たない (このサーバでは fMP4 にしないので、そのトラックがない配信として扱う)
-    // (初期化情報より先にフレームが届いた H.264 も fMP4 にできないので待たない: feed)
+    // (初期化情報より先にフレームが届いた H.264 も使わないので待たない: feed)
     const video_expected = (this.firstVideoIsAVC ?? (this.onMetadata?.videocodecid === VideoCodecType.AVC || this.onMetadata?.videocodecid === 'avc1')) && !this.videoSequenceHeaderMissing;
     const audio_expected = this.firstAudioFormat != null
       ? this.firstAudioFormat === AudioCodecType.AAC
@@ -161,8 +161,10 @@ export default class FMP4Transmuxer {
           this.avcDecoderConfigurationRecord = payload.avcDecoderConfigurationRecord;
           return [];
         }
-        // 初期化情報より先に映像のフレームが届いたら、その映像は fMP4 にできないので、映像のトラックがない配信として扱う (09 の HLSGenerator と同じ)
-        // (FFmpeg 6.0 以前で初期化情報を出さないエンコーダの H.264 を送ると、中身が空の初期化情報しか届かない: 03 の handle_avc)
+        // 初期化情報より先に映像のフレームが届いたら、その映像は使わずに、映像のトラックがない配信として扱う (09 の HLSGenerator と同じ)
+        // (FFmpeg 6.0 以前で初期化情報を出さないエンコーダの H.264 を送ると、中身が空の初期化情報しか届かない: 03 の handle_avc。
+        //  その時のフレームは開始コード付き (Annex B) のままで、FFmpeg はその中の SPS/PPS から avcC を作って MP4 にするが、
+        //  このサーバは届いた初期化情報で初期化セグメントを作り、フレームは長さ付きの NAL Unit としてそのまま入れるので扱わない)
         if (this.avcDecoderConfigurationRecord == null && !this.videoSequenceHeaderMissing) {
           logger.warn('Video sequence header is missing, video is ignored', { codec: payload.codec });
           this.videoSequenceHeaderMissing = true;

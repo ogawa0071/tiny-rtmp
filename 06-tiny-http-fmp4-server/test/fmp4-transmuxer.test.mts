@@ -154,7 +154,7 @@ describe('Tracks in the initialization segment', () => {
     expect(fragments.length).toStrictEqual(1000);
   });
 
-  test('an onMetaData that arrives after the first frames and declares AAC: only the frames of the last second are kept while the AAC track is waited for', () => {
+  test('an onMetaData that arrives after the first frames and declares AAC: only the frames of the last second and those from the newest keyframe are kept while the AAC track is waited for', () => {
     const transmuxer = new FMP4Transmuxer();
     transmuxer.feed(video(0, AVC_SEQUENCE_HEADER));
     const fragments: FMP4Fragment[] = [];
@@ -166,7 +166,7 @@ describe('Tracks in the initialization segment', () => {
       if (t >= 2000) { fragments.push(... transmuxer.feed(audio(t + 8, AAC_FRAME))); }
     }
 
-    // 映像は、AAC の初期化情報が届く前の 1 秒 (UNDECLARED_TRACK_WAIT) の間に取っておいた、1000 ms のキーフレームから送られる
+    // 映像は、一番新しいキーフレーム (1000 ms) から送られる (それより前の 0 ms からの GOP は、AAC の初期化情報が届く 1 秒 (UNDECLARED_TRACK_WAIT) より前に届いたので取っておかない)
     const videoFragments = fragments.filter((fragment) => trackId(fragment) === 1);
     expect(videoFragments.map(decodeTime)).toStrictEqual(Array.from({ length: 19 }, (_, i) => 1000 + i * 100));
     expect(fragments.find(({ independent }) => independent)).toBe(videoFragments[0]);

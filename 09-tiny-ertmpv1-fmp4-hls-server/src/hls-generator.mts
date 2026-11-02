@@ -123,8 +123,10 @@ export default class HLSGenerator {
       this.unsupportedAudioCodec = payload.soundFormat;
       return;
     }
-    // 初期化情報より先に映像のフレームが届いたら、その映像は fMP4 にできないので、映像のトラックがない配信として扱う
-    // (FFmpeg 6.1 で初期化情報を出さないエンコーダの HEVC を送ると、中身が空の初期化情報しか届かない: rtmp-handler の handle_hevc)
+    // 初期化情報より先に映像のフレームが届いたら、その映像は使わずに、映像のトラックがない配信として扱う
+    // (FFmpeg 6.1 で初期化情報を出さないエンコーダの HEVC を送ると、中身が空の初期化情報しか届かない: rtmp-handler の handle_hevc。
+    //  その時のフレームは開始コード付き (Annex B) のままで、FFmpeg はその中の VPS/SPS/PPS から hvcC を作って MP4 にするが (H.264 なら SPS/PPS から avcC)、
+    //  このサーバは届いた初期化情報で初期化セグメントを作り、フレームは長さ付きの NAL Unit としてそのまま入れるので扱わない)
     if (payload.kind === 'Video' && payload.packetType !== PacketType.SequenceStart && this.videoTrack == null && this.unsupportedVideoCodec == null) {
       logger.warn('Video sequence header is missing, video is ignored', { codec: payload.codec });
       this.unsupportedVideoCodec = payload.codec;

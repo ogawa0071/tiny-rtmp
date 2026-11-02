@@ -75,7 +75,7 @@ const handle_avc = (reader: ByteReader): AVCData | null => {
       // (エンコーダが初期化情報 (グローバルヘッダ) を出さない時や、ADTS の AAC (MPEG-TS や HLS の入力など) を -c copy で送る時)
       // 本当の初期化情報は、最初のフレームから取り出して、そのフレームの直前に送り直してくるので、中身が空のものは無視する
       // (H.264 の初期化情報を最初のフレームから取り出して送り直すのは FFmpeg 6.1 以降。それより前の FFmpeg は送り直さず、
-      //  フレームも開始コード付き (Annex B) のまま送ってくるので、その映像は使えない)
+      //  フレームも開始コード付き (Annex B) のまま送ってくるので、その映像は使わない: mpegts-transmuxer.mts の feed)
       const avcDecoderConfigurationRecord = reader.read();
       if (avcDecoderConfigurationRecord.byteLength === 0) { return null; }
       return { codec: 'AVC', packetType, avcDecoderConfigurationRecord };

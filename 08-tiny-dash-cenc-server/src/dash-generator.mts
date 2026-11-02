@@ -39,7 +39,7 @@ export default class DASHGenerator {
   private onMetadata: AMF0Object | null = null;
   // 最初に届いた音声のメッセージの SoundFormat (AudioTagHeader の先頭 4bit: 10 は AAC、2 は MP3、9 は Enhanced RTMP の形式)
   private firstAudioFormat: number | null = null;
-  // 初期化情報より先に H.264 のフレームが届いたか (その映像は fMP4 にできないので、MPD に載せない: feed)
+  // 初期化情報より先に H.264 のフレームが届いたか (その映像は使わずに、MPD に載せない: feed)
   private videoSequenceHeaderMissing = false;
   // MPD に載せるトラック (MPD を作れるようになった時に決めて、後から増やしたり減らしたりしない: decideTracks)
   private tracks: { video: boolean; audio: boolean; } | null = null;
@@ -238,8 +238,10 @@ export default class DASHGenerator {
           this.parameterSets = read_parameter_sets(read_avc_decoder_configuration_record(payload.avcDecoderConfigurationRecord));
           return;
         }
-        // 初期化情報より先に映像のフレームが届いたら、その映像は fMP4 にできないので、映像のトラックがない配信として扱う (09 の HLSGenerator と同じ)
-        // (FFmpeg 6.0 以前で初期化情報を出さないエンコーダの H.264 を送ると、中身が空の初期化情報しか届かない: 03 の handle_avc)
+        // 初期化情報より先に映像のフレームが届いたら、その映像は使わずに、映像のトラックがない配信として扱う (09 の HLSGenerator と同じ)
+        // (FFmpeg 6.0 以前で初期化情報を出さないエンコーダの H.264 を送ると、中身が空の初期化情報しか届かない: 03 の handle_avc。
+        //  その時のフレームは開始コード付き (Annex B) のままで、FFmpeg はその中の SPS/PPS から avcC を作って MP4 にするが、
+        //  このサーバは届いた初期化情報で初期化セグメントを作り、フレームは長さ付きの NAL Unit としてそのまま入れるので扱わない)
         if (this.avcDecoderConfigurationRecord == null && !this.videoSequenceHeaderMissing) {
           logger.warn('Video sequence header is missing, video is ignored', { codec: payload.codec });
           this.videoSequenceHeaderMissing = true;

@@ -45,7 +45,7 @@ const handle_hevc = (packetType: number, reader: ByteReader): HEVCData | null =>
       // 中身が空の初期化情報は無視する (FFmpeg はエンコーダが初期化情報を出さない時、空の初期化情報を先に送り、最初のフレームの直前に本当の初期化情報を送り直す)
       // (従来の形式の AVC と AAC も同じ: 03-tiny-http-ts-server の handle_avc)
       // (ただし HEVC の初期化情報を送り直すのは FFmpeg 7.0 以降。FFmpeg 6.1 は送り直さず、フレームも開始コード付き (Annex B) のまま送ってくるので、
-      //  その映像は使えない: HLSGenerator は初期化情報より先にフレームが届いた映像を、ないものとして扱う)
+      //  その映像は使わない: HLSGenerator は初期化情報より先にフレームが届いた映像を、ないものとして扱う)
       const hevcDecoderConfigurationRecord = reader.read();
       if (hevcDecoderConfigurationRecord.byteLength === 0) { return null; }
       return { codec: 'HEVC', packetType, hevcDecoderConfigurationRecord };

@@ -88,18 +88,21 @@ const handle = async (connection: Duplex) => {
   let waiting = true;
   // 最初の映像・音声のメッセージの timestamp (待った長さを測る)
   let first: number | null = null;
-  // 溜めていたものから順に TS パケットにして、視聴者に送る
+  // 溜めていたものから順に TS パケットにして、1 つの Buffer につなげてから視聴者に送る
+  // (Node.js は 1 つの tick に書いた Buffer を tick の終わりにまとめて OS に渡すが、1 回の writev で渡せる数には上限 (Linux では 1024 個) があり、2 回渡しても残った分は後のイベントループで渡す。
+  //  TS パケット (188 バイト) ごとに書くと、大きなキーフレームや待っていた間の分などで 1 つの tick に 2000 個より多く書いた時に、残りを渡し終わるまでは全て writableLength に数えられ、
+  //  速い視聴者でも highWaterMark を超えて切断してしまう: viewer.write)
   const send = (): void => {
-    const packets = pending.splice(0).flatMap((iterable) => [... iterable]);
+    const data = Buffer.concat(pending.splice(0).flatMap((iterable) => [... iterable]));
     if (waiting) {
-      // 待っていた間の分は、待っていた視聴者にまとめて送ることになる (速い視聴者でも送り終わるまでに時間がかかるので、その分は詰まりとみなさない)
-      const bytes = packets.reduce((sum, packet) => sum + packet.byteLength, 0);
-      for (const viewer of viewers) { viewer.initialBytes = bytes; }
+      // 待っていた間の分は、待っていた視聴者にまとめて送ることになる (速い視聴者でも送り終わるまでに時間がかかるので、その分は詰まりとみなさない。
+      //  ただし OS がこの分を全部受け取るまでは writableLength に全部数えられるので、その間に後から書いた分が highWaterMark を超えると切断する)
+      for (const viewer of viewers) { viewer.initialBytes = data.byteLength; }
       waiting = false;
     }
-    for (const packet of packets) {
-      for (const viewer of viewers) { viewer.write(packet); }
-    }
+    // TS パケットにならないメッセージ (初期化情報や onMetaData など) では何も書かない
+    if (data.byteLength === 0) { return; }
+    for (const viewer of viewers) { viewer.write(data); }
   };
 
   try {
@@ -157,7 +160,9 @@ const web_server = http.createServer({ highWaterMark }, (req, res) => {
       // highWaterMark を超えて送信が詰まっている視聴者は切断する
       // ただし Node.js の http は、同じ tick に書いたデータを tick の終わりにまとめて送るので、それまでは全て writableLength に数えられる
       // (1 つの tick に何メッセージ分も書くと、詰まっていなくても highWaterMark を超え、res.write も false を返す)
-      // そこで tick の終わりに送った後 (setImmediate) に、まだ送れずに残っているバイト数で確かめる (配信が終わって end した後は、残りを送り終わるまで待つ)
+      // そこで tick の終わりに送った後 (setImmediate) に、writableLength で確かめる (配信が終わって end した後は、残りを送り終わるまで待つ)
+      // (writableLength は、まとめて送ったデータを OS が全部受け取るまで、受け取った分も含めて全部数え、その後に書いた分も数える。
+      //  送り始めたばかりの TCP 接続は送信バッファが小さく、一度に少ししか受け取らないので、ネットワーク越しの視聴者は速くても、配信の始めなどに highWaterMark を超えて切断されることがある)
       viewer.checking = true;
       setImmediate(() => {
         viewer.checking = false;

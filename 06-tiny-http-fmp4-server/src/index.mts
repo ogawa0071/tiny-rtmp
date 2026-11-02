@@ -131,8 +131,11 @@ const web_server = http.createServer({ highWaterMark }, (req, res) => {
       // highWaterMark を超えて送信が詰まっている視聴者は切断する
       // ただし Node.js の http は、同じ tick に書いたデータを tick の終わりにまとめて送るので、それまでは全て writableLength に数えられる
       // (配信の始めなどにメッセージがまとめて届くと、1 つの tick に何フレーム分も書くので、詰まっていなくても highWaterMark を超える)
-      // そこで tick の終わりに送った後 (setImmediate) に、まだ送れずに残っているバイト数で確かめる (配信が終わって end した後は、残りを送り終わるまで待つ)
-      // (視聴を始めた時にまとめて送ったデータは、速い視聴者でも送り終わるまでに時間がかかるので、その分は詰まりとみなさない)
+      // そこで tick の終わりに送った後 (setImmediate) に、writableLength で確かめる (配信が終わって end した後は、残りを送り終わるまで待つ)
+      // (writableLength は、まとめて送ったデータを OS が全部受け取るまで、受け取った分も含めて全部数え、その後に書いた分も数える。
+      //  送り始めたばかりの TCP 接続は送信バッファが小さく、一度に少ししか受け取らないので、ネットワーク越しの視聴者は速くても、配信の始めなどに highWaterMark を超えて切断されることがある)
+      // (視聴を始めた時にまとめて送ったデータは、速い視聴者でも送り終わるまでに時間がかかるので、その分は詰まりとみなさない。
+      //  ただし OS がそれを全部受け取るまでは writableLength に全部数えられるので、その間に後から書いた分が highWaterMark を超えると切断する)
       viewer.checking = true;
       setImmediate(() => {
         viewer.checking = false;
