@@ -225,22 +225,28 @@ describe('Streams with video', () => {
 
 describe('H.264 whose real sequence header never arrives (FFmpeg 6.0 or earlier with an encoder without global header)', () => {
   // 中身が空の初期化情報しか届かず、フレームは開始コード付き (Annex B) のまま届く (このサーバはフレームを長さ付きの NAL Unit として読むので、その映像は使わない)
-  test('with AAC: the video is reported as ignored, and segments are cut at the AAC frames with a PMT that lists only AAC', async () => {
+  test.each([
+    ['with AAC', 0],
+    // B フレームがあると、FFmpeg は映像の DTS が負にならないように全体を遅らせるので、最初の AAC のフレームは最初のキーフレームより後に届く
+    // (30 fps で B フレーム 2 枚、44.1 kHz の AAC なら 44 ミリ秒後。その映像を使わないと分かるのはそのキーフレームが届いた時なので、そのキーフレームからはセグメントを始めない)
+    ['with AAC starting 44 ms after the first keyframe (FFmpeg with B-frames)', 44],
+  ])('%s: the video is reported as ignored, and segments are cut at the AAC frames with a PMT that lists only AAC', async (_, delay) => {
     const generator = new HLSGenerator();
     expect(warnings(() => {
       generator.feed(onmetadata({ videocodecid: 7, audiocodecid: 10 }));
       generator.feed(video(0, EMPTY_AVC_SEQUENCE_HEADER));
       generator.feed(audio(0, AAC_SEQUENCE_HEADER));
-      // 10 fps の映像 (1 秒ごとにキーフレーム) と AAC
+      // 10 fps の映像 (1 秒ごとにキーフレーム) と、delay ミリ秒から始まる AAC
       let i = 0;
       for (let t = 0; t < 4500; t += 100) {
         generator.feed(video(t, avc(t % 1000 === 0 ? 1 : 2)));
-        for (; aac(i) < t + 100; i++) { generator.feed(audio(aac(i), AAC_FRAME)); }
+        for (; delay + aac(i) < t + 100; i++) { generator.feed(audio(delay + aac(i), AAC_FRAME)); }
       }
     })).toStrictEqual(['Video sequence header is missing, video is ignored']);
 
     expect(await generator.published()).toStrictEqual(true);
-    // 音声だけの配信と同じく、1 秒以上たってから最初の AAC のフレームで区切る
+    // 音声だけの配信と同じく、最初の AAC のフレームから始めて、1 秒以上たってから最初の AAC のフレームで区切る (FFmpeg の HLS 出力も、映像のない配信は最初の音声のフレームから始める)
+    // (使わないキーフレームから始めると、最初のセグメントに何も入っていない 44 ミリ秒が含まれて、その後の区切りもずれる)
     expect(extinfs(generator.m3u8())).toStrictEqual([1.003, 1.002, 1.003, 1.003]);
     for (const segment of segments(generator)) {
       expect(pids(segment).slice(0, 2)).toStrictEqual([0, 256]);

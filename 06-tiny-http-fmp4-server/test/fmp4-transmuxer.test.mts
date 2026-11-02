@@ -384,6 +384,29 @@ describe('Sequence headers without the configuration', () => {
       expect(fragments.find(({ independent }) => independent)).toBe(videoFragments[0]);
     }
   });
+
+  test.each([
+    // 1500 ms に届けば 0 ms のキーフレームから、3500 ms に届けば 2000 ms のキーフレームから送られる (それより前の GOP は取っておかない)
+    [1500, 0],
+    [3500, 2000],
+  ])('FFmpeg -c copy from ADTS AAC whose audio starts later, 2-second GOP, the real AAC sequence header at %i ms: viewers can start from the newest keyframe before it (%i ms)', (header, start) => {
+    const transmuxer = new FMP4Transmuxer();
+    transmuxer.feed(metadata(7, 10));
+    transmuxer.feed(video(0, AVC_SEQUENCE_HEADER));
+    transmuxer.feed(audio(0, Buffer.from('af00', 'hex')));
+    const fragments: FMP4Fragment[] = [];
+    for (let t = 0; t < 6000; t += 100) {
+      // GOP が UNDECLARED_TRACK_WAIT (1 秒) より長いので、本当の AAC の初期化情報が届く前の 1 秒には映像のキーフレームがない
+      if (t === header) { transmuxer.feed(audio(t, AAC_SEQUENCE_HEADER)); }
+      fragments.push(... transmuxer.feed(video(t, avc(t % 2000 === 0 ? 1 : 2))));
+      if (t >= header) { fragments.push(... transmuxer.feed(audio(t + 8, AAC_FRAME))); }
+    }
+
+    // 最後のフレーム (5900 ms) は長さが分からないので、まだ送られない
+    const videoFragments = fragments.filter((fragment) => trackId(fragment) === 1);
+    expect(videoFragments.map(decodeTime)).toStrictEqual(Array.from({ length: (5900 - start) / 100 }, (_, i) => start + i * 100));
+    expect(fragments.find(({ independent }) => independent)).toBe(videoFragments[0]);
+  });
 });
 
 describe('RTMP timestamps that wrap around', () => {

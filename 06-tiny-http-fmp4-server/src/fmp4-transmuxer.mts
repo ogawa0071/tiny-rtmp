@@ -27,7 +27,7 @@ const AUDIO_TRACK_ID = 2;
 // onMetaData にコーデックが書かれていない時に、まだ初期化情報が届いていないトラックを、最初のフレームから待つ長さ (ミリ秒)
 const UNDECLARED_TRACK_WAIT = 1000;
 // 初期化情報を待っている間に取っておくフレームの数の上限 (1 秒間に届くフレームの数より十分に多くする)
-// (timestamp が進まない配信では、UNDECLARED_TRACK_WAIT の間に届いたフレームだけにしても減らないので、取っておくフレームが増え続けないようにする)
+// (キーフレームがなかなか届かない配信や timestamp が進まない配信では、keep で取っておくフレームが減らないので、取っておくフレームが増え続けないようにする)
 const MAX_WAITING_FRAMES = 1000;
 
 // 視聴者に送る fMP4 の断片 (moof + mdat)
@@ -124,11 +124,14 @@ export default class FMP4Transmuxer {
   }
 
   // 初期化セグメントを作れるまでの間に届いたフレームを取っておく
-  // 初期化情報がいつまでも届かないこともあるので、取っておくのは最近の UNDECLARED_TRACK_WAIT の間に届いたフレームだけ (多くても MAX_WAITING_FRAMES 個) にする
+  // 初期化情報がいつまでも届かないこともあるので、取っておくのは最近の UNDECLARED_TRACK_WAIT の間に届いたフレームと、
+  // 一番新しい映像のキーフレームから後のフレームだけ (多くても MAX_WAITING_FRAMES 個) にする
+  // (GOP が UNDECLARED_TRACK_WAIT より長いと、最近のフレームにはキーフレームがないことがあり、それだけでは視聴者が見始められない)
   // (古い方から捨てるので、取っておいたフレームの途中に間は空かない)
   private keep(frame: Frame): void {
     this.waitingFrames.push(frame);
-    this.waitingFrames = this.waitingFrames.filter(({ timestamp }) => frame.timestamp - timestamp < UNDECLARED_TRACK_WAIT).slice(-MAX_WAITING_FRAMES);
+    const keyframe = this.waitingFrames.findLastIndex((kept) => kept.kind === 'Video' && kept.frameType === FrameType.KEY_FRAME);
+    this.waitingFrames = this.waitingFrames.filter(({ timestamp }, index) => frame.timestamp - timestamp < UNDECLARED_TRACK_WAIT || (keyframe >= 0 && index >= keyframe)).slice(-MAX_WAITING_FRAMES);
   }
 
   // RTMP のメッセージを fMP4 の断片にする (初期化セグメントを作った時は、待っている間に取っておいたフレームの断片もまとめて返す)

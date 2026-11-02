@@ -271,22 +271,26 @@ describe('Partial segments in the middle of a GOP', () => {
 
 describe('H.264 whose real sequence header never arrives (FFmpeg 6.0 or earlier with an encoder without global header)', () => {
   // HLS (04-tiny-hls-server) と同じく、その映像は使わずに、映像のない配信として扱う
-  test('with AAC: the video is reported as ignored, and every partial segment is cut at the AAC frames with a PMT that lists only AAC', async () => {
+  test.each([
+    ['with AAC', 0],
+    // B フレームがあると、最初の AAC のフレームは最初のキーフレームより後に届く (HLS (04-tiny-hls-server) と同じく、使わないキーフレームからはセグメントを始めない)
+    ['with AAC starting 44 ms after the first keyframe (FFmpeg with B-frames)', 44],
+  ])('%s: the video is reported as ignored, and every partial segment is cut at the AAC frames with a PMT that lists only AAC', async (_, delay) => {
     const generator = new LLHLSGenerator({ liveWindowLength: 3, partialSegmentDuration: 0.3 });
     expect(warnings(() => {
       generator.feed(onmetadata({ videocodecid: 7, audiocodecid: 10 }));
       generator.feed(video(0, EMPTY_AVC_SEQUENCE_HEADER));
       generator.feed(audio(0, AAC_SEQUENCE_HEADER));
-      // 10 fps の映像 (1 秒ごとにキーフレーム) と AAC
+      // 10 fps の映像 (1 秒ごとにキーフレーム) と、delay ミリ秒から始まる AAC
       let i = 0;
       for (let t = 0; t < 4500; t += 100) {
         generator.feed(video(t, avc(t % 1000 === 0 ? 1 : 2)));
-        for (; aac(i) < t + 100; i++) { generator.feed(audio(aac(i), AAC_FRAME)); }
+        for (; delay + aac(i) < t + 100; i++) { generator.feed(audio(delay + aac(i), AAC_FRAME)); }
       }
     })).toStrictEqual(['Video sequence header is missing, video is ignored']);
 
     expect(await generator.published()).toStrictEqual(true);
-    // 音声だけの配信と同じく、AAC のフレームで区切り、どのパーシャルセグメントも INDEPENDENT=YES にする
+    // 音声だけの配信と同じく、最初の AAC のフレームから始めて AAC のフレームで区切り、どのパーシャルセグメントも INDEPENDENT=YES にする
     expect(extinfs(generator)).toStrictEqual([1.002, 1.003, 1.003]);
     expect(parts(generator).every((part) => part.endsWith(',INDEPENDENT=YES'))).toStrictEqual(true);
     for (const [name, data] of await partialSegments(generator)) {

@@ -335,6 +335,25 @@ describe('AAC sequence header without the configuration', () => {
       expect(extinfs(generator)).toStrictEqual([1, 1, 0.9]);
     }
   });
+
+  test.each([
+    // 1500 ms に届けば 0 ms のキーフレームから、3500 ms に届けば 2000 ms のキーフレームからセグメントを始める (それより前の GOP は取っておかない)
+    [1500, [2, 2, 1.9]],
+    [3500, [2, 1.9]],
+  ])('FFmpeg -c copy from ADTS AAC whose audio starts later, 2-second GOP, the real AAC sequence header at %i ms: the first segment starts at the newest keyframe before it', (header, expected) => {
+    const generator = new HLSGenerator();
+    generator.feed(metadata(7, 10));
+    generator.feed(video(0, AVC_SEQUENCE_HEADER));
+    generator.feed(audio(0, Buffer.from('af00', 'hex')));
+    for (let t = 0; t < 6000; t += 100) {
+      // GOP が UNDECLARED_TRACK_WAIT (1 秒) より長いので、本当の AAC の初期化情報が届く前の 1 秒には映像のキーフレームがない
+      if (t === header) { generator.feed(audio(t, AAC_SEQUENCE_HEADER)); }
+      generator.feed(video(t, avc(t % 2000 === 0 ? 1 : 2)));
+      if (t >= header) { generator.feed(audio(t + 8, AAC_FRAME)); }
+    }
+    generator.end();
+    expect(extinfs(generator)).toStrictEqual(expected);
+  });
 });
 
 describe('Enhanced RTMP video of the second track', () => {
