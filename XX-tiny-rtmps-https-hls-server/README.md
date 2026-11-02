@@ -34,8 +34,8 @@ const options = {
 +const key = fs.readFileSync(args.key);
 +const cert = fs.readFileSync(args.cert);
 
--const rtmp_server = net.createServer({ noDelay: true }, async (connection) => {
-+const rtmp_server = tls.createServer({ noDelay: true, key, cert }, async (connection) => {
+-const rtmp_server = net.createServer({ noDelay: true }, (connection) => {
++const rtmp_server = tls.createServer({ noDelay: true, key, cert }, (connection) => {
 
 -const web_server = http.createServer(async (req, res) => {
 +const web_server = https.createServer({ key, cert }, async (req, res) => {
@@ -60,7 +60,7 @@ node src/index.mts --rtmp 1935 --web 8000 --key server.key --cert server.crt --a
 また、vite を使ってバンドルして javascript にまとめられます。
 
 ```bash
-# dist/tiny-rtmps-https-hls-server.mjs にバンドルした結果を出力
+# dist/tiny-rtmps-https-hls-server.js (CommonJS), dist/tiny-rtmps-https-hls-server.mjs (ES Modules) にバンドルした結果を出力
 yarn build
 ```
 

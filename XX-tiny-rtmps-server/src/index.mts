@@ -7,7 +7,7 @@ import handle_rtmp from '../../01-tiny-rtmp-server/src/rtmp-accepter.mts';
 import { AuthConfiguration } from '../../01-tiny-rtmp-server/src/auth.mts';
 import intercepter from '../../01-tiny-rtmp-server/src/rtmp-intercepter.mts';
 import { run } from '../../01-tiny-rtmp-server/src/rtmp-session.mts';
-import { logger } from '../../01-tiny-rtmp-server/src/logger.mts';
+import { ConsoleLogger, LogLevel, logger, registerLogger } from '../../01-tiny-rtmp-server/src/logger.mts';
 
 const options = {
   port: {
@@ -28,8 +28,9 @@ const options = {
     default: false,
   },
 } as const satisfies ParseArgsOptionsConfig;
-const { values: args } = parseArgs({ options, tokens: true });
-if (Number.isNaN(Number.parseInt(args.port, 10))) {
+const { values: args } = parseArgs({ options });
+const port = Number.parseInt(args.port, 10);
+if (Number.isNaN(port)) {
   console.error('Please Specify Valid PORT number');
   process.exit(1);
 }
@@ -41,21 +42,23 @@ if (args.cert == null) {
   console.error('Please Specify Valid SSL/TLS cert');
   process.exit(1);
 }
-const port = Number.parseInt(args.port, 10);
-const output = args.flv == null ? null : args.flv === '-' ? process.stdout : fs.createWriteStream(args.flv);
+const flv = args.flv;
 const intercept = args.intercept;
 const key = fs.readFileSync(args.key);
 const cert = fs.readFileSync(args.cert);
 const auth = AuthConfiguration.noAuth();
+// 配信が始まるたびに FLV の出力先を開く (配信の終了時に閉じられる)
+const open_flv = flv == null ? undefined : () => flv === '-' ? process.stdout : fs.createWriteStream(flv);
+// intercept 時は送受信したメッセージを DEBUG で出力するので、ログレベルを下げる
+registerLogger(new ConsoleLogger(intercept ? LogLevel.DEBUG : LogLevel.INFO));
 
-const server = tls.createServer({ noDelay: true, key, cert }, async (connection) => {
-  await run(async () => {
+const server = tls.createServer({ noDelay: true, key, cert }, (connection) => {
+  run(async () => {
     try {
       const proxy = intercept ? intercepter(connection) : connection;
-      await handle_rtmp(proxy, auth, output ?? undefined);
+      await handle_rtmp(proxy, auth, open_flv);
     } catch (e) {
-      const message = e instanceof Error ? e.message : String(e);
-      logger.error(`RTMP session error: ${message}`, { stack: e instanceof Error ? e.stack : undefined });
+      logger.error('RTMP session error', { error: e });
     }
   });
 });

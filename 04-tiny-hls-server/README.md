@@ -4,7 +4,7 @@
 
 ## 主要コンポーネント
 
-- hls-generator.mts - HLSプレイリストとセグメント生成処理
+- hls-generator.mts - [HTTP-TS配信](../03-tiny-http-ts-server/)のMPEG-TSをキーフレームで区切り、HLSのセグメントにする処理 (映像 (H.264) のない配信と分かれば (onMetaData や、最初に届いた映像で分かる: [mpegts-transmuxer.mts](../03-tiny-http-ts-server/src/mpegts-transmuxer.mts))、音声のフレームで 1 秒以上ごとに区切る)
 - media-playlist.mts - M3U8プレイリストファイル生成
 - segment.mts - MPEG-TSセグメント管理
 - index.mts - RTMPとHTTPサーバの統合管理
@@ -27,7 +27,7 @@ node src/index.mts --app myapp --streamKey mystreamkey --bandwidth 2000000
 また、vite を使ってバンドルして javascript にまとめられます。
 
 ```bash
-# dist/index.cjs, dist/index.mjs にバンドルした結果を出力
+# dist/tiny-hls-server.js (CommonJS), dist/tiny-hls-server.mjs (ES Modules) にバンドルした結果を出力
 yarn build
 ```
 
@@ -49,3 +49,5 @@ http://localhost:8000/myapp/mystreamkey/playlist.m3u8
 ```
 http://localhost:8000/myapp/mystreamkey/{番号}.ts
 ```
+
+セグメントの番号は配信を始めた時刻 (UNIX 時間を 0.1 秒単位にしたもの) から始まります (前の配信の番号がそれより進んでいれば、その続きから)。配信し直しても前の配信と URL が重ならないようにするためです。

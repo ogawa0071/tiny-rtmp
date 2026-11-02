@@ -5,9 +5,10 @@ import { parseArgs } from 'node:util';
 import type { ParseArgsOptionsConfig } from 'node:util';
 
 import { run } from '../../01-tiny-rtmp-server/src/rtmp-session.mts';
-import { logger } from '../../01-tiny-rtmp-server/src/logger.mts';
+import { ConsoleLogger, logger, registerLogger } from '../../01-tiny-rtmp-server/src/logger.mts';
 
 import handle_rtmp from '../../02-tiny-http-flv-server/src/rtmp-accepter.mts';
+import { congestion_checker } from '../../02-tiny-http-flv-server/src/congestion.mts';
 import { AuthConfiguration } from '../../01-tiny-rtmp-server/src/auth.mts';
 
 import FMP4Transmuxer from './fmp4-transmuxer.mts';
@@ -34,11 +35,12 @@ const options = {
     type: 'string',
   },
 } as const satisfies ParseArgsOptionsConfig;
-const { values: args } = parseArgs({ options, tokens: true });
-if (Number.isNaN(Number.parseInt(args.rtmp, 10))) {
-  console.error('Please Specify valid port number'); process.exit(1);
-}
-if (Number.isNaN(Number.parseInt(args.web, 10))) {
+const { values: args } = parseArgs({ options });
+const port = Number.parseInt(args.rtmp, 10);
+const web = Number.parseInt(args.web, 10);
+const highWaterMark = args.highWaterMark != null ? Number.parseInt(args.highWaterMark, 10) : undefined;
+const bandwidth = args.bandwidth != null ? Number.parseInt(args.bandwidth, 10) : undefined;
+if (Number.isNaN(port) || Number.isNaN(web)) {
   console.error('Please Specify valid port number'); process.exit(1);
 }
 if (args.app == null) {
@@ -47,89 +49,98 @@ if (args.app == null) {
 if (args.streamKey == null) {
   console.error('Please Specify valid streamKey'); process.exit(1);
 }
-if (args.highWaterMark != null && Number.isNaN(Number.parseInt(args.highWaterMark, 10))) {
+if (Number.isNaN(highWaterMark)) {
   console.error('Please Specify valid highwatermark'); process.exit(1);
 }
-if (args.bandwidth != null && Number.isNaN(Number.parseInt(args.bandwidth, 10))) {
+if (Number.isNaN(bandwidth)) {
   console.error('Please Specify valid bandwidth'); process.exit(1);
 }
-const port = Number.parseInt(args.rtmp, 10);
-const web = Number.parseInt(args.web, 10);
 const app = args.app;
 const streamKey = args.streamKey;
-const highWaterMark = args.highWaterMark != null ? Number.parseInt(args.highWaterMark, 10) : undefined;
-const bandwidth = args.bandwidth != null ? Number.parseInt(args.bandwidth, 10) : undefined;
 const auth = AuthConfiguration.simpleAuth(app, streamKey);
+registerLogger(new ConsoleLogger());
 
-type StreamingInformation = [writeFn: (buffer: Buffer) => void, exitFn: () => void, initialized: boolean];
-const streaming = new Map<number, StreamingInformation>();
+type Viewer = {
+  write: (buffer: Buffer) => void;
+  exit: () => void;
+  initialized: boolean; // 初期化セグメントを送ったか
+  initialBytes: number; // 視聴を始めた時にまとめて送ったバイト数 (初期化セグメントと、待っている間に取っておいたフレームを含む断片)
+};
+const viewers = new Set<Viewer>();
+
 const handle = async (connection: Duplex) => {
   const rtmp_to_fmp4 = new FMP4Transmuxer();
+  let published = false;
 
   try {
     for await (const message of handle_rtmp(connection, { auth, limit: { bandwidth } })) {
-      const frag = rtmp_to_fmp4.feed(message);
-      if (frag == null) { continue; }
-
-      for (const stream of streaming.values()) {
-        const [write] = stream;
-        if (stream[2]) {
-          const init = rtmp_to_fmp4.initialize();
-          if (init == null) { continue; }
-          write(init);
-          stream[2] = false;
+      published = true;
+      // 初期化セグメントを作った時は、それまで待っていたフレームの断片もまとめて返ってくる
+      const fragments = rtmp_to_fmp4.feed(message);
+      for (const [index, fragment] of fragments.entries()) {
+        for (const viewer of viewers) {
+          // 視聴を始めた視聴者には、最初に初期化セグメントを送る
+          // 映像は、キーフレームから送り始める (それより前のフレームは、参照するフレームがないのでデコードできない)
+          if (!viewer.initialized) {
+            const initialize = rtmp_to_fmp4.initialize();
+            if (initialize == null || !fragment.independent) { continue; }
+            // 初期化セグメントと、ここから後の断片はまとめて送ることになる
+            viewer.initialBytes = fragments.slice(index).reduce((bytes, { data }) => bytes + data.byteLength, initialize.byteLength);
+            viewer.write(initialize);
+            viewer.initialized = true;
+          }
+          viewer.write(fragment.data);
         }
-        {
-          write(frag);
-        }
-      };
+      }
     }
   } catch (e) {
-    const message = e instanceof Error ? e.message : String(e);
-    logger.error(`RTMP session error: ${message}`, e instanceof Error ? { stack: e.stack } : undefined);
+    logger.error('RTMP session error', { error: e });
   } finally {
-    for (const [,end] of streaming.values()) { end(); }
+    // 配信していた接続が終わったら視聴も終わらせる (認証に失敗した接続などでは何もしない)
+    if (published) {
+      for (const viewer of viewers) { viewer.exit(); }
+    }
   }
 };
 
-const rtmp_server = net.createServer({ noDelay: true }, async (connection) => {
-  await run(async () => {
-    await handle(connection);
-  });
+const rtmp_server = net.createServer({ noDelay: true }, (connection) => {
+  run(() => handle(connection));
 });
 rtmp_server.listen(port);
 
-let viewers = 0;
 const web_server = http.createServer({ highWaterMark }, (req, res) => {
-  if (req.url == null) {
+  // new URL は解析できない URL (例: //[) だと例外を投げてサーバごと落ちるので、代わりに null を返す URL.parse を使う
+  const url = URL.parse(req.url ?? '/', `http://localhost:${web}`);
+  if (url == null || !(req.method === 'GET' && url.pathname === `/${app}/${streamKey}`)) {
     res.writeHead(404, { 'access-control-allow-origin': '*' });
     res.end();
     return;
   }
-  const url = new URL(req.url, `http://localhost:${web}`);
-  if (!(req.method === 'GET' && url.pathname === `/${app}/${streamKey}`)) {
-    res.writeHead(404, { 'access-control-allow-origin': '*' });
-    res.end();
-    return;
-  }
-  const viewer = viewers++;
+  // データは初期化セグメントが揃ってから (映像のキーフレームから) 送るので、レスポンスヘッダだけ先に送る
   res.writeHead(200, {
-    'content-type': 'application/octet-stream',
+    'content-type': 'video/mp4',
     'access-control-allow-origin': '*',
   });
+  res.flushHeaders();
 
-  const write = (chunk: Buffer) => {
-    if (res.closed) { return; }
-    if (!res.write(chunk) && highWaterMark != null) { res.destroy(); }
+  // highWaterMark を超えて送信が詰まっている視聴者は切断する (同じ tick に書いた分を送った後に確かめる: congestion.mts)
+  // (視聴を始めた時に、初期化セグメントと待っている間に取っておいたフレームをまとめて送った視聴者は、その分を詰まりとみなさない)
+  const check_congestion = congestion_checker(res, highWaterMark, () => viewer.initialBytes);
+  const viewer: Viewer = {
+    write: (chunk: Buffer) => {
+      if (res.closed) { return; }
+      res.write(chunk);
+      check_congestion();
+    },
+    exit: () => { res.end(); viewers.delete(viewer); },
+    initialized: false,
+    initialBytes: 0,
   };
+  viewers.add(viewer);
 
-  const exit = () => { res.end(); streaming.delete(viewer); };
-  const entry = [write, exit, true] satisfies StreamingInformation;
-  streaming.set(viewer, entry);
-
-  req.on('close', exit);
-  res.on('close', exit);
-  req.on('error', exit);
-  res.on('error', exit);
+  req.on('close', viewer.exit);
+  res.on('close', viewer.exit);
+  req.on('error', viewer.exit);
+  res.on('error', viewer.exit);
 });
 web_server.listen({ port: web });

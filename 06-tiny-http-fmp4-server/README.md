@@ -30,7 +30,7 @@ node src/index.mts --app myapp --streamKey mystreamkey --highWaterMark 16384
 また、vite を使ってバンドルして javascript にまとめられます。
 
 ```bash
-# dist/index.cjs, dist/index.mjs にバンドルした結果を出力
+# dist/tiny-http-fmp4-server.js (CommonJS), dist/tiny-http-fmp4-server.mjs (ES Modules) にバンドルした結果を出力
 yarn build
 ```
 

@@ -35,16 +35,18 @@ const options = {
 +const key = fs.readFileSync(args.key);
 +const cert = fs.readFileSync(args.cert);
 
--const rtmp_server = net.createServer({ noDelay: true }, async (connection) => {
-+const rtmp_server = tls.createServer({ noDelay: true, key, cert }, async (connection) => {
+-const rtmp_server = net.createServer({ noDelay: true }, (connection) => {
++const rtmp_server = tls.createServer({ noDelay: true, key, cert }, (connection) => {
 
 -const web_server = http.createServer(async (req, res) => {
-+const web_server = http2.createSecureServer({ key, cert }, async (req, res) => {
++const web_server = http2.createSecureServer({ key, cert, allowHTTP1: true }, async (req, res) => {
 ```
+
+HTTP/2 に対応していないプレイヤー (FFmpeg など) も通常の HLS として再生できるように、HTTP/1.1 の接続も受け付けています (`allowHTTP1`)。
 
 ## 主要コンポーネント
 
-- index.mts - [RTMPS/HTTPS HLSサーバ](../07-tiny-rtmps-https-hls-server/)に[LL-HLSサーバ](../05-tiny-llhls-server/)を加え、HTTP2に対応させた実装
+- index.mts - [RTMPS/HTTPS HLSサーバ](../XX-tiny-rtmps-https-hls-server/)に[LL-HLSサーバ](../05-tiny-llhls-server/)を加え、HTTP2に対応させた実装
 
 ## 実行方法
 
@@ -64,7 +66,7 @@ node src/index.mts --rtmp 1935 --web 8000 --key server.key --cert server.crt --a
 また、vite を使ってバンドルして javascript にまとめられます。
 
 ```bash
-# dist/tiny-rtmps-http2-llhls-server.mjs にバンドルした結果を出力
+# dist/tiny-rtmps-http2-llhls-server.js (CommonJS), dist/tiny-rtmps-http2-llhls-server.mjs (ES Modules) にバンドルした結果を出力
 yarn build
 ```
 

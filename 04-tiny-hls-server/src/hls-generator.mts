@@ -1,57 +1,15 @@
-import { Writable } from 'node:stream';
-
 import type { Message } from '../../01-tiny-rtmp-server/src/message.mts';
 
-import { read_avc_decoder_configuration_record, write_annexb_avc } from '../../03-tiny-http-ts-server/src/avc.mts';
-import type { AVCDecoderConfigurationRecord } from '../../03-tiny-http-ts-server/src/avc.mts';
-import { read_audio_specific_config, write_adts_aac } from '../../03-tiny-http-ts-server/src/aac.mts';
-import type { AudioSpecificConfig } from '../../03-tiny-http-ts-server/src/aac.mts';
-
-import handle_rtmp_payload, { FrameType } from '../../03-tiny-http-ts-server/src/rtmp-handler.mts';
-import { SectionPacketizer, PESPacketizer, PCRPacketizer, write_pat, write_pmt, write_pes, StreamType } from '../../03-tiny-http-ts-server/src/mpegts.mts';
-import type { PAT, PMT } from '../../03-tiny-http-ts-server/src/mpegts.mts';
+import MPEGTSTransmuxer from '../../03-tiny-http-ts-server/src/mpegts-transmuxer.mts';
+import handle_rtmp_payload, { AACPacketType, FrameType, PacketType, TimestampUnwrapper } from '../../03-tiny-http-ts-server/src/rtmp-handler.mts';
 
 import MediaPlaylist from './media-playlist.mts';
 import { PlaylistTimestamp } from './playlist-timestamp.mts';
 
-const PMT_PID = 256;
-const PCR_PID = 257;
-const AVC_PID = 258;
-const AAC_PID = 259;
-const PAT_DATA = {
-  transport_stream_id: 0,
-  programs: [{
-    program_number: 1,
-    program_map_PID: PMT_PID,
-  }],
-} as const satisfies PAT;
-const PMT_DATA = {
-  program_number: 1,
-  pcr_pid: PCR_PID,
-  streams: [{
-    stream_type: StreamType.AVC,
-    elementary_PID: AVC_PID,
-  }, {
-    stream_type: StreamType.AAC_ADTS,
-    elementary_PID: AAC_PID,
-  }],
-} as const satisfies PMT;
-const emit_PSI_interval = 100;
-
-const timestamp_from_rtmp_to_mpegts = (timestamp: number): number => {
-  return (timestamp * 90) % 2 ** 33;
-};
-
+// HTTP-TS 配信 (03-tiny-http-ts-server) と同じ MPEG-TS を、キーフレームごとにセグメントに区切ってプレイリストで提供する
 export default class HLSGenerator {
-  private avcDecoderConfigurationRecord: AVCDecoderConfigurationRecord | null = null;
-  private audioSpecificConfig: AudioSpecificConfig | null = null;
-  private patPacketizer = new SectionPacketizer(0);
-  private pmtPacketizer = new SectionPacketizer(PMT_PID);
-  private pcrPacketizer = new PCRPacketizer(PCR_PID);
-  private avcPacketizer = new PESPacketizer(AVC_PID);
-  private aacPacketizer = new PESPacketizer(AAC_PID);
-  private last_emit_PSI_timestamp: number | null = null;
-
+  private transmuxer = new MPEGTSTransmuxer();
+  private timestamps = new TimestampUnwrapper();
   private playlist: MediaPlaylist;
 
   public constructor(liveWindowLength: number = 3) {
@@ -70,72 +28,39 @@ export default class HLSGenerator {
     return this.playlist.m3u8();
   }
 
-  public feed(message: Message): void {
+  public end(): void {
+    this.playlist.end();
+  }
+
+  public feed(received: Message): void {
+    // RTMP の timestamp が一周して戻っても (rtmp-handler.mts の TimestampUnwrapper)、時刻が戻らないように直してから使う
+    const message = this.timestamps.unwrap(received);
     const payload = handle_rtmp_payload(message);
-    if (payload == null) { return; }
+    const timestamp = PlaylistTimestamp.fromRTMP(message.timestamp);
+    // 先にこのメッセージを渡して、映像 (AVC) のない配信か (PMT に AVC の ES を載せないか) を決めさせる (MPEGTSTransmuxer の hasVideo)
+    // (TS パケットにするのは、下でセグメントの先頭にするかを決めてから、playlist.feed で取り出す時なので、PAT/PMT はその時に入る)
+    const packets = this.transmuxer.feed(message);
+    // 映像のない配信 (音声だけの配信や、このサーバで扱えない AVC 以外の映像の配信) か
+    // onMetaData を送ってこない配信ソフトや、onMetaData にコーデックを書かない配信ソフト (yasea など) では、映像が届くまで分からないので、映像のキーフレームを待つ
+    // (映像が音声より遅れて届くこともあり、音声だけで区切ったセグメントの後から映像が始まると、そこから再生を始めたプレイヤーは映像を再生できない)
+    // onMetaData に書かれていなかった映像が、音声を TS パケットにし始めた後から届いても使わない (MPEGTSTransmuxer の hasVideo)
+    // (トラックを増やす所には EXT-X-DISCONTINUITY が必要で (RFC 8216 4.3.2.3)、再生を始めたプレイヤーは途中からトラックを増やせない)
+    const audioOnly = !this.transmuxer.hasVideo();
 
-    switch (payload.kind) {
-      case 'Video':
-        if (payload.codec !== 'AVC') { return; }
-        if (payload.packetType === 0) {
-          this.avcDecoderConfigurationRecord = read_avc_decoder_configuration_record(payload.avcDecoderConfigurationRecord);
-          return;
-        }
-        if (payload.frameType === FrameType.KEY_FRAME) {
-          this.playlist.append(PlaylistTimestamp.fromRTMP(payload.timestamp));
-          this.playlist.feed([
-            ... this.patPacketizer.packetize(write_pat(PAT_DATA)),
-            ... this.pmtPacketizer.packetize(write_pmt(PMT_DATA)),
-            this.pcrPacketizer.packetize(timestamp_from_rtmp_to_mpegts(payload.timestamp)),
-          ]);
-          this.last_emit_PSI_timestamp = payload.timestamp;
-        }
-        break;
-      case 'Audio':
-        if (payload.codec !== 'AAC') { return; }
-        if (payload.packetType === 0) {
-          this.audioSpecificConfig = read_audio_specific_config(payload.audioSpecificConfig);
-          return;
-        }
-        break;
-      default:
-        return;
+    // キーフレームから新しいセグメントを始める
+    // 映像のない配信では、音声のフレームから (1 秒以上たったら) 新しいセグメントを始める (AAC のフレームはどれも単体でデコードできる)
+    const video = !audioOnly && payload?.kind === 'Video' && payload.packetType === PacketType.CodedFrames;
+    const audio = audioOnly && payload?.kind === 'Audio' && payload.packetType === AACPacketType.Raw;
+    const keyframe = video && payload.frameType === FrameType.KEY_FRAME;
+    const started = (keyframe || audio) && this.playlist.append(timestamp);
+    // セグメント単体でもデコードを始められるように、セグメントの先頭に PAT/PMT を入れる
+    // セグメントの途中のキーフレームの前にも入れる (FFmpeg の MPEG-TS も、映像のキーフレームの前には PAT/PMT を入れる)
+    // (映像のない配信では、音声のフレームごとに入れると多すぎるので、セグメントの先頭だけにする)
+    if (started || keyframe) {
+      this.transmuxer.resetPSI();
     }
 
-    if (this.last_emit_PSI_timestamp != null && (message.timestamp - this.last_emit_PSI_timestamp) >= emit_PSI_interval) {
-      this.playlist.feed([
-        ... this.patPacketizer.packetize(write_pat(PAT_DATA)),
-        ... this.pmtPacketizer.packetize(write_pmt(PMT_DATA)),
-        this.pcrPacketizer.packetize(timestamp_from_rtmp_to_mpegts(message.timestamp)),
-      ]);
-      this.last_emit_PSI_timestamp = message.timestamp;
-    }
-
-    switch (payload.kind) {
-      case 'Video':
-        if (this.avcDecoderConfigurationRecord == null) { return; }
-        this.playlist.feed(this.avcPacketizer.packetize(
-          write_pes(
-            write_annexb_avc(payload.data, this.avcDecoderConfigurationRecord),
-            0xe0, // 0b1110XXXX: H.262/H.263/H.264/H.265 Video, stream number = 0
-            timestamp_from_rtmp_to_mpegts(payload.timestamp + payload.compositionTimeOffset),
-            timestamp_from_rtmp_to_mpegts(payload.timestamp),
-            true
-          )
-        ));
-        break;
-      case 'Audio':
-        if (this.audioSpecificConfig == null) { return; }
-        this.playlist.feed(this.aacPacketizer.packetize(
-          write_pes(
-            write_adts_aac(payload.data, this.audioSpecificConfig),
-            0xc0, // 0b111XXXXX: AAC Audio, stream number = 0
-            timestamp_from_rtmp_to_mpegts(payload.timestamp),
-            null,
-            false
-          )
-        ));
-        break;
-    }
+    // 配信が終わった時は、セグメントを区切るフレーム (映像のない配信では音声のフレーム) の最後のものの時刻までで、最後のセグメントを完成させる
+    this.playlist.feed(packets, timestamp, video || audio);
   }
 }

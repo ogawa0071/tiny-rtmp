@@ -1,11 +1,12 @@
+// 受信バイト数を数え、Window Acknowledgement Size ごとに Acknowledgement を送るタイミングを通知する
 export default class AckCounter {
-  private total: number = 0;
-  private difference: number = 0;
-  private ack_window_size: number | undefined = undefined;
+  private total: number = 0; // 受信した総バイト数 (32bit で一周する)
+  private difference: number = 0; // 前回通知してから受信したバイト数
+  private ack_window_size: number | null = null;
   private callback: (bytes: number) => void;
 
-  public constructor(callback?: (bytes: number) => void) {
-    this.callback = callback ?? ((_: number) => {});
+  public constructor(callback: (bytes: number) => void = () => {}) {
+    this.callback = callback;
   }
 
   private call(): void {

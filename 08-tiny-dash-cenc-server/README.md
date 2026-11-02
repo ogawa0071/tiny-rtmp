@@ -19,20 +19,21 @@ Node.js のネイティブTypeScript実行機能により、以下のコマン�
 
 ```bash
 # RTMPポート1935、HTTPポート8000でサーバーを起動
-node src/index.mts --app myapp --streamKey mystreamkey --encryptionKeyId 9eb4050de44b4802932e27d75083e266 --encryptionKey 166634c675823c235a4a9446fad52e4d
+node src/index.mts --app myapp --streamKey mystreamkey --encryptionScheme cenc --encryptionKeyId 9eb4050de44b4802932e27d75083e266 --encryptionKey 166634c675823c235a4a9446fad52e4d
 
 # カスタムポートでサーバーを起動
-node src/index.mts --rtmp 1935 --web 8080 --app myapp --streamKey mystreamkey --encryptionKeyId 9eb4050de44b4802932e27d75083e266 --encryptionKey 166634c675823c235a4a9446fad52e4d
+node src/index.mts --rtmp 1935 --web 8080 --app myapp --streamKey mystreamkey --encryptionScheme cenc --encryptionKeyId 9eb4050de44b4802932e27d75083e266 --encryptionKey 166634c675823c235a4a9446fad52e4d
 
 # 帯域幅制限付きで起動
-node src/index.mts --app myapp --streamKey mystreamkey --encryptionKeyId 9eb4050de44b4802932e27d75083e266 --encryptionKey 166634c675823c235a4a9446fad52e4d --bandwidth 2000000
+node src/index.mts --app myapp --streamKey mystreamkey --encryptionScheme cenc --encryptionKeyId 9eb4050de44b4802932e27d75083e266 --encryptionKey 166634c675823c235a4a9446fad52e4d --bandwidth 2000000
 
 # セグメントのCache-Control max-ageを指定（秒単位、デフォルト36000）
-node src/index.mts --app myapp --streamKey mystreamkey --encryptionKeyId 9eb4050de44b4802932e27d75083e266 --encryptionKey 166634c675823c235a4a9446fad52e4d --maxage 60
+node src/index.mts --app myapp --streamKey mystreamkey --encryptionScheme cenc --encryptionKeyId 9eb4050de44b4802932e27d75083e266 --encryptionKey 166634c675823c235a4a9446fad52e4d --maxage 60
 ```
 
 ### 暗号化キーについて
 
+- `--encryptionScheme`: 必須パラメータ。`cenc` (AES-128-CTR) または `cbcs` (AES-128-CBC のパターン暗号化) を指定
 - `--encryptionKeyId`: 16バイトのキーID（32桁の16進数文字列）
 - `--encryptionKey`: 16バイトの暗号化キー（32桁の16進数文字列）
 
@@ -41,7 +42,7 @@ node src/index.mts --app myapp --streamKey mystreamkey --encryptionKeyId 9eb4050
 また、vite を使ってバンドルして javascript にまとめられます。
 
 ```bash
-# dist/index.cjs, dist/index.mjs にバンドルした結果を出力
+# dist/tiny-dash-cenc-server.js (CommonJS), dist/tiny-dash-cenc-server.mjs (ES Modules) にバンドルした結果を出力
 yarn build
 ```
 
@@ -66,17 +67,19 @@ http://localhost:8000/myapp/mystreamkey/
 
 ### Initialization Segment
 ```
-http://localhost:8000/myapp/mystreamkey/video_init.mp4
-http://localhost:8000/myapp/mystreamkey/audio_init.mp4
+http://localhost:8000/myapp/mystreamkey/video_{配信ごとの番号}_init.mp4
+http://localhost:8000/myapp/mystreamkey/audio_{配信ごとの番号}_init.mp4
 ```
+
+配信ごとの番号は配信を始めた時刻で、配信し直すと変わります (前の配信のセグメントがキャッシュから使われないようにするため)。
 
 ### Media Segment
 ```
-http://localhost:8000/myapp/mystreamkey/video_{番号}.m4s
-http://localhost:8000/myapp/mystreamkey/audio_{番号}.m4s
+http://localhost:8000/myapp/mystreamkey/video_{配信ごとの番号}_{番号}.m4s
+http://localhost:8000/myapp/mystreamkey/audio_{配信ごとの番号}_{番号}.m4s
 ```
 
 ## メモ
 
-cbcs は Constant IV にするのが一般的らしい  
-Chrome はどの指定でも動くが、Firefox は cbcs だと Constant IV でなければ動かない  
+cbcs は Constant IV (tenc に書いた全サンプル共通の IV) を使い、cenc はサンプルごとに乱数で作った IV (senc に書く) を使う  
+cbcs で Per-Sample IV を使うと、Chrome では動くが Firefox などでは復号できない  

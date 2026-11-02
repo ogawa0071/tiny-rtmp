@@ -40,11 +40,10 @@ describe('Unit Test', () => {
   });
 
   test('Type: 9 (ObjectEnd)', () => {
+    // ObjectEnd は Object の終端にしか現れない
     const target = Buffer.from('09', 'hex');
 
-    const result = read_amf0(target);
-    expect(result).length(1);
-    expect(result[0]).toBeTypeOf('symbol');
+    expect(() => read_amf0(target)).toThrowError('Unexpected ObjectEnd Marker');
   });
 
   test('Type: 10 (strict array)', () => {

@@ -1,4 +1,5 @@
-import { Duplex, PassThrough, Writable } from 'node:stream';
+import { duplexPair } from 'node:stream';
+import type { Duplex, Readable } from 'node:stream';
 import AsyncByteReader from './async-byte-reader.mts';
 import read_message from './message-reader.mts';
 import { logger } from './logger.mts';
@@ -24,61 +25,44 @@ const message_name = (message: Message): string => {
   }
 };
 
-export default (duplex: Duplex) => {
-  const input = new PassThrough();
-  const output = new PassThrough();
-  const proxy = Duplex.from({ readable: input, writable: output });
+// 片方向に流れるデータを横から読み取って、RTMP のメッセージとしてログに出す
+const dump = async (stream: Readable, direction: string, handshake_prefix: 'C' | 'S'): Promise<void> => {
+  const reader = new AsyncByteReader();
+  stream.on('data', (chunk: Buffer) => { reader.feed(chunk); });
+  stream.on('close', () => { reader.feedEOF(); });
 
-  {
-    const controller = new AbortController();
-    const reader = new AsyncByteReader({ signal: controller.signal });
-    input.pipe(new Writable({
-      write(data, _, cb) { reader.feed(data); cb(); },
-    }));
-    input.addListener('close', () => { controller.abort(); });
-    void (async () => {
-      try {
-        await reader.read(1);
-        logger.debug('CLIENT -> SERVER C0');
-        await reader.read(1536);
-        logger.debug('CLIENT -> SERVER C1');
-        await reader.read(1536);
-        logger.debug('CLIENT -> SERVER C2');
-        for await (const message of read_message(reader)) {
-          logger.debug(`CLIENT -> SERVER ${message_name(message)}`, message);
-        }
-      } finally {
-        reader.feedEOF();
-      }
-    })();
+  try {
+    await reader.read(1);
+    logger.debug(`${direction} ${handshake_prefix}0`);
+    await reader.read(1536);
+    logger.debug(`${direction} ${handshake_prefix}1`);
+    await reader.read(1536);
+    logger.debug(`${direction} ${handshake_prefix}2`);
+    for await (const message of read_message(reader)) {
+      logger.debug(`${direction} ${message_name(message)}`, message);
+    }
+  } catch {
+    // 切断されると読み取りが EOF で中断されるが、それは正常な終了なので何もしない
+  } finally {
+    reader.feedEOF();
   }
+};
 
-  {
-    const controller = new AbortController();
-    const reader = new AsyncByteReader({ signal: controller.signal });
-    output.pipe(new Writable({
-      write(data, _, cb) { reader.feed(data); cb(); },
-    }));
-    output.addListener('close', () => { controller.abort(); });
-    void (async () => {
-      try {
-        await reader.read(1);
-        logger.debug('SERVER -> CLIENT S0');
-        await reader.read(1536);
-        logger.debug('SERVER -> CLIENT S1');
-        await reader.read(1536);
-        logger.debug('SERVER -> CLIENT S2');
-        for await (const message of read_message(reader)) {
-          logger.debug(`SERVER -> CLIENT ${message_name(message)}`, message);
-        }
-      } finally {
-        reader.feedEOF();
-      }
-    })();
-  }
+export default (duplex: Duplex): Duplex => {
+  // duplexPair は仮想的なソケットの両端を作る (片方に書いたものがもう片方から読める)
+  // サーバの処理には proxy を渡し、relay と本物の接続 (duplex) の間でデータを中継する
+  const [proxy, relay] = duplexPair();
 
-  duplex.pipe(input);
-  output.pipe(duplex);
+  void dump(duplex, 'CLIENT -> SERVER', 'C');
+  void dump(relay, 'SERVER -> CLIENT', 'S');
+
+  duplex.pipe(relay);
+  relay.pipe(duplex);
+  // 本物の接続が閉じたら、サーバに渡した proxy も閉じてセッションを終わらせる (pipe は close を伝えない)
+  duplex.on('close', () => { proxy.destroy(); });
+  // 本物の接続のエラー (RST による ECONNRESET など) も proxy に伝える
+  // (pipe は自分のリスナーを外してエラーを投げ直すので、誰も受け取らないとプロセスごと落ちる)
+  duplex.on('error', (error) => { proxy.destroy(error); });
 
   return proxy;
 };

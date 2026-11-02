@@ -4,7 +4,7 @@ import ByteReader from '../../01-tiny-rtmp-server/src/byte-reader.mts';
 import ByteBuilder from '../../01-tiny-rtmp-server/src/byte-builder.mts';
 import { read_avc_decoder_configuration_record, type AVCDecoderConfigurationRecord } from '../../03-tiny-http-ts-server/src/avc.mts';
 import BitReader from '../../03-tiny-http-ts-server/src/bit-reader.mts';
-import { is_idr_nal, read_nal_unit_header, read_pic_parameter_set_data, read_seq_parameter_set_data, strip_nal_unit_header, sufficient_bits, type NALUnitHeader, type SequenceParameterSet } from '../../06-tiny-http-fmp4-server/src/avc.mts';
+import { is_idr_nal, read_nal_unit_header, read_pic_parameter_set_data, read_seq_parameter_set_data, strip_nal_unit_header, type NALUnitHeader, type PictureParameterSet, type SequenceParameterSet } from '../../06-tiny-http-fmp4-server/src/avc.mts';
 import EBSPBitReader from '../../06-tiny-http-fmp4-server/src/ebsp-bit-reader.mts';
 import { avcC, make, track } from '../../06-tiny-http-fmp4-server/src/fmp4.mts';
 import { EncryptionFormat, EncryptionScheme, encv, frma, IVType, padIV, schi, schm, sinf, tenc, type EncryptionFormatCBCS, type EncryptionFormatCENC, type SubsampleInformation } from './cenc.mts';
@@ -35,72 +35,34 @@ export const is_si_slice = (slice_type: number): boolean => {
   return is_target_slice_type(slice_type, SliceType.SI);
 };
 
-const skip_ref_pic_list_modification = (slice_type: number, reader: BitReader): void => {
-  if (!is_i_slice(slice_type) && !is_si_slice(slice_type)) {
-    const ref_pic_list_modification_flag_l0 = reader.readBool();
-    if (ref_pic_list_modification_flag_l0) {
-      while (true) {
-        const modification_of_pic_nums_idc = reader.readUEG();
-        if (modification_of_pic_nums_idc === 3) { break; }
+// ref_pic_list_modification_flag_lX が立っている時の、参照ピクチャリストの並び替えの指示を読み飛ばす
+const skip_modification_of_pic_nums = (mvc: boolean, reader: BitReader): void => {
+  while (true) {
+    const modification_of_pic_nums_idc = reader.readUEG();
+    if (modification_of_pic_nums_idc === 3) { break; }
 
-        if (modification_of_pic_nums_idc === 0 || modification_of_pic_nums_idc === 1) {
-          reader.skipUEG(); // abs_diff_pic_num_minus1
-        } else if (modification_of_pic_nums_idc === 2) {
-          reader.skipUEG(); // long_term_pic_num
-        }
-      }
-    }
-  }
-  if (is_b_slice(slice_type)) {
-    const ref_pic_list_modification_flag_l1 = reader.readBool();
-    if (ref_pic_list_modification_flag_l1) {
-      while (true) {
-        const modification_of_pic_nums_idc = reader.readUEG();
-        if (modification_of_pic_nums_idc === 3) { break; }
-
-        if (modification_of_pic_nums_idc === 0 || modification_of_pic_nums_idc === 1) {
-          reader.skipUEG(); // abs_diff_pic_num_minus1
-        } else if (modification_of_pic_nums_idc === 2) {
-          reader.skipUEG(); // long_term_pic_num
-        }
-      }
+    if (modification_of_pic_nums_idc === 0 || modification_of_pic_nums_idc === 1) {
+      reader.skipUEG(); // abs_diff_pic_num_minus1
+    } else if (modification_of_pic_nums_idc === 2) {
+      reader.skipUEG(); // long_term_pic_num
+    } else if (mvc && (modification_of_pic_nums_idc === 4 || modification_of_pic_nums_idc === 5)) {
+      reader.skipUEG(); // abs_diff_view_idx_minus1 (ref_pic_list_mvc_modification のみ)
     }
   }
 };
 
-const skip_ref_pic_list_mvc_modification = (slice_type: number, reader: BitReader): void => {
+// ref_pic_list_modification (mvc = true なら ref_pic_list_mvc_modification) を読み飛ばす
+const skip_ref_pic_list_modification = (slice_type: number, mvc: boolean, reader: BitReader): void => {
   if (!is_i_slice(slice_type) && !is_si_slice(slice_type)) {
     const ref_pic_list_modification_flag_l0 = reader.readBool();
     if (ref_pic_list_modification_flag_l0) {
-      while (true) {
-        const modification_of_pic_nums_idc = reader.readUEG();
-        if (modification_of_pic_nums_idc === 3) { break; }
-
-        if (modification_of_pic_nums_idc === 0 || modification_of_pic_nums_idc === 1) {
-          reader.skipUEG(); // abs_diff_pic_num_minus1
-        } else if (modification_of_pic_nums_idc === 2) {
-          reader.skipUEG(); // long_term_pic_num
-        } else if (modification_of_pic_nums_idc === 4 || modification_of_pic_nums_idc === 5) {
-          reader.skipUEG(); // abs_diff_view_idx_minus1
-        }
-      }
+      skip_modification_of_pic_nums(mvc, reader);
     }
   }
   if (is_b_slice(slice_type)) {
     const ref_pic_list_modification_flag_l1 = reader.readBool();
     if (ref_pic_list_modification_flag_l1) {
-      while (true) {
-        const modification_of_pic_nums_idc = reader.readUEG();
-        if (modification_of_pic_nums_idc === 3) { break; }
-
-        if (modification_of_pic_nums_idc === 0 || modification_of_pic_nums_idc === 1) {
-          reader.skipUEG(); // abs_diff_pic_num_minus1
-        } else if (modification_of_pic_nums_idc === 2) {
-          reader.skipUEG(); // long_term_pic_num
-        } else if (modification_of_pic_nums_idc === 4 || modification_of_pic_nums_idc === 5) {
-          reader.skipUEG(); // abs_diff_view_idx_minus1
-        }
-      }
+      skip_modification_of_pic_nums(mvc, reader);
     }
   }
 };
@@ -175,10 +137,19 @@ const skip_dec_ref_pic_marking = (nal_unit_type: number, reader: BitReader): voi
   }
 };
 
-export const skip_slice_header = ({ nal_ref_idc, nal_unit_type }: NALUnitHeader, reader: BitReader, all_sps: Buffer[], all_pps: Buffer[]): void => {
-  const spss = all_sps.map((sps) => read_seq_parameter_set_data(strip_nal_unit_header(sps)));
-  const ppss = all_pps.map((pps) => read_pic_parameter_set_data(strip_nal_unit_header(pps)));
+export type ParameterSets = {
+  spss: SequenceParameterSet[];
+  ppss: PictureParameterSet[];
+};
 
+export const read_parameter_sets = ({ SequenceParameterSets, PictureParameterSets }: AVCDecoderConfigurationRecord): ParameterSets => {
+  return {
+    spss: SequenceParameterSets.map((sps) => read_seq_parameter_set_data(strip_nal_unit_header(sps))),
+    ppss: PictureParameterSets.map((pps) => read_pic_parameter_set_data(strip_nal_unit_header(pps))),
+  };
+};
+
+export const skip_slice_header = ({ nal_ref_idc, nal_unit_type }: NALUnitHeader, reader: BitReader, { spss, ppss }: ParameterSets): void => {
   reader.skipUEG(); // first_mb_in_slice
   const slice_type = reader.readUEG();
   const pic_parameter_set_id = reader.readUEG();
@@ -200,13 +171,13 @@ export const skip_slice_header = ({ nal_ref_idc, nal_unit_type }: NALUnitHeader,
   if (is_idr_nal(nal_unit_type)) { // IdrPicFlag
     reader.skipUEG(); // idr_pic_id
   }
-  if (sps.has_log2_max_pic_order_cnt_lsb_minus4) {
-    reader.skipBits(sps.log2_max_pic_order_cnt_lsb_minus4 + 4);
+  if (sps.pic_order_cnt_type === 0) {
+    reader.skipBits(sps.log2_max_pic_order_cnt_lsb_minus4 + 4); // pic_order_cnt_lsb
     if (pps.bottom_field_pic_order_in_frame_present_flag && !field_pic_flag) {
       reader.skipSEG(); // delta_pic_order_cnt_bottom
     }
   }
-  if (sps.has_delta_pic_order_always_zero_flag && !sps.delta_pic_order_always_zero_flag) {
+  if (sps.pic_order_cnt_type === 1 && !sps.delta_pic_order_always_zero_flag) {
     reader.skipSEG(); // delta_pic_order_cnt[0]
     if (pps.bottom_field_pic_order_in_frame_present_flag && !field_pic_flag) {
       reader.skipSEG(); // delta_pic_order_cnt[1]
@@ -231,11 +202,8 @@ export const skip_slice_header = ({ nal_ref_idc, nal_unit_type }: NALUnitHeader,
     }
   }
 
-  if (nal_unit_type === 20 || nal_unit_type === 21) { /* specified in Annex H */
-    skip_ref_pic_list_mvc_modification(slice_type, reader);
-  } else {
-    skip_ref_pic_list_modification(slice_type, reader);
-  }
+  // nal_unit_type 20, 21 は Annex H (MVC) の ref_pic_list_mvc_modification
+  skip_ref_pic_list_modification(slice_type, nal_unit_type === 20 || nal_unit_type === 21, reader);
 
   if ((pps.weighted_pred_flag && (is_p_slice(slice_type) || is_sp_slice(slice_type))) || (pps.weighted_bipred_idc === 1 && is_b_slice(slice_type))) {
     skip_pred_weight_table(slice_type, num_ref_idx_l0_active_minus1, num_ref_idx_l1_active_minus1, sps, reader);
@@ -260,9 +228,10 @@ export const skip_slice_header = ({ nal_ref_idc, nal_unit_type }: NALUnitHeader,
       reader.skipSEG(); // slice_beta_offset_div2
     }
   }
-  if (pps.has_slice_group_map_type && pps.has_slice_group_change_rate_minus1) {
-    const slice_group_change_cycle_bits = sufficient_bits(sps.pic_size_in_map_units / (pps.slice_group_change_rate_minus1 + 1));
-    reader.skipBits(slice_group_change_cycle_bits);
+  if (pps.num_slice_groups_minus1 > 0 && 3 <= pps.slice_group_map_type && pps.slice_group_map_type <= 5) {
+    // slice_group_change_cycle は Ceil(Log2(PicSizeInMapUnits ÷ SliceGroupChangeRate + 1)) bit
+    const SliceGroupChangeRate = pps.slice_group_change_rate_minus1 + 1;
+    reader.skipBits(Math.ceil(Math.log2(sps.pic_size_in_map_units / SliceGroupChangeRate + 1))); // slice_group_change_cycle
   }
 };
 
@@ -271,8 +240,10 @@ export const write_mp4_avc_track_information = (track_id: number, timescale: num
   const sps = SequenceParameterSets[0];
   const { resolution, vui_parameters: { source_aspect_ratio } } = read_seq_parameter_set_data(strip_nal_unit_header(sps));
 
+  // SAR が未定義 (aspect_ratio_idc が 0 や予約値、sar_width か sar_height が 0) の時は 1:1 とみなす
+  const [sar_width, sar_height] = source_aspect_ratio.every((value) => Number.isInteger(value) && value > 0) ? source_aspect_ratio : [1, 1];
   const presentation = [
-    Math.floor(resolution[0] * source_aspect_ratio[0] / source_aspect_ratio[1]),
+    Math.floor(resolution[0] * sar_width / sar_height),
     resolution[1],
   ];
 
@@ -292,108 +263,101 @@ export const write_mp4_avc_track_information = (track_id: number, timescale: num
   });
 };
 
-export const encrypt_avc_cenc = (format: EncryptionFormatCENC, key: Buffer, iv: Buffer, sizedNalus: Buffer, avcDecoderConfigurationRecord: AVCDecoderConfigurationRecord): [Buffer, SubsampleInformation[]] => {
+// NAL Unit Header と slice_header のバイト数 (avcC にない PPS を参照しているなど、読めなければ null)
+const slice_header_bytes = (nalu: Buffer, parameterSets: ParameterSets): number | null => {
+  try {
+    const nalu_header = read_nal_unit_header(nalu);
+    const bit_reader = new EBSPBitReader(nalu.subarray(nalu_header.consumed_bytes));
+    skip_slice_header(nalu_header, bit_reader, parameterSets);
+    return nalu_header.consumed_bytes + Math.ceil(bit_reader.consumedBits() / 8);
+  } catch {
+    return null;
+  }
+};
+
+// NAL Unit ごとに Sub-Sample Encryption する
+// slice_header を持つ VCL NAL Unit (映像のスライス) は NAL Unit Header と slice_header を平文で残し、残りを encrypt で暗号化する
+// それ以外の NAL Unit (SPS/PPS/SEI や slice_header を持たない Data Partition B/C など) は全て平文で残す
+// align が true なら BytesOfProtectedData を 16 byte の倍数にする (cenc は CMAF でそう決まっている)
+// parameterSets はサンプルの中で送られてきた (in-band の) SPS/PPS で更新する
+const encrypt_subsamples = (sizedNalus: Buffer, avcDecoderConfigurationRecord: AVCDecoderConfigurationRecord, parameterSets: ParameterSets, align: boolean, encrypt: (data: Buffer) => Buffer): [Buffer, SubsampleInformation[]] => {
+  const naluLengthSize = avcDecoderConfigurationRecord.lengthSize;
+  const builder = new ByteBuilder();
+  const nalu_reader = new ByteReader(sizedNalus);
+
+  const subsamples: SubsampleInformation[] = [];
+  while (!nalu_reader.isEOF()) {
+    const length = nalu_reader.readUIntBE(naluLengthSize);
+    const nalu = nalu_reader.read(length);
+
+    // slice_header を持つのは nal_unit_type 1 (non-IDR), 2 (Data Partition A), 5 (IDR)
+    const nal_unit_type = length > 0 ? nalu[0] & 0x1F : 0;
+    const hasSliceHeader = nal_unit_type === 1 || nal_unit_type === 2 || nal_unit_type === 5;
+    const headerBytes = hasSliceHeader ? slice_header_bytes(nalu, parameterSets) : null;
+    try {
+      if (nal_unit_type === 7) {
+        const sps = read_seq_parameter_set_data(strip_nal_unit_header(nalu));
+        parameterSets.spss = [sps, ... parameterSets.spss.filter(({ seq_parameter_set_id }) => seq_parameter_set_id !== sps.seq_parameter_set_id)];
+      } else if (nal_unit_type === 8) {
+        const pps = read_pic_parameter_set_data(strip_nal_unit_header(nalu));
+        parameterSets.ppss = [pps, ... parameterSets.ppss.filter(({ pic_parameter_set_id }) => pic_parameter_set_id !== pps.pic_parameter_set_id)];
+      }
+    } catch {
+      // 読めない SPS/PPS は使わない
+    }
+
+    builder.writeUIntBE(length, naluLengthSize);
+    if (headerBytes != null) {
+      // CENCv3 から slice_header は clear である必要がある
+      // CENCv1 では そのような記載がないため nal header くらいがあれば十分
+      // 16 byte に満たない端数は slice_header の後ろの平文に含める
+      const clearBytes = headerBytes + (align ? (length - headerBytes) % 16 : 0);
+      const encrypted = encrypt(nalu.subarray(clearBytes));
+      builder.write(nalu.subarray(0, clearBytes));
+      builder.write(encrypted);
+
+      subsamples.push([naluLengthSize + clearBytes, encrypted.byteLength]);
+    } else {
+      builder.write(nalu);
+      // BytesOfClearData は 16bit なので、収まらない分は複数の Sub-Sample に分ける
+      for (let i = 0; i < naluLengthSize + length; i += 0xFFFF) {
+        subsamples.push([Math.min(0xFFFF, (naluLengthSize + length) - i), 0]);
+      }
+    }
+  }
+
+  return [builder.build(), subsamples];
+};
+
+export const encrypt_avc_cenc = (format: EncryptionFormatCENC, key: Buffer, iv: Buffer, sizedNalus: Buffer, avcDecoderConfigurationRecord: AVCDecoderConfigurationRecord, parameterSets: ParameterSets = read_parameter_sets(avcDecoderConfigurationRecord)): [Buffer, SubsampleInformation[]] => {
   // IV のビット数が少ない場合は 0 埋めして合わせる
   iv = padIV(format, iv);
-  // NALu は Sub-Sample Encryption
+  // cenc (AES-CTR) では、1 つのサンプル内の暗号化部分を連続した 1 つのストリームとして暗号化する
   const cipher = crypto.createCipheriv(format.algorithm, key, iv);
-  const builder = new ByteBuilder();
-  const nalu_reader = new ByteReader(sizedNalus);
-
-  const subsamples: SubsampleInformation[] = [];
-  while (!nalu_reader.isEOF()) {
-    const naluLengthSize = avcDecoderConfigurationRecord.lengthSize;
-    const length = nalu_reader.readUIntBE(naluLengthSize);
-    const nalu = nalu_reader.read(length);
-
-    const nalu_header = read_nal_unit_header(nalu);
-    const { nal_unit_type, consumed_bytes } = nalu_header;
-    const bit_reader = new EBSPBitReader(nalu.subarray(consumed_bytes));
-    const isVCL = 1 <= nal_unit_type && nal_unit_type <= 5;
-
-    builder.writeUIntBE(length, avcDecoderConfigurationRecord.lengthSize);
-    if (isVCL) {
-      // CENCv3 から slice_header は clear である必要がある
-      // CENCv1 では そのような記載がないため nal header くらいがあれば十分
-      skip_slice_header(nalu_header, bit_reader, avcDecoderConfigurationRecord.SequenceParameterSets, avcDecoderConfigurationRecord.PictureParameterSets);
-      const clearBytes = consumed_bytes + Math.floor((bit_reader.consumedBits() + 8 - 1) / 8);
-      builder.write(nalu.subarray(0, clearBytes));
-
-      const update = cipher.update(nalu.subarray(clearBytes));
-      builder.write(update);
-
-      subsamples.push([naluLengthSize + clearBytes, update.byteLength]);
-    } else {
-      builder.write(nalu);
-      for (let i = 0; i < naluLengthSize + length; i += 0xFFFF) {
-        subsamples.push([Math.min(0xFFFF, (naluLengthSize + length) - i), 0]);
-      }
-    }
-  }
-
-  return [builder.build(), subsamples];
+  return encrypt_subsamples(sizedNalus, avcDecoderConfigurationRecord, parameterSets, true, (data) => cipher.update(data));
 };
 
-export const encrypt_avc_cbcs = (format: EncryptionFormatCBCS, key: Buffer, iv: Buffer, sizedNalus: Buffer, avcDecoderConfigurationRecord: AVCDecoderConfigurationRecord): [Buffer, SubsampleInformation[]] => {
+export const encrypt_avc_cbcs = (format: EncryptionFormatCBCS, key: Buffer, iv: Buffer, sizedNalus: Buffer, avcDecoderConfigurationRecord: AVCDecoderConfigurationRecord, parameterSets: ParameterSets = read_parameter_sets(avcDecoderConfigurationRecord)): [Buffer, SubsampleInformation[]] => {
   // IV のビット数が少ない場合は 0 埋めして合わせる
   iv = padIV(format, iv);
-  // NALu は Sub-Sample かつ Pattern Encryption
-  const builder = new ByteBuilder();
-  const nalu_reader = new ByteReader(sizedNalus);
-
-  const subsamples: SubsampleInformation[] = [];
-  while (!nalu_reader.isEOF()) {
+  const [crypt, skip] = format.pattern;
+  // cbcs (AES-CBC) では、Sub-Sample ごとに IV から暗号化し直し、
+  // 16 byte のブロック単位で crypt 個を暗号化して skip 個を平文で残すパターンを繰り返す (余りの 16 byte 未満は平文)
+  return encrypt_subsamples(sizedNalus, avcDecoderConfigurationRecord, parameterSets, false, (data) => {
     const cipher = crypto.createCipheriv(format.algorithm, key, iv);
-    const naluLengthSize = avcDecoderConfigurationRecord.lengthSize;
-    const length = nalu_reader.readUIntBE(naluLengthSize);
-    const nalu = nalu_reader.read(length);
-
-    const nalu_header = read_nal_unit_header(nalu);
-    const { nal_unit_type, consumed_bytes } = nalu_header;
-    const bit_reader = new EBSPBitReader(nalu.subarray(consumed_bytes));
-    const isVCL = 1 <= nal_unit_type && nal_unit_type <= 5;
-
-    builder.writeUIntBE(length, avcDecoderConfigurationRecord.lengthSize);
-    if (isVCL) {
-      // CENCv3 から slice_header は clear である必要がある
-      // CENCv1 では そのような記載がないため nal header くらいがあれば十分
-      skip_slice_header(nalu_header, bit_reader, avcDecoderConfigurationRecord.SequenceParameterSets, avcDecoderConfigurationRecord.PictureParameterSets);
-      const clearBytes = consumed_bytes + Math.floor((bit_reader.consumedBits() + 8 - 1) / 8);
-      builder.write(nalu.subarray(0, clearBytes));
-
-      const target = nalu.subarray(clearBytes);
-      let offset = 0;
-      while (offset < target.byteLength) {
-        const [crypt, clear] = format.pattern;
-        for (let i = 0; i < crypt; i++) {
-          if (offset + format.bytes <= target.byteLength) {
-            builder.write(cipher.update(target.subarray(offset, offset + format.bytes)));
-            offset += format.bytes;
-          }
-        }
-        for (let i = 0; i < clear; i++) {
-          if (offset < target.byteLength) {
-            const next = Math.min(target.byteLength, offset + format.bytes);
-            builder.write(target.subarray(offset, next));
-            offset = next;
-          }
-        }
-      }
-      subsamples.push([naluLengthSize + clearBytes, target.byteLength]);
-    } else {
-      builder.write(nalu);
-      for (let i = 0; i < naluLengthSize + length; i += 0xFFFF) {
-        subsamples.push([Math.min(0xFFFF, (naluLengthSize + length) - i), 0]);
-      }
+    const builder = new ByteBuilder();
+    for (let offset = 0; offset < data.byteLength; offset += format.bytes) {
+      const block = data.subarray(offset, offset + format.bytes);
+      const is_crypt_block = (offset / format.bytes) % (crypt + skip) < crypt;
+      builder.write(is_crypt_block && block.byteLength === format.bytes ? cipher.update(block) : block);
     }
-  }
-
-  return [builder.build(), subsamples];
+    return builder.build();
+  });
 };
 
-export const encrypt_avc = (format: EncryptionFormat, key: Buffer, iv: Buffer, sizedNalus: Buffer, avcDecoderConfigurationRecord: AVCDecoderConfigurationRecord): [Buffer, SubsampleInformation[]] => {
+export const encrypt_avc = (format: EncryptionFormat, key: Buffer, iv: Buffer, sizedNalus: Buffer, avcDecoderConfigurationRecord: AVCDecoderConfigurationRecord, parameterSets?: ParameterSets): [Buffer, SubsampleInformation[]] => {
   switch (format.scheme) {
-    case EncryptionScheme.CENC: return encrypt_avc_cenc(format, key, iv, sizedNalus, avcDecoderConfigurationRecord);
-    case EncryptionScheme.CBCS: return encrypt_avc_cbcs(format, key, iv, sizedNalus, avcDecoderConfigurationRecord);
+    case EncryptionScheme.CENC: return encrypt_avc_cenc(format, key, iv, sizedNalus, avcDecoderConfigurationRecord, parameterSets);
+    case EncryptionScheme.CBCS: return encrypt_avc_cbcs(format, key, iv, sizedNalus, avcDecoderConfigurationRecord, parameterSets);
   }
 };

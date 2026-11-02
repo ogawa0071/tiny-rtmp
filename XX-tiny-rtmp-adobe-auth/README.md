@@ -6,8 +6,7 @@ Adobe Auth に対応したRTMP受信サーバの実装です。
 
 ## 主要コンポーネント
 
-- rtmp-session.mts - RTMPセッション管理
-- auth-session.mts - Adobe Auth 処理
+- adobe-auth.mts - Adobe Auth 処理
 
 
 ## 実行方法
@@ -31,7 +30,7 @@ node src/index.mts --user myuser --password mypass --flv -
 また、vite を使ってバンドルして javascript にまとめられます。
 
 ```bash
-# dist/index.cjs, dist/index.mjs にバンドルした結果を出力
+# dist/tiny-rtmp-adobe-auth.js (CommonJS), dist/tiny-rtmp-adobe-auth.mjs (ES Modules) にバンドルした結果を出力
 yarn build
 ```
 

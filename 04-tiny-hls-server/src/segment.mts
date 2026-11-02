@@ -13,18 +13,22 @@ export default class Segment {
     return this.beginTimestamp;
   }
 
+  // セグメントの長さ (秒)
   public extinf(): number | null {
-    if (this.endTimestamp == null) { return null; }
-    return (this.endTimestamp - this.beginTimestamp) / this.timescale;
+    const duration = this.duration();
+    if (duration == null) { return null; }
+    return duration / this.timescale;
   }
 
+  // セグメントの長さ (timescale 単位)
   public duration(): number | null {
     if (this.endTimestamp == null) { return null; }
     return this.endTimestamp - this.beginTimestamp;
   }
 
+  // 完成したセグメントのデータ (まだ完成していなければ null)
   public segment(): Buffer | null {
-    if (this.extinf() == null) { return null; }
+    if (this.endTimestamp == null) { return null; }
     return Buffer.concat(this.media);
   }
 
@@ -33,7 +37,7 @@ export default class Segment {
   }
 
   public complete(timestamp: number): void {
-    if (this.extinf() != null) { return; }
+    if (this.endTimestamp != null) { return; }
     this.endTimestamp = timestamp;
   }
 }

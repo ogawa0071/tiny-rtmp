@@ -1,5 +1,4 @@
 import BitBuilder from './bit-builder.mts';
-import BitReader from './bit-reader.mts';
 
 const PACKET_SIZE = 188;
 const HEADER_SIZE = 4;
@@ -7,25 +6,36 @@ const PAYLOAD_SIZE = PACKET_SIZE - HEADER_SIZE;
 const SYNC_BYTE = 0x47;
 const STUFFING_BYTE = 0xFF;
 
+// これらの stream_id の PES は、PES ヘッダのフラグや PTS/DTS などのオプションのフィールドを持たない
 const pes_not_contain_flags = new Set([0xBC, 0xBE, 0xBF, 0xF0, 0xF1, 0xFF, 0xF2, 0xF8]);
 const pes_has_flags = (stream_id: number) => {
   return !pes_not_contain_flags.has(stream_id);
 };
 
-const crc32_table = new Uint32Array(256);
-for (let i = 0; i < crc32_table.length; i++) {
+// CRC32/MPEG-2 (生成多項式 0x04C11DB7) を 1byte ずつ計算するためのテーブル
+const crc32_table = Uint32Array.from({ length: 256 }, (_, i) => {
   let c = i << 24;
   for (let j = 0; j < 8; j++) {
     c = ((c << 1) ^ ((c & 0x80000000) ? 0x04c11db7 : 0)) >>> 0;
   }
-  crc32_table[i] = c;
-}
+  return c;
+});
 const crc32 = (data: Buffer) => {
   let crc = 0xFFFFFFFF;
   for (const datum of data) {
     crc = ((crc << 8) ^ crc32_table[((crc >>> 24) ^ datum) & 0xFF]) >>> 0;
   }
   return crc;
+};
+
+// section_length と CRC32 は、セクション全体を書き終えてから埋める
+const finalize_section = (builder: BitBuilder): Buffer => {
+  builder.writeBits(0, 32); // CRC32 (後で埋める)
+  const section = builder.build();
+  // section_length は section_length の直後から CRC32 の終わりまでのバイト数
+  section.writeUInt16BE(section.readUInt16BE(1) | ((section.byteLength - 3) & 0x0FFF), 1);
+  section.writeUInt32BE(crc32(section.subarray(0, -4)), section.byteLength - 4);
+  return section;
 };
 
 export type PAT = {
@@ -43,7 +53,7 @@ export const write_pat = (pat: PAT) => {
   builder.writeBits(1, 1); // section_syntax_indicator
   builder.writeBits(0, 1); // 0
   builder.writeBits(0b11, 2); // reserved
-  builder.writeBits(0, 12); // section_length
+  builder.writeBits(0, 12); // section_length (後で埋める)
   builder.writeBits(pat.transport_stream_id, 16); // transport_stream_id
   builder.writeBits(0b11, 2); // reserved
   builder.writeBits(0, 5); // version_number
@@ -55,12 +65,8 @@ export const write_pat = (pat: PAT) => {
     builder.writeBits(0b111, 3); // reserved
     builder.writeBits(program_map_PID, 13); // program_map_PID
   }
-  builder.writeBits(0, 32); // CRC32
-  const section = builder.build();
-  section.writeUInt16BE(section.readUInt16BE(1) | ((section.byteLength - 3) & 0x0FFF), 1);
-  section.writeUInt32BE(crc32(section.subarray(0, -4)), section.byteLength - 4);
 
-  return section;
+  return finalize_section(builder);
 };
 
 export const StreamType = {
@@ -70,10 +76,12 @@ export const StreamType = {
   AVC: 0x1b,
   METADATA: 0x15,
   HEVC: 0x24,
-};
+} as const;
 
 export type PMT = {
   program_number: number;
+  // PMT の中身を変えた時は 1 増やす (32 で 0 に戻る: H.222.0 2.4.4.9)
+  version_number: number;
   pcr_pid: number;
   program_info?: Buffer;
   streams: {
@@ -90,10 +98,10 @@ export const write_pmt = (pmt: PMT) => {
   builder.writeBits(1, 1); // section_syntax_indicator
   builder.writeBits(0, 1); // 0
   builder.writeBits(0b11, 2); // reserved
-  builder.writeBits(0, 12); // section_length
+  builder.writeBits(0, 12); // section_length (後で埋める)
   builder.writeBits(pmt.program_number, 16); // program_number
   builder.writeBits(0b11, 2); // reserved
-  builder.writeBits(0, 5); // version_number
+  builder.writeBits(pmt.version_number, 5); // version_number
   builder.writeBits(0b1, 1); // current_next_indicator
   builder.writeBits(0, 8); // section_number
   builder.writeBits(0, 8); // last_section_number
@@ -101,71 +109,83 @@ export const write_pmt = (pmt: PMT) => {
   builder.writeBits(pmt.pcr_pid, 13); // PCR_PID
   builder.writeBits(0b1111, 4); // reserved
   builder.writeBits(pmt.program_info?.byteLength ?? 0, 12); // program_info_length
-  builder.writeBytes(pmt.program_info ?? Buffer.from([])); // program_info
+  builder.writeBytes(pmt.program_info ?? []); // program_info
   for (const { stream_type, elementary_PID, ES_info } of pmt.streams) {
     builder.writeBits(stream_type, 8); // stream_type
     builder.writeBits(0b111, 3); // reserved
     builder.writeBits(elementary_PID, 13); // elementary_PID
     builder.writeBits(0b1111, 4); // reserved
     builder.writeBits(ES_info?.byteLength ?? 0, 12); // ES_info_length
-    builder.writeBytes(ES_info ?? Buffer.from([])); // ES_info
+    builder.writeBytes(ES_info ?? []); // ES_info
   }
-  builder.writeBits(0, 32); // CRC32
-  const section = builder.build();
-  section.writeUInt16BE(section.readUInt16BE(1) | ((section.byteLength - 3) & 0x0FFF), 1);
-  section.writeUInt32BE(crc32(section.subarray(0, -4)), section.byteLength - 4);
 
-  return section;
+  return finalize_section(builder);
+};
+
+// PTS/DTS (33bit) は 3bit, 15bit, 15bit に分け、それぞれの後ろに marker_bit を挟んで書き込む
+const write_timestamp = (builder: BitBuilder, prefix: number, timestamp: number): void => {
+  builder.writeBits(prefix, 4);
+  builder.writeBits(Math.floor(timestamp / 2 ** 30), 3); // [32..30]
+  builder.writeBits(0b1, 1); // marker_bit
+  builder.writeBits(Math.floor(timestamp / 2 ** 15), 15); // [29..15]
+  builder.writeBits(0b1, 1); // marker_bit
+  builder.writeBits(timestamp, 15); // [14..0]
+  builder.writeBits(0b1, 1); // marker_bit
 };
 
 export const write_pes = (data: Buffer, stream_id: number, pts: number | null, dts: number | null, omit_length = false) => {
-  if (pts == null) { dts = null; }
+  // DTS は PTS があり、かつ PTS と値が異なる時だけ書く (H.222.0 2.7.5)
+  if (pts == null || dts === pts) { dts = null; }
 
   const builder = new BitBuilder();
   const PES_header_data_length = (pts != null ? 5 : 0) + (dts != null ? 5 : 0);
 
-  builder.writeBits(0x000001, 24); // start_code_prefix
+  builder.writeBits(0x000001, 24); // packet_start_code_prefix
   builder.writeBits(stream_id, 8); // stream_id
-  builder.writeBits(0, 16); // pes_length
+  builder.writeBits(0, 16); // PES_packet_length (後で埋める)
   if (pes_has_flags(stream_id)) {
-    builder.writeBits(0b10000000, 8);
-    builder.writeBits(pts != null ? 0b1 : 0b0, 1); // pts present
-    builder.writeBits(dts != null ? 0b1 : 0b0, 1); // dts present
-    builder.writeBits(0b000000, 6);
+    builder.writeBits(0b10, 2); // '10'
+    builder.writeBits(0, 2); // PES_scrambling_control
+    builder.writeBits(0, 1); // PES_priority
+    builder.writeBits(0, 1); // data_alignment_indicator
+    builder.writeBits(0, 1); // copyright
+    builder.writeBits(0, 1); // original_or_copy
+    builder.writeBits(pts != null ? 0b1 : 0b0, 1); // PTS_DTS_flags (PTS)
+    builder.writeBits(dts != null ? 0b1 : 0b0, 1); // PTS_DTS_flags (DTS)
+    builder.writeBits(0, 6); // ESCR_flag, ES_rate_flag, DSM_trick_mode_flag, additional_copy_info_flag, PES_CRC_flag, PES_extension_flag
     builder.writeBits(PES_header_data_length, 8); // PES_header_data_length
     if (pts != null) {
-      const pts_binary = Buffer.alloc(5);
-      pts_binary.writeUIntBE(pts, 0, 5);
-      const reader = new BitReader(pts_binary);
-      reader.skipBits(7);
-
-      builder.writeBits(dts != null ? 0b0011 : 0b0010, 4);
-      builder.writeBits(reader.readBits(3), 3);
-      builder.writeBits(0b1, 1); // marker
-      builder.writeBits(reader.readBits(15), 15);
-      builder.writeBits(0b1, 1); // marker
-      builder.writeBits(reader.readBits(15), 15);
-      builder.writeBits(0b1, 1); // marker
+      write_timestamp(builder, dts != null ? 0b0011 : 0b0010, pts); // PTS
     }
     if (dts != null) {
-      const dts_binary = Buffer.alloc(5);
-      dts_binary.writeUIntBE(dts, 0, 5);
-      const reader = new BitReader(dts_binary);
-      reader.skipBits(7);
-
-      builder.writeBits(0b0001, 4);
-      builder.writeBits(reader.readBits(3), 3);
-      builder.writeBits(0b1, 1); // marker
-      builder.writeBits(reader.readBits(15), 15);
-      builder.writeBits(0b1, 1); // marker
-      builder.writeBits(reader.readBits(15), 15);
-      builder.writeBits(0b1, 1); // marker
+      write_timestamp(builder, 0b0001, dts); // DTS
     }
   }
   const header = builder.build();
   const pes = Buffer.concat([header, data]);
+  // PES_packet_length は PES_packet_length の直後からのバイト数 (映像では 0 として省略できる)
   if (!omit_length) { pes.writeUInt16BE(pes.byteLength - 6, 4); }
   return pes;
+};
+
+type TransportPacketHeader = {
+  pid: number;
+  payload_unit_start_indicator: boolean;
+  adaptation_field: boolean;
+  payload: boolean;
+  continuity_counter: number;
+};
+
+const write_header = (builder: BitBuilder, header: TransportPacketHeader): void => {
+  builder.writeBits(SYNC_BYTE, 8); // sync_byte
+  builder.writeBits(0, 1); // transport_error_indicator
+  builder.writeBool(header.payload_unit_start_indicator); // payload_unit_start_indicator
+  builder.writeBits(0, 1); // transport_priority
+  builder.writeBits(header.pid, 13); // PID
+  builder.writeBits(0, 2); // transport_scrambling_control
+  builder.writeBool(header.adaptation_field); // adaptation_field_control (adaptation_field present)
+  builder.writeBool(header.payload); // adaptation_field_control (payload present)
+  builder.writeBits(header.continuity_counter, 4); // continuity_counter
 };
 
 export class SectionPacketizer {
@@ -176,34 +196,28 @@ export class SectionPacketizer {
     this.pid = pid;
   }
 
-  public packetize(section: Buffer): Buffer[] {
-    const packets: Buffer[] = [];
+  public *packetize(section: Buffer): Generator<Buffer> {
+    // セクションの直前に pointer_field (直後からセクションが始まるので 0) を置く
+    const payload = Buffer.concat([Buffer.from([0x00]), section]);
 
-    for (let i = 0; i < section.byteLength; i += (PAYLOAD_SIZE - (i === 0 ? 1 : 0))) {
-      const packet = Buffer.alloc(PACKET_SIZE, 0xFF);
-      const length = Math.min(i + (PAYLOAD_SIZE - (i === 0 ? 1 : 0)), section.byteLength) - i;
-
+    for (let offset = 0; offset < payload.byteLength; offset += PAYLOAD_SIZE) {
       const builder = new BitBuilder();
-      builder.writeBits(SYNC_BYTE, 8);
-      builder.writeBits(0, 1); // transport_err_indicator
-      builder.writeBits(i === 0 ? 1 : 0, 1); // payload_unit_start_indicator
-      builder.writeBits(0, 1); // transport_priority
-      builder.writeBits(this.pid, 13);
-      builder.writeBits(0, 2); // transport_scrambling_control
-      builder.writeBool(false); // adaptation_field_control (adaptation_field present)
-      builder.writeBool(true); // adaptation_field_control (payload present)
-      builder.writeBits(this.continuity_counter, 4); // continiuty_counter
-      if (i === 0) { builder.writeBits(0, 8); } // pointer_field
+      write_header(builder, {
+        pid: this.pid,
+        payload_unit_start_indicator: offset === 0,
+        adaptation_field: false,
+        payload: true,
+        continuity_counter: this.continuity_counter,
+      });
 
-      const header = builder.build();
-      header.copy(packet, 0);
-      section.copy(packet, header.byteLength, i, i + length);
+      // セクションが終わった後の余りは stuffing_byte (0xFF) で埋める
+      const packet = Buffer.alloc(PACKET_SIZE, STUFFING_BYTE);
+      builder.build().copy(packet, 0);
+      payload.copy(packet, HEADER_SIZE, offset, offset + PAYLOAD_SIZE);
 
-      packets.push(packet);
+      yield packet;
       this.continuity_counter = (this.continuity_counter + 1) & 0x0F;
     }
-
-    return packets;
   }
 }
 
@@ -215,36 +229,31 @@ export class PESPacketizer {
     this.pid = pid;
   }
 
-  public packetize(pes: Buffer): Buffer[] {
-    const packets: Buffer[] = [];
-
-    for (let i = 0; i < pes.byteLength; i += PAYLOAD_SIZE) {
-      const packet = Buffer.alloc(PACKET_SIZE, 0xFF);
-      const length = Math.min(i + PAYLOAD_SIZE, pes.byteLength) - i;
-      const filler = PAYLOAD_SIZE - length;
+  public *packetize(pes: Buffer): Generator<Buffer> {
+    for (let offset = 0; offset < pes.byteLength; offset += PAYLOAD_SIZE) {
+      const payload = pes.subarray(offset, offset + PAYLOAD_SIZE);
+      // ペイロードが足りない部分は adaptation_field の stuffing_byte (0xFF) で埋める
+      const stuffing = PAYLOAD_SIZE - payload.byteLength;
 
       const builder = new BitBuilder();
-      builder.writeBits(SYNC_BYTE, 8);
-      builder.writeBits(0, 1); // transport_err_indicator
-      builder.writeBits(i === 0 ? 1 : 0, 1); // payload_unit_start_indicator
-      builder.writeBits(0, 1); // transport_priority
-      builder.writeBits(this.pid, 13);
-      builder.writeBits(0, 2); // transport_scrambling_control
-      builder.writeBool(filler > 0); // adaptation_field_control (adaptation_field present)
-      builder.writeBool(true); // adaptation_field_control (payload present)
-      builder.writeBits(this.continuity_counter, 4); // continiuty_counter
-      if (filler > 0) { builder.writeBits(filler - 1, 8); }
-      if (filler > 1) { builder.writeBits(0, 8); }
+      write_header(builder, {
+        pid: this.pid,
+        payload_unit_start_indicator: offset === 0,
+        adaptation_field: stuffing > 0,
+        payload: true,
+        continuity_counter: this.continuity_counter,
+      });
+      if (stuffing > 0) { builder.writeBits(stuffing - 1, 8); } // adaptation_field_length
+      if (stuffing > 1) { builder.writeBits(0, 8); } // adaptation_field のフラグ (全て 0)
 
-      const header = builder.build();
-      header.copy(packet, 0);
-      pes.copy(packet, header.byteLength + Math.max(filler - 2, 0), i, i + length);
+      // ヘッダと adaptation_field を前に置き、ペイロードは末尾に詰めて置く
+      const packet = Buffer.alloc(PACKET_SIZE, STUFFING_BYTE);
+      builder.build().copy(packet, 0);
+      payload.copy(packet, PACKET_SIZE - payload.byteLength);
 
-      packets.push(packet);
+      yield packet;
       this.continuity_counter = (this.continuity_counter + 1) & 0x0F;
     }
-
-    return packets;
   }
 }
 
@@ -256,24 +265,22 @@ export class PCRPacketizer {
   }
 
   public packetize(pcr: number): Buffer {
-    const packet = Buffer.alloc(PACKET_SIZE, STUFFING_BYTE);
-
     const builder = new BitBuilder();
-    builder.writeBits(SYNC_BYTE, 8);
-    builder.writeBits(0, 1); // transport_err_indicator
-    builder.writeBits(0, 1); // payload_unit_start_indicator
-    builder.writeBits(0, 1); // transport_priority
-    builder.writeBits(this.pid, 13);
-    builder.writeBits(0, 2); // transport_scrambling_control
-    builder.writeBool(true); // adaptation_field_control (adaptation_field_present)
-    builder.writeBool(false); // adaptation_field_control (payload present)
-    builder.writeBits(0, 4); // continiuty_counter
-    builder.writeBits(PACKET_SIZE - HEADER_SIZE - 1, 8); // adaptation field length
-    builder.writeBits(0x10, 8); // PCR is Present
-    builder.writeBits(pcr, 33); // PCR base
-    builder.writeBits(0, 6); // reserved
-    builder.writeBits(0, 9); // PCR extension
+    write_header(builder, {
+      pid: this.pid,
+      payload_unit_start_indicator: false,
+      adaptation_field: true,
+      payload: false,
+      continuity_counter: 0, // ペイロードのないパケットでは continuity_counter を増やさない
+    });
+    builder.writeBits(PACKET_SIZE - HEADER_SIZE - 1, 8); // adaptation_field_length
+    builder.writeBits(0x10, 8); // PCR_flag
+    builder.writeBits(pcr, 33); // program_clock_reference_base
+    builder.writeBits(0b111111, 6); // reserved
+    builder.writeBits(0, 9); // program_clock_reference_extension
 
+    // 残りは stuffing_byte (0xFF) で埋める
+    const packet = Buffer.alloc(PACKET_SIZE, STUFFING_BYTE);
     builder.build().copy(packet);
     return packet;
   }

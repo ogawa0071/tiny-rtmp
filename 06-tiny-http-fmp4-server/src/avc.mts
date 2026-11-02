@@ -220,26 +220,15 @@ const skip_scaling_list = (sizeOfScalingList: number, reader: BitReader): void =
   }
 };
 
-type PicOrderCntType = ({
-  // 0
-  has_log2_max_pic_order_cnt_lsb_minus4: true; // マーカーのために勝手に定義してる
-  has_delta_pic_order_always_zero_flag: false; // マーカーのために勝手に定義してる
+// pic_order_cnt_type によって、SPS に含まれる (slice header のパースに必要な) 値が変わる
+type PicOrderCnt = {
+  pic_order_cnt_type: 0;
   log2_max_pic_order_cnt_lsb_minus4: number;
 } | {
-  has_log2_max_pic_order_cnt_lsb_minus4: false; // マーカーのために勝手に定義してる
-  has_delta_pic_order_always_zero_flag: true; // マーカーのために勝手に定義してる
+  pic_order_cnt_type: 1;
   delta_pic_order_always_zero_flag: boolean;
 } | {
-  has_log2_max_pic_order_cnt_lsb_minus4: false;
-  has_delta_pic_order_always_zero_flag: false;
-});
-
-export const sufficient_bits = (value: number): number => {
-  let bits = 0;
-  while (value >= 2 ** bits) {
-    bits += 1;
-  }
-  return bits;
+  pic_order_cnt_type: 2;
 };
 
 // slice header のパースで使うもの
@@ -248,7 +237,7 @@ type SliceHeaderRequiredData = {
   pic_size_in_map_units: number;
   frame_mbs_only_flag: boolean;
   log2_max_frame_num_minus4: number;
-} & PicOrderCntType;
+} & PicOrderCnt;
 
 export type SequenceParameterSet = {
   // 大体必要なやつ
@@ -305,15 +294,11 @@ export const read_seq_parameter_set_data = (reader: BitReader): SequenceParamete
     }
   })();
   const log2_max_frame_num_minus4 = reader.readUEG();
-  const log2_max_pic_order_cnt_lsb_minus4 = ((): PicOrderCntType => {
+  const pic_order_cnt = ((): PicOrderCnt => {
     const pic_order_cnt_type = reader.readUEG();
     if (pic_order_cnt_type === 0) {
       const log2_max_pic_order_cnt_lsb_minus4 = reader.readUEG();
-      return {
-        has_log2_max_pic_order_cnt_lsb_minus4: true,
-        has_delta_pic_order_always_zero_flag: false,
-        log2_max_pic_order_cnt_lsb_minus4,
-      } as const;
+      return { pic_order_cnt_type, log2_max_pic_order_cnt_lsb_minus4 };
     } else if (pic_order_cnt_type === 1) {
       const delta_pic_order_always_zero_flag = reader.readBool();
       const offset_for_non_ref_pic = reader.readSEG();
@@ -322,16 +307,10 @@ export const read_seq_parameter_set_data = (reader: BitReader): SequenceParamete
       for (let i = 0; i < num_ref_frames_in_pic_order_cnt_cycle; i++) {
         const offset_for_ref_frame = reader.readSEG();
       }
-      return {
-        has_log2_max_pic_order_cnt_lsb_minus4: false,
-        has_delta_pic_order_always_zero_flag: true,
-        delta_pic_order_always_zero_flag,
-      } as const;
+      return { pic_order_cnt_type, delta_pic_order_always_zero_flag };
     } else {
-      return {
-        has_log2_max_pic_order_cnt_lsb_minus4: false,
-        has_delta_pic_order_always_zero_flag: false,
-      } as const;
+      // 2 (0 ~ 2 以外の値は規格外なので、追加のフィールドがない 2 として扱う)
+      return { pic_order_cnt_type: 2 };
     }
   })();
   const max_num_ref_frames = reader.readUEG();
@@ -353,10 +332,16 @@ export const read_seq_parameter_set_data = (reader: BitReader): SequenceParamete
     source_aspect_ratio: [1, 1], // default
   } satisfies VUIParameters;
 
+  // クロップの単位 (CropUnitX, CropUnitY) は色差の間引き方とフィールド符号化かどうかで変わる
+  const ChromaArrayType = separate_colour_plane_flag ? 0 : chroma_format_idc;
   const SubWidthC = chroma_format_idc === 3 ? 1 : 2;
   const SubHeightC = chroma_format_idc <= 1 ? 2 : 1;
-  const width = (pic_width_in_mbs_minus1 + 1) * 16 - SubWidthC * (frame_crop_left_offset + frame_crop_right_offset);
-  const height = ((pic_height_in_map_units_minus1 + 1) * 16  - SubHeightC * (frame_crop_top_offset + frame_crop_bottom_offset)) * (frame_mbs_only_flag ? 1 : 2);
+  const CropUnitX = ChromaArrayType === 0 ? 1 : SubWidthC;
+  const CropUnitY = (ChromaArrayType === 0 ? 1 : SubHeightC) * (frame_mbs_only_flag ? 1 : 2);
+  const PicWidthInMbs = pic_width_in_mbs_minus1 + 1;
+  const FrameHeightInMbs = (pic_height_in_map_units_minus1 + 1) * (frame_mbs_only_flag ? 1 : 2);
+  const width = PicWidthInMbs * 16 - CropUnitX * (frame_crop_left_offset + frame_crop_right_offset);
+  const height = FrameHeightInMbs * 16 - CropUnitY * (frame_crop_top_offset + frame_crop_bottom_offset);
 
   return {
     seq_parameter_set_id,
@@ -372,82 +357,57 @@ export const read_seq_parameter_set_data = (reader: BitReader): SequenceParamete
     pic_size_in_map_units: (pic_width_in_mbs_minus1 + 1) * (pic_height_in_map_units_minus1 + 1),
     frame_mbs_only_flag,
     log2_max_frame_num_minus4,
-    ... log2_max_pic_order_cnt_lsb_minus4,
+    ... pic_order_cnt,
   };
 };
-
-export type SliceGroupMapType = ({
-  has_slice_group_map_type: true;
-  slice_group_map_type: number;
-} | {
-  has_slice_group_map_type: false;
-}) & ({
-  has_slice_group_change_rate_minus1: true;
-  slice_group_change_rate_minus1: number;
-} | {
-  has_slice_group_change_rate_minus1: false;
-});
 
 export type PictureParameterSet = {
   pic_parameter_set_id: number;
   seq_parameter_set_id: number;
   entropy_coding_mode_flag: boolean;
   bottom_field_pic_order_in_frame_present_flag: boolean;
+  num_slice_groups_minus1: number;
+  slice_group_map_type: number; // num_slice_groups_minus1 > 0 の時だけ存在する (なければ 0)
+  slice_group_change_rate_minus1: number; // slice_group_map_type が 3 ~ 5 の時だけ存在する (なければ 0)
   num_ref_idx_l0_default_active_minus1: number;
   num_ref_idx_l1_default_active_minus1: number;
   weighted_pred_flag: boolean;
   weighted_bipred_idc: number;
   deblocking_filter_control_present_flag: boolean;
   redundant_pic_cnt_present_flag: boolean;
-} & SliceGroupMapType;
+};
 
 export const read_pic_parameter_set_data = (reader: BitReader): PictureParameterSet => {
   const pic_parameter_set_id = reader.readUEG();
   const seq_parameter_set_id = reader.readUEG();
   const entropy_coding_mode_flag = reader.readBool();
   const bottom_field_pic_order_in_frame_present_flag = reader.readBool();
-  const slice_group_map_type = ((): SliceGroupMapType => {
-    const num_slice_groups_minus1 = reader.readUEG();
-    if (num_slice_groups_minus1 > 0) {
-      const slice_group_map_type = reader.readUEG();
-      if (slice_group_map_type === 0) {
-        for (let iGroup = 0; iGroup <= num_slice_groups_minus1; iGroup++) {
-          reader.skipUEG(); // run_length_minus1[iGroup]
-        }
-      } else if (slice_group_map_type === 1) {
-        for (let iGroup = 0; iGroup <= num_slice_groups_minus1; iGroup++) {
-          reader.skipUEG(); // top_left[iGroup]
-          reader.skipUEG(); // bottom_right[iGroup]
-        }
-      } else if (3 <= slice_group_map_type && slice_group_map_type <= 5) {
-        reader.skipBool(); // slice_group_change_direction_flag
-        const slice_group_change_rate_minus1 = reader.readUEG();
-
-        return {
-          has_slice_group_map_type: true,
-          has_slice_group_change_rate_minus1: true,
-          slice_group_map_type,
-          slice_group_change_rate_minus1,
-        } as const;
-      } else if (slice_group_map_type === 6) {
-        const pic_size_in_map_units_minus1 = reader.readUEG();
-        for (let i = 0; i <= pic_size_in_map_units_minus1; i++) {
-          const num_slice_groups_bits = sufficient_bits(num_slice_groups_minus1 + 1);
-          reader.skipBits(num_slice_groups_bits);
-        }
+  const num_slice_groups_minus1 = reader.readUEG();
+  let slice_group_map_type = 0;
+  let slice_group_change_rate_minus1 = 0;
+  if (num_slice_groups_minus1 > 0) {
+    slice_group_map_type = reader.readUEG();
+    if (slice_group_map_type === 0) {
+      for (let iGroup = 0; iGroup <= num_slice_groups_minus1; iGroup++) {
+        reader.skipUEG(); // run_length_minus1[iGroup]
       }
-      return {
-        has_slice_group_map_type: true,
-        has_slice_group_change_rate_minus1: false,
-        slice_group_map_type,
-      } as const;
-    } else {
-      return {
-        has_slice_group_map_type: false,
-        has_slice_group_change_rate_minus1: false,
-      } as const;
+    } else if (slice_group_map_type === 2) {
+      for (let iGroup = 0; iGroup < num_slice_groups_minus1; iGroup++) {
+        reader.skipUEG(); // top_left[iGroup]
+        reader.skipUEG(); // bottom_right[iGroup]
+      }
+    } else if (3 <= slice_group_map_type && slice_group_map_type <= 5) {
+      reader.skipBool(); // slice_group_change_direction_flag
+      slice_group_change_rate_minus1 = reader.readUEG();
+    } else if (slice_group_map_type === 6) {
+      const pic_size_in_map_units_minus1 = reader.readUEG();
+      // slice_group_id[i] は Ceil(Log2(num_slice_groups_minus1 + 1)) bit
+      const slice_group_id_bits = Math.ceil(Math.log2(num_slice_groups_minus1 + 1));
+      for (let i = 0; i <= pic_size_in_map_units_minus1; i++) {
+        reader.skipBits(slice_group_id_bits); // slice_group_id[i]
+      }
     }
-  })();
+  }
   const num_ref_idx_l0_default_active_minus1 = reader.readUEG();
   const num_ref_idx_l1_default_active_minus1 = reader.readUEG();
   const weighted_pred_flag = reader.readBool(); // weighted_pred_flag
@@ -465,11 +425,13 @@ export const read_pic_parameter_set_data = (reader: BitReader): PictureParameter
     seq_parameter_set_id,
     entropy_coding_mode_flag,
     bottom_field_pic_order_in_frame_present_flag,
+    num_slice_groups_minus1,
+    slice_group_map_type,
+    slice_group_change_rate_minus1,
     num_ref_idx_l0_default_active_minus1,
     num_ref_idx_l1_default_active_minus1,
     weighted_pred_flag,
     weighted_bipred_idc,
-    ... slice_group_map_type,
     deblocking_filter_control_present_flag,
     redundant_pic_cnt_present_flag,
   };
@@ -505,8 +467,10 @@ export const write_mp4_avc_track_information = (track_id: number, timescale: num
   const sps = SequenceParameterSets[0];
   const { resolution, vui_parameters: { source_aspect_ratio } } = read_seq_parameter_set_data(strip_nal_unit_header(sps));
 
+  // SAR が未定義 (aspect_ratio_idc が 0 や予約値、sar_width か sar_height が 0) の時は 1:1 とみなす
+  const [sar_width, sar_height] = source_aspect_ratio.every((value) => Number.isInteger(value) && value > 0) ? source_aspect_ratio : [1, 1];
   const presentation = [
-    Math.floor(resolution[0] * source_aspect_ratio[0] / source_aspect_ratio[1]),
+    Math.floor(resolution[0] * sar_width / sar_height),
     resolution[1],
   ];
 

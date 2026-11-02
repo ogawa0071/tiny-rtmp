@@ -21,16 +21,15 @@ export interface Logger {
 }
 
 export class NoopLogger implements Logger {
-  trace(): void {};
-  debug(): void {};
-  info(): void {};
-  warn(): void {};
-  error(): void {};
-  fatal(): void {};
-};
+  trace(): void {}
+  debug(): void {}
+  info(): void {}
+  warn(): void {}
+  error(): void {}
+  fatal(): void {}
+}
 
 const flat = (obj: unknown): string => {
-  if (obj === undefined) { return ''; }
   return inspect(obj, {
     depth: Number.POSITIVE_INFINITY,
     breakLength: Number.POSITIVE_INFINITY,
@@ -38,16 +37,23 @@ const flat = (obj: unknown): string => {
   });
 };
 
+// 実行環境のタイムゾーンでの現在日時を 2026/10/30 21:05:09.123 の形式で返す
 const datetime = (): string => {
-  const date = new Date();
-  const date_string = `${date.getFullYear()}/${date.getMonth() + 1}/${date.getDate()}`;
-  const time_string = `${date.getHours().toString().padStart(2, '0')}:${date.getMinutes().toString().padStart(2, '0')}:${date.getSeconds().toString().padStart(2, '0')}.${date.getMilliseconds().toString().padStart(3, '0')}`;
-  return `${date_string} ${time_string}`;
+  const now = Temporal.Now.plainDateTimeISO();
+  // 時刻は ISO 8601 形式 (ゼロ埋めされた HH:mm:ss.sss) を、ミリ秒までに切り詰めて使う
+  const time = now.toPlainTime().toString({ smallestUnit: 'millisecond' });
+  return `${now.year}/${now.month}/${now.day} ${time}`; // Temporal の month は 1 始まり
 };
 
-const is_empty = (record: Record<string, unknown>): boolean => {
-  return Object.keys(record).length === 0;
-};
+type Level = keyof typeof LogLevel;
+const styles = {
+  TRACE: ['gray', 'bgBlack', 'dim'],
+  DEBUG: ['gray', 'bgBlack'],
+  INFO: ['white', 'bgBlack'],
+  WARN: ['white', 'bgYellow'],
+  ERROR: ['white', 'bgRed'],
+  FATAL: ['white', 'bgRed', 'bold'],
+} as const satisfies Record<Level, Parameters<typeof styleText>[0]>;
 
 export class ConsoleLogger implements Logger {
   private loglevel: number;
@@ -55,70 +61,40 @@ export class ConsoleLogger implements Logger {
     this.loglevel = loglevel ?? LogLevel.INFO;
   }
 
-  trace(message: string, record?: Record<string, unknown>): void {
-    if (this.loglevel > LogLevel.TRACE) { return; }
-    const level = styleText(['gray', 'bgBlack', 'dim'], '[TRACE]', { stream: process.stderr });
-    record = { ... (load() ?? {}),  ... (record ?? {}) };
-    if (is_empty(record)) {
-      console.error(datetime(), level, message);
+  private log(level: Level, message: string, record?: Record<string, unknown>): void {
+    if (this.loglevel > LogLevel[level]) { return; }
+    const label = styleText(styles[level], `[${level}]`, { stream: process.stderr });
+    // セッション情報 (sessionId, app, stream など) を付けて出力する
+    const merged = { ... load(), ... record };
+    if (Object.keys(merged).length === 0) {
+      console.error(datetime(), label, message);
     } else {
-      console.error(datetime(), level, message, flat(record));
+      console.error(datetime(), label, message, flat(merged));
     }
+  }
+
+  trace(message: string, record?: Record<string, unknown>): void {
+    this.log('TRACE', message, record);
   }
 
   debug(message: string, record?: Record<string, unknown>): void {
-    if (this.loglevel > LogLevel.DEBUG) { return; }
-    const level = styleText(['gray', 'bgBlack'], '[DEBUG]', { stream: process.stderr });
-    record = { ... (load() ?? {}),  ... (record ?? {}) };
-    if (is_empty(record)) {
-      console.error(datetime(), level, message);
-    } else {
-      console.error(datetime(), level, message, flat(record));
-    }
+    this.log('DEBUG', message, record);
   }
 
   info(message: string, record?: Record<string, unknown>): void {
-    if (this.loglevel > LogLevel.INFO) { return; }
-    const level = styleText(['white', 'bgBlack'], '[INFO]', { stream: process.stderr });
-    record = { ... (load() ?? {}),  ... (record ?? {}) };
-    if (is_empty(record)) {
-      console.error(datetime(), level, message);
-    } else {
-      console.error(datetime(), level, message, flat(record));
-    }
+    this.log('INFO', message, record);
   }
 
   warn(message: string, record?: Record<string, unknown>): void {
-    if (this.loglevel > LogLevel.WARN) { return; }
-    const level = styleText(['white', 'bgYellow'], '[WARN]', { stream: process.stderr });
-    record = { ... (load() ?? {}),  ... (record ?? {}) };
-    if (is_empty(record)) {
-      console.error(datetime(), level, message);
-    } else {
-      console.error(datetime(), level, message, flat(record));
-    }
+    this.log('WARN', message, record);
   }
 
   error(message: string, record?: Record<string, unknown>): void {
-    if (this.loglevel > LogLevel.ERROR) { return; }
-    const level = styleText(['white', 'bgRed'], '[ERROR]', { stream: process.stderr });
-    record = { ... (load() ?? {}),  ... (record ?? {}) };
-    if (is_empty(record)) {
-      console.error(datetime(), level, message);
-    } else {
-      console.error(datetime(), level, message, flat(record));
-    }
+    this.log('ERROR', message, record);
   }
 
   fatal(message: string, record?: Record<string, unknown>): void {
-    if (this.loglevel > LogLevel.FATAL) { return; }
-    const level = styleText(['white', 'bgRed', 'bold'], '[FATAL]', { stream: process.stderr });
-    record = { ... (load() ?? {}),  ... (record ?? {}) };
-    if (is_empty(record)) {
-      console.error(datetime(), level, message);
-    } else {
-      console.error(datetime(), level, message, flat(record));
-    }
+    this.log('FATAL', message, record);
   }
 }
 
@@ -127,23 +103,12 @@ export const registerLogger = (logger: Logger): void => {
   secret = logger;
 };
 
-export const logger = {
-  trace: (message: string, record?: Record<string, unknown>): void => {
-    secret.trace(message, record);
-  },
-  debug: (message: string, record?: Record<string, unknown>): void => {
-    secret.debug(message, record);
-  },
-  info: (message: string, record?: Record<string, unknown>): void => {
-    secret.info(message, record);
-  },
-  warn: (message: string, record?: Record<string, unknown>): void => {
-    secret.warn(message, record);
-  },
-  error: (message: string, record?: Record<string, unknown>): void => {
-    secret.error(message, record);
-  },
-  fatal: (message: string, record?: Record<string, unknown>): void => {
-    secret.fatal(message, record);
-  },
-} as const;
+// 登録されたロガーに委譲する (registerLogger で後から差し替えられるように、呼び出しの度に参照する)
+export const logger: Logger = {
+  trace: (message, record) => { secret.trace(message, record); },
+  debug: (message, record) => { secret.debug(message, record); },
+  info: (message, record) => { secret.info(message, record); },
+  warn: (message, record) => { secret.warn(message, record); },
+  error: (message, record) => { secret.error(message, record); },
+  fatal: (message, record) => { secret.fatal(message, record); },
+};

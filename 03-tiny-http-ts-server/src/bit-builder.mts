@@ -2,19 +2,22 @@ export default class BitBuilder {
   protected bits: number[] = [];
   protected data: number[] = [];
 
+  // 8bit 溜まるごとに 1byte として確定させる
   protected fill(): void {
     while (this.bits.length >= 8) {
-      let datum = 0;
-      for (let i = 0; i < 8; i++) {
-        datum = datum * 2 + this.bits.shift()!;
-      }
-      this.data.push(datum);
+      this.push(this.bits.splice(0, 8).reduce((byte, bit) => byte * 2 + bit, 0));
     }
   }
 
+  // 確定した 1byte を追加する (継承先で書き込むバイトを加工できるように分けている)
+  protected push(byte: number): void {
+    this.data.push(byte);
+  }
+
   public writeBits(value: number, length: number): void {
+    // 上位 bit から順に value の下位 length bit を書き込む
     for (let i = length - 1; i >= 0; i--) {
-      this.bits.push(Math.floor((value % (2 ** (i + 1))) / (2 ** i)));
+      this.bits.push(Math.floor(value / (2 ** i)) % 2);
     }
     this.fill();
   }
@@ -24,6 +27,7 @@ export default class BitBuilder {
   }
 
   public writeUEG(value: number): void {
+    // 指数ゴロム符号: (value + 1) の bit 数 - 1 個の 0 に続けて (value + 1) を書く
     value += 1;
     let bits = 0;
     for (let v = value; v > 0; v = Math.floor(v / 2)) { bits++; }
@@ -40,7 +44,6 @@ export default class BitBuilder {
   }
 
   public writeByteAlign(fill: 0 | 1 = 0): void {
-    if ((this.bits.length % 8) === 0) { return; }
     while ((this.bits.length % 8) !== 0) {
       this.bits.push(fill);
     }
@@ -58,6 +61,7 @@ export default class BitBuilder {
   public build(): Buffer {
     const values = [... this.data];
 
+    // 8bit に満たない残りは 0 で埋めて 1byte にする
     if (this.bits.length > 0) {
       let datum = 0;
       for (let i = 0; i < 8; i++) {

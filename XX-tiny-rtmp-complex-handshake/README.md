@@ -6,7 +6,7 @@ RTMP Complex Handshake に対応したRTMP受信サーバの実装です。
 
 ## 主要コンポーネント
 
-- rtmp-session.mts - RTMPセッション管理とComplex Handshake処理
+- rtmp-accepter.mts - Complex Handshake の処理 (ハンドシェイク以外は[RTMP受信サーバ](../01-tiny-rtmp-server/)の処理を使う)
 
 
 ## 実行方法
@@ -30,7 +30,7 @@ node src/index.mts --flv -
 また、vite を使ってバンドルして javascript にまとめられます。
 
 ```bash
-# dist/index.cjs, dist/index.mjs にバンドルした結果を出力
+# dist/tiny-rtmp-complex-handshake.js (CommonJS), dist/tiny-rtmp-complex-handshake.mjs (ES Modules) にバンドルした結果を出力
 yarn build
 ```
 
