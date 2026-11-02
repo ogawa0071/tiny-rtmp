@@ -26,9 +26,10 @@ const MP3_FRAME = Buffer.from('2fff', 'hex');
 
 // 6 秒間、10 fps の映像 (1 秒ごとにキーフレーム) と、audioStart から AAC (初期化情報と 100 ミリ秒ごとのフレーム) を送る
 // 映像を送るたびに、firstRequest 以降は MPD を取りに行く (届いた MPD を返す)
-const publish = (generator: DASHGenerator, { audioStart, firstRequest }: { audioStart: number | null; firstRequest: number; }): (string | null)[] => {
+const publish = (generator: DASHGenerator, { audioStart, firstRequest, beforeVideo }: { audioStart: number | null; firstRequest: number; beforeVideo?: (t: number) => void; }): (string | null)[] => {
   const mpds: (string | null)[] = [];
   for (let t = 0; t < 6000; t += 100) {
+    beforeVideo?.(t);
     if (t === audioStart) { generator.feed(audio(t, AAC_SEQUENCE_HEADER)); }
     generator.feed(video(t, avc(t % 1000 === 0 ? 1 : 2)));
     if (audioStart != null && t >= audioStart) { generator.feed(audio(t + 8, AAC_FRAME)); }
@@ -131,6 +132,26 @@ describe('MPD', () => {
       expect(warnings).toStrictEqual(['Video sequence header is missing, video is ignored']);
       expectTracks(mpds, ['audio']);
     }
+  });
+
+  test('H.264 whose sequence header arrives after the first frames: the video stays ignored, so the MPD does not gain the video track', () => {
+    const warnings: string[] = [];
+    registerLogger(Object.assign(new NoopLogger(), { warn: (message: string) => { warnings.push(message); } }));
+    let mpds: (string | null)[] = [];
+    try {
+      const generator = new DASHGenerator(EncryptionFormat.from(EncryptionScheme.CENC), Buffer.alloc(16, 1), Buffer.alloc(16, 2));
+      generator.feed(onmetadata({ videocodecid: 7, audiocodecid: 10 }));
+      // AVC の初期化情報が、最初のフレーム (0 ms) より後で、MPD を作れるようになる (最初のセグメントができる) 前の 300 ms に届く
+      mpds = publish(generator, { audioStart: 0, firstRequest: 0, beforeVideo: (t) => {
+        if (t === 300) { generator.feed(video(t, AVC_SEQUENCE_HEADER)); }
+      } });
+    } finally {
+      registerLogger(new NoopLogger());
+    }
+
+    // 映像のトラックがない配信として扱うと警告した後は、初期化情報が届いても映像を MPD に載せない
+    expect(warnings).toStrictEqual(['Video sequence header is missing, video is ignored']);
+    expectTracks(mpds, ['audio']);
   });
 });
 

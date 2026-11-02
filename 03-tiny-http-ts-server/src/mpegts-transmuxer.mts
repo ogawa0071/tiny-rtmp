@@ -86,45 +86,53 @@ export default class MPEGTSTransmuxer {
     }
   }
 
-  public *feed(message: Message): Generator<Buffer> {
+  // 映像/音声のメッセージを TS パケットにする
+  // 中身の解析と Annex B / ADTS への変換はここですぐに行い (壊れたデータなら、このメッセージの feed で例外になる)、
+  // PAT/PMT/PCR と PES を TS パケットにするのは、返したジェネレータから取り出す時に行う
+  // (LL-HLS では、どのパーシャルセグメントに入れるかを決めてから取り出して、パーシャルセグメントの先頭に PAT/PMT を入れる)
+  public feed(message: Message): Iterable<Buffer> {
     const payload = handle_rtmp_payload(message);
     switch (payload?.kind) {
-      case 'Video':
+      case 'Video': {
         if (payload.packetType === PacketType.SequenceStart) {
           this.avcDecoderConfigurationRecord = read_avc_decoder_configuration_record(payload.avcDecoderConfigurationRecord);
-          return;
+          return [];
         }
-        if (this.avcDecoderConfigurationRecord == null) { return; }
-        yield* this.emitPSIAndPCR(payload.timestamp);
-        yield* this.avcPacketizer.packetize(
-          write_pes(
-            write_annexb_avc(payload.data, this.avcDecoderConfigurationRecord),
-            0xe0, // 0b1110XXXX: H.262/H.263/H.264/H.265 Video, stream number = 0
-            timestamp_from_rtmp_to_mpegts(payload.timestamp + payload.compositionTimeOffset + DECODE_DELAY),
-            timestamp_from_rtmp_to_mpegts(payload.timestamp + DECODE_DELAY),
-            true
-          )
+        if (this.avcDecoderConfigurationRecord == null) { return []; }
+        const pes = write_pes(
+          write_annexb_avc(payload.data, this.avcDecoderConfigurationRecord),
+          0xe0, // 0b1110XXXX: H.262/H.263/H.264/H.265 Video, stream number = 0
+          timestamp_from_rtmp_to_mpegts(payload.timestamp + payload.compositionTimeOffset + DECODE_DELAY),
+          timestamp_from_rtmp_to_mpegts(payload.timestamp + DECODE_DELAY),
+          true
         );
-        return;
-      case 'Audio':
+        return this.packetize(this.avcPacketizer, pes, payload.timestamp);
+      }
+      case 'Audio': {
         if (payload.packetType === AACPacketType.SequenceHeader) {
           this.audioSpecificConfig = read_audio_specific_config(payload.audioSpecificConfig);
-          return;
+          return [];
         }
-        if (this.audioSpecificConfig == null) { return; }
+        if (this.audioSpecificConfig == null) { return []; }
         // 中身のない AAC のフレームは ADTS にできないので送らない (raw_data_block は終端の ID_END だけでも 1 byte ある)
-        if (payload.data.byteLength === 0) { return; }
-        yield* this.emitPSIAndPCR(payload.timestamp);
-        yield* this.aacPacketizer.packetize(
-          write_pes(
-            write_adts_aac(payload.data, this.audioSpecificConfig),
-            0xc0, // 0b110XXXXX: AAC Audio, stream number = 0
-            timestamp_from_rtmp_to_mpegts(payload.timestamp + DECODE_DELAY),
-            null,
-            false
-          )
+        if (payload.data.byteLength === 0) { return []; }
+        const pes = write_pes(
+          write_adts_aac(payload.data, this.audioSpecificConfig),
+          0xc0, // 0b110XXXXX: AAC Audio, stream number = 0
+          timestamp_from_rtmp_to_mpegts(payload.timestamp + DECODE_DELAY),
+          null,
+          false
         );
-        return;
+        return this.packetize(this.aacPacketizer, pes, payload.timestamp);
+      }
+      default:
+        return [];
     }
+  }
+
+  // PES を TS パケットにする (必要なら、その前に PAT/PMT/PCR を出力する)
+  private *packetize(packetizer: PESPacketizer, pes: Buffer, timestamp: number): Generator<Buffer> {
+    yield* this.emitPSIAndPCR(timestamp);
+    yield* packetizer.packetize(pes);
   }
 }

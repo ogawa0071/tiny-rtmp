@@ -141,7 +141,8 @@ describe('Streams with video', () => {
     expect(extinfs(generator)).toStrictEqual([1.003, 1.002, 1.495, 1, 1, 1]);
   });
 
-  // キーフレームの間隔が 1 秒より短い配信では、セグメントの途中のキーフレームからもパーシャルセグメント (INDEPENDENT=YES) が始まる
+  // キーフレームの間隔が 1 秒より短い配信では、セグメントの途中のキーフレームを含むパーシャルセグメントも INDEPENDENT=YES になる
+  // (この配信では、6 フレームごとのキーフレームからパーシャルセグメントが始まる。キーフレームがパーシャルセグメントの途中にあることもある: 下の 30 fps の例)
   // そこからデコードを始められるように、どのパーシャルセグメントも PAT と PMT から始める (RFC 8216bis 3.2, 3.1.1)
   test('keyframes every 0.25 s: every partial segment starts with PAT and PMT', async () => {
     const generator = new LLHLSGenerator({ liveWindowLength: 3, partialSegmentDuration: 0.25 });
@@ -170,6 +171,37 @@ describe('Streams with video', () => {
   });
 });
 
+describe('Partial segments in the middle of a GOP', () => {
+  // HLS (04-tiny-hls-server) と同じく、パーシャルセグメントの途中のキーフレームの前にも PAT と PMT を入れる
+  test('keyframes inside a partial segment also get PAT and PMT in front of them', async () => {
+    const generator = new LLHLSGenerator({ liveWindowLength: 10, partialSegmentDuration: 0.25 });
+    generator.feed(onmetadata({ videocodecid: 7, audiocodecid: 10 }));
+    generator.feed(video(0, AVC_SEQUENCE_HEADER));
+    generator.feed(audio(0, AAC_SEQUENCE_HEADER));
+    // 30 fps の映像 (0.5 秒ごとにキーフレーム) と 48 kHz の AAC
+    // パーシャルセグメントは 7 フレーム (約 0.233 秒) ずつで区切るので、0.5 秒のキーフレーム (15 番のフレーム) は 14 番のフレームから始まるパーシャルセグメントの途中にある
+    let i = 0;
+    for (let frame = 0; frame < 30 * 8; frame++) {
+      const t = Math.round(frame * 1000 / 30);
+      for (; aac(i) <= t; i++) { generator.feed(audio(aac(i), AAC_FRAME)); }
+      generator.feed(video(t, avc(frame % 15 === 0 ? 1 : 2)));
+    }
+    generator.end();
+
+    const stream = Buffer.concat(await segments(generator));
+    const list = pids(stream);
+    // 映像の PES の始まり (payload_unit_start_indicator が立っている TS パケット) と、そのうちキーフレームのもの (15 フレームごと)
+    const frames = list.flatMap((pid, index) => pid === 258 && (stream[index * 188 + 1] & 0x40) !== 0 ? [index] : []);
+    const keyframes = frames.filter((_, n) => n % 15 === 0);
+    expect(keyframes.length).toStrictEqual(16);
+    // どのキーフレームも、1 つ前の映像のフレームより後に PAT がある
+    for (const index of keyframes) {
+      const before = list.slice(0, index);
+      expect(before.lastIndexOf(0)).toBeGreaterThan(before.lastIndexOf(258));
+    }
+  });
+});
+
 describe('RTMP timestamps that wrap around', () => {
   test.each([
     ['the RTMP specification (32bit)', 2 ** 32],
@@ -189,5 +221,30 @@ describe('RTMP timestamps that wrap around', () => {
     expect(extinfs(generator)).toStrictEqual([1, 1, 1]);
     const durations = parts(generator).map((part) => Number(/DURATION=([\d.]+)/.exec(part)![1]));
     expect(durations).toStrictEqual([0.3, 0.3, 0.3, 0.1, 0.3, 0.3, 0.3, 0.1, 0.3, 0.3, 0.3, 0.1, 0.3, 0.3, 0.3]);
+  });
+});
+
+describe('Malformed messages', () => {
+  // TS パケットにするのはパーシャルセグメントが決まるまで待つが、壊れたデータの例外は、そのメッセージの feed で起きる
+  // (index.mts は feed の例外を記録して配信を終える。配信の終わりに finally の中で呼ぶ end で例外が起きると、サーバごと落ちてしまう)
+  test.each([
+    ['a coded frame whose NAL unit is shorter than its length', video(5000, Buffer.from('27010000000000000541', 'hex'))],
+    ['an AVC sequence header that is too short', video(5000, Buffer.from('17000000000142', 'hex'))],
+    ['an AAC sequence header that is too short', audio(5000, Buffer.from('af0012', 'hex'))],
+  ])('%s as the last message: feed throws, and end completes the playlist without throwing', async (_, malformed) => {
+    const generator = new LLHLSGenerator({ liveWindowLength: 3, partialSegmentDuration: 0.3 });
+    generator.feed(video(0, AVC_SEQUENCE_HEADER));
+    generator.feed(audio(0, AAC_SEQUENCE_HEADER));
+    for (let t = 0; t < 5000; t += 100) {
+      generator.feed(video(t, avc(t % 1000 === 0 ? 1 : 2)));
+      generator.feed(audio(t + 8, AAC_FRAME));
+    }
+
+    expect(() => { generator.feed(malformed); }).toThrow();
+    expect(() => { generator.end(); }).not.toThrow();
+    // 最後のセグメントも完成して、プレイリストを公開できる
+    expect(await generator.published()).toStrictEqual(true);
+    expect(generator.m3u8()).toContain('#EXT-X-ENDLIST');
+    expect(extinfs(generator)).toStrictEqual([1, 1, 1]);
   });
 });

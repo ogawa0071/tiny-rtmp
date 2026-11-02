@@ -141,6 +141,19 @@ describe('Tracks in the initialization segment', () => {
     }
   });
 
+  test('no onMetaData and timestamps that do not advance: only the newest 1000 frames are kept while the other track is waited for', () => {
+    const transmuxer = new FMP4Transmuxer();
+    transmuxer.feed(video(0, AVC_SEQUENCE_HEADER));
+    // timestamp が進まない映像だけの配信 (配信ソフトの不具合など) では、UNDECLARED_TRACK_WAIT の間が終わらない
+    const waiting: FMP4Fragment[] = [];
+    for (let i = 0; i < 5000; i++) { waiting.push(... transmuxer.feed(video(0, keyframes(i * 100)))); }
+    expect(waiting).toStrictEqual([]);
+
+    // timestamp が進んで待ち終わると、取っておいた新しい方の 1000 フレームが送られる (いま届いたフレームは長さが分からないので、まだ送られない)
+    const fragments = transmuxer.feed(video(1000, keyframes(0)));
+    expect(fragments.length).toStrictEqual(1000);
+  });
+
   test('an onMetaData that arrives after the first frames and declares AAC: the frames kept until then are not sent before the gap', () => {
     const transmuxer = new FMP4Transmuxer();
     transmuxer.feed(video(0, AVC_SEQUENCE_HEADER));
@@ -166,12 +179,31 @@ describe('Tracks in the initialization segment', () => {
     // 最初に届いた映像が H.264 ではないので、H.264 の初期化情報は待たない
     const fragments = publish(transmuxer, { videoFrame: () => frame, audioFrame: AAC_FRAME, before: (t) => {
       if (t === 0) { transmuxer.feed(audio(0, AAC_SEQUENCE_HEADER)); }
+      // 最初の AAC のフレーム (8 ms) を受け取った時には、もう初期化セグメントができている (UNDECLARED_TRACK_WAIT の 1 秒を待たない)
+      if (t === 100) { expect(transmuxer.initialize()).not.toBeNull(); }
     } });
 
     expect(tracks(transmuxer)).toStrictEqual(['mp4a']);
     // 最初の AAC のフレーム (8 ms) から、全ての AAC のフレームが送られる
     expect(fragments.length).toStrictEqual(30);
     expect(decodeTime(fragments[0])).toStrictEqual(Math.floor(8 * 44100 / 1000));
+  });
+
+  test('no onMetaData, an empty AVC sequence header first (FFmpeg 6.1 or later, encoder without global header): the real one that arrives later is waited for', () => {
+    const transmuxer = new FMP4Transmuxer();
+    // 配信の始めに中身が空の AVC の初期化情報と AAC の初期化情報が届き、本当の AVC の初期化情報は最初の映像のフレーム (300 ms) の直前に届く
+    // (エンコーダの遅延で、最初の映像のフレームより先に AAC のフレームが届く。それは映像の初期化情報を待っている間に届くので捨てる)
+    transmuxer.feed(video(0, Buffer.from('1700000000', 'hex')));
+    transmuxer.feed(audio(0, AAC_SEQUENCE_HEADER));
+    const fragments: FMP4Fragment[] = [];
+    for (let t = 0; t < 3000; t += 100) {
+      if (t === 300) { transmuxer.feed(video(t, AVC_SEQUENCE_HEADER)); }
+      if (t >= 300) { fragments.push(... transmuxer.feed(video(t, keyframes(t - 300)))); }
+      fragments.push(... transmuxer.feed(audio(t + 8, AAC_FRAME)));
+    }
+
+    expect(tracks(transmuxer)).toStrictEqual(['avc1', 'mp4a']);
+    expect(trackIds(fragments)).toStrictEqual(new Set([1, 2]));
   });
 
   test('no onMetaData, H.264 + MP3: the keyframe that arrives before the first MP3 frame is sent too', () => {
@@ -205,6 +237,31 @@ describe('Tracks in the initialization segment', () => {
       // 映像のない配信なので、どの音声の断片からも送り始められる
       expect(fragments.length).toStrictEqual(30);
       expect(fragments.every(({ independent }) => independent)).toStrictEqual(true);
+    } finally {
+      registerLogger(new NoopLogger());
+    }
+  });
+
+  test.each([
+    ['H.264 + AAC', { videocodecid: 7, audiocodecid: 10 }, ['mp4a']],
+    ['H.264 only', { videocodecid: 7 }, []],
+  ])('%s whose sequence header arrives after the first frames: the video stays ignored after the sequence header arrives', (_, object, expected) => {
+    const warnings: string[] = [];
+    registerLogger(Object.assign(new NoopLogger(), { warn: (message: string) => { warnings.push(message); } }));
+    const transmuxer = new FMP4Transmuxer();
+    try {
+      transmuxer.feed(onmetadata(object));
+      const audioFrame = expected.length > 0 ? AAC_FRAME : undefined;
+      if (audioFrame != null) { transmuxer.feed(audio(0, AAC_SEQUENCE_HEADER)); }
+      // AVC の初期化情報が、最初のフレーム (0 ms) より後の 300 ms に届く
+      const fragments = publish(transmuxer, { videoFrame: keyframes, audioFrame, before: (t) => {
+        if (t === 300) { transmuxer.feed(video(t, AVC_SEQUENCE_HEADER)); }
+      } });
+
+      // 映像のトラックがない配信として扱うと警告した後は、初期化情報が届いても映像を送らない (音声がなければ何も送らない)
+      expect(warnings).toStrictEqual(['Video sequence header is missing, video is ignored']);
+      expect(tracks(transmuxer)).toStrictEqual(expected);
+      expect(trackIds(fragments)).toStrictEqual(new Set(expected.length > 0 ? [2] : []));
     } finally {
       registerLogger(new NoopLogger());
     }

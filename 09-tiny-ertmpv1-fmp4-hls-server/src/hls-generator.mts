@@ -37,6 +37,9 @@ const AUDIO_TRACK_ID = 2;
 const HEVC_FOURCC = Buffer.from('hvc1', 'ascii').readUInt32BE(0);
 // onMetaData にコーデックが書かれていない時に、まだ初期化情報が届いていないトラックを、最初のフレームから待つ長さ (ミリ秒)
 const UNDECLARED_TRACK_WAIT = 1000;
+// UNDECLARED_TRACK_WAIT の間に取っておくフレームの数の上限 (1 秒間に届くフレームの数より十分に多くする)
+// (timestamp が進まない配信では待ち終わらないので、取っておくフレームが増え続けないようにする)
+const MAX_WAITING_FRAMES = 1000;
 
 export default class HLSGenerator {
   private timestamps = new TimestampUnwrapper();
@@ -132,6 +135,8 @@ export default class HLSGenerator {
     switch (payload.kind) {
       case 'Video':
         if (payload.packetType !== PacketType.SequenceStart) { break; }
+        // 初期化情報より先にフレームが届いた映像などは、映像のトラックがない配信として扱うので (上)、後から初期化情報が届いても使わない
+        if (this.videoTrack == null && this.unsupportedVideoCodec != null) { return; }
         switch (payload.codec) {
           case 'AVC':
             this.videoTrack = write_mp4_avc_track_information(VIDEO_TRACK_ID, RTMP_TIMESCALE, payload.avcDecoderConfigurationRecord);
@@ -185,6 +190,8 @@ export default class HLSGenerator {
       if (!declared && missing) {
         this.firstFrameTimestamp ??= payload.timestamp;
         if (payload.timestamp - this.firstFrameTimestamp < UNDECLARED_TRACK_WAIT) {
+          // 上限に達したら一番古いフレームを捨てる (古い方から捨てるので、取っておいたフレームの途中に間は空かない)
+          if (this.waitingFrames.length >= MAX_WAITING_FRAMES) { this.waitingFrames.shift(); }
           this.waitingFrames.push(payload);
           return;
         }

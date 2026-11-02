@@ -63,6 +63,7 @@ type Viewer = {
   write: (buffer: Buffer) => void;
   exit: () => void;
   initialized: boolean; // 初期化セグメントを送ったか
+  initialBytes: number; // 視聴を始めた時にまとめて送ったバイト数 (初期化セグメントと、待っている間に取っておいたフレームを含む断片)
 };
 const viewers = new Set<Viewer>();
 
@@ -74,13 +75,16 @@ const handle = async (connection: Duplex) => {
     for await (const message of handle_rtmp(connection, { auth, limit: { bandwidth } })) {
       published = true;
       // 初期化セグメントを作った時は、それまで待っていたフレームの断片もまとめて返ってくる
-      for (const fragment of rtmp_to_fmp4.feed(message)) {
+      const fragments = rtmp_to_fmp4.feed(message);
+      for (const [index, fragment] of fragments.entries()) {
         for (const viewer of viewers) {
           // 視聴を始めた視聴者には、最初に初期化セグメントを送る
           // 映像は、キーフレームから送り始める (それより前のフレームは、参照するフレームがないのでデコードできない)
           if (!viewer.initialized) {
             const initialize = rtmp_to_fmp4.initialize();
             if (initialize == null || !fragment.independent) { continue; }
+            // 初期化セグメントと、ここから後の断片はまとめて送ることになる
+            viewer.initialBytes = fragments.slice(index).reduce((bytes, { data }) => bytes + data.byteLength, initialize.byteLength);
             viewer.write(initialize);
             viewer.initialized = true;
           }
@@ -121,11 +125,15 @@ const web_server = http.createServer({ highWaterMark }, (req, res) => {
   const viewer: Viewer = {
     write: (chunk: Buffer) => {
       if (res.closed) { return; }
+      res.write(chunk);
       // highWaterMark を超えて送信が詰まっている視聴者は切断する
-      if (!res.write(chunk) && highWaterMark != null) { res.destroy(); }
+      // (視聴を始めた時にまとめて送ったデータは、速い視聴者でも送り終わるまでに時間がかかるので、その分は詰まりとみなさない。
+      //  Node.js の http は同じ tick に書いたデータを tick の終わりにまとめて送るので、それまでは全て writableLength に数えられる)
+      if (highWaterMark != null && res.writableLength > highWaterMark + viewer.initialBytes) { res.destroy(); }
     },
     exit: () => { res.end(); viewers.delete(viewer); },
     initialized: false,
+    initialBytes: 0,
   };
   viewers.add(viewer);
 

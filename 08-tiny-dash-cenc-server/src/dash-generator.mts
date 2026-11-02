@@ -232,6 +232,8 @@ export default class DASHGenerator {
     switch (payload.kind) {
       case 'Video':
         if (payload.packetType === PacketType.SequenceStart) {
+          // 初期化情報より先にフレームが届いた映像は、映像のトラックがない配信として扱うので (下)、後から初期化情報が届いても使わない
+          if (this.videoSequenceHeaderMissing) { return; }
           this.avcDecoderConfigurationRecord = payload.avcDecoderConfigurationRecord;
           this.parameterSets = read_parameter_sets(read_avc_decoder_configuration_record(payload.avcDecoderConfigurationRecord));
           return;

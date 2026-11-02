@@ -88,6 +88,9 @@ describe('Messages that are not relayed', () => {
     // Enhanced RTMP の ExVideoTagHeader (先頭 1bit が立っている) は、下位 4bit が 7 でも AVC の CodecID ではなく PacketType
     ['an Enhanced RTMP video packet whose PacketType is 7', video(0, Buffer.from('97617663310000000000', 'hex'))],
     ['a video message that is too short', video(0, Buffer.from('17', 'hex'))],
+    ['an audio message that is too short', audio(0, Buffer.from('af', 'hex'))],
+    // FrameType 0 は FLV の仕様では定義されていない値 (Enhanced RTMP の仕様では予約されている)
+    ['a video message with the reserved FrameType 0', video(0, Buffer.from('0701000000', 'hex'))],
     ['onTextData', data_message(['@setDataFrame', 'onTextData', { text: 'hello' }])],
     ['onMetaData that is not an object', data_message(['@setDataFrame', 'onMetaData', 'hello'])],
   ])('%s is not relayed', (_, message) => {

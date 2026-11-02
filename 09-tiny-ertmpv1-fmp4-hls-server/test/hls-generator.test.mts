@@ -151,6 +151,20 @@ describe('Tracks decided from the sequence headers', () => {
     }
   });
 
+  test('no onMetaData and timestamps that do not advance: only the newest 1000 frames are kept while the other track is waited for', () => {
+    const generator = new HLSGenerator();
+    generator.feed(video(0, AVC_SEQUENCE_HEADER));
+    // timestamp が進まない映像だけの配信 (配信ソフトの不具合など) では、UNDECLARED_TRACK_WAIT の間が終わらない
+    for (let i = 0; i < 5000; i++) { generator.feed(video(0, avc(i % 10 === 0 ? 1 : 2))); }
+    // timestamp が進んで待ち終わると、取っておいた新しい方の 1000 フレームが最初のセグメントになる
+    generator.feed(video(1000, avc(1)));
+    generator.end();
+    expect(extinfs(generator)).toStrictEqual([1]);
+    // セグメントに入っている fMP4 の断片 (moof) の数
+    const [, msn] = generator.m3u8().match(/^(\d+)\.m4s$/m)!;
+    expect(generator.segment(Number(msn))!.toString('latin1').split('moof').length - 1).toStrictEqual(1000);
+  });
+
   test('an onMetaData that arrives after the first frames and declares AAC: the frames kept until then are not written before the gap', () => {
     const generator = new HLSGenerator();
     generator.feed(video(0, AVC_SEQUENCE_HEADER));
@@ -201,6 +215,30 @@ const warnings = (run: () => void): string[] => {
   try { run(); } finally { registerLogger(new NoopLogger()); }
   return logger.warnings;
 };
+
+describe('Video sequence header after the first frames', () => {
+  test.each([
+    ['H.264 + AAC', { videocodecid: 7, audiocodecid: 10 }, [2]],
+    ['H.264 only', { videocodecid: 7 }, []],
+  ])('%s: the video stays ignored after the sequence header arrives', (_, object, ids) => {
+    const generator = new HLSGenerator();
+    expect(warnings(() => {
+      generator.feed(onmetadata(object));
+      if (ids.length > 0) { generator.feed(audio(0, AAC_SEQUENCE_HEADER)); }
+      for (let t = 0; t < 3000; t += 100) {
+        // AVC の初期化情報が、最初のフレーム (0 ms) より後の 300 ms に届く
+        if (t === 300) { generator.feed(video(t, AVC_SEQUENCE_HEADER)); }
+        generator.feed(video(t, avc(t % 1000 === 0 ? 1 : 2)));
+        if (ids.length > 0) { generator.feed(audio(t + 8, AAC_FRAME)); }
+      }
+      generator.end();
+    })).toStrictEqual(['Video sequence header is missing, video is ignored']);
+
+    // 映像のトラックがない配信として扱うと警告した後は、初期化情報が届いても映像を書き出さない (音声がなければ何も書き出さない)
+    expect(generator.initialize()?.includes('avc1') ?? false).toBe(false);
+    expect(trackIds(generator)).toStrictEqual(new Set(ids));
+  });
+});
 
 describe('Enhanced RTMP audio after the AAC sequence header', () => {
   // FFmpeg 8.0 以降は 5.1ch など (モノラルとステレオ以外) の AAC の初期化情報の後に、MultichannelConfig を送ってくる

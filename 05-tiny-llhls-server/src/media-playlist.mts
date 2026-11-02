@@ -76,7 +76,7 @@ export default class MediaPlaylist {
   private videoTimestamps: number[] = [];
   // 最後に届いた映像のフレームと、その後に届いた音声などのデータ (まだパーシャルセグメントに入れていない)
   // フレームの長さは次の映像のフレームが届くまで分からないので、それまではどのパーシャルセグメントに入れるかを決めない
-  // (data は MPEG-TS に変換するジェネレータなので、どのパーシャルセグメントに入れるかを決めてから、届いた順に取り出す。
+  // (data は取り出す時に TS パケットを作るジェネレータなので、どのパーシャルセグメントに入れるかを決めてから、届いた順に取り出す。
   //  そうすれば、新しいパーシャルセグメントを始めた時 (partialSegmentStarted) に、その先頭に PAT/PMT を入れられる)
   private pendingFrame: { timestamp: number; timescale: number; keyframe: boolean; data: Iterable<Buffer>[]; } | null = null;
   // セグメントの途中で新しいパーシャルセグメントを始めた時に呼ぶ (LLHLSGenerator が、その先頭に PAT/PMT を入れるのに使う)
@@ -215,7 +215,7 @@ export default class MediaPlaylist {
       // (このフレームから始まる次のパーシャルセグメントが、いつもより長いフレームから始まっているなら (stalled)、それも使わない (その次に区切った時に決める))
       this.partialSegmentExtra = regular || this.lastFrameLength == null ? 0 : (end - frame.timestamp - this.lastFrameLength) / frame.timescale;
     }
-    // 保留していたデータは、入れるパーシャルセグメントが決まったここで MPEG-TS に変換する (新しいパーシャルセグメントなら、先頭に PAT/PMT が入る)
+    // 保留していたデータは、入れるパーシャルセグメントが決まったここで TS パケットにする (新しいパーシャルセグメントなら、先頭に PAT/PMT が入る)
     for (const data of frame.data) {
       for (const buffer of data) { this.currentSegment?.feed(buffer, frame.keyframe); }
     }
@@ -326,7 +326,7 @@ export default class MediaPlaylist {
     if (begin != null && timestamp > begin && (full || late)) {
       this.completePartialSegment(timestamp, timescale, timestamp, true);
     }
-    // data は取り出す時に MPEG-TS に変換するジェネレータなので、後のメッセージと順番が入れ替わらないように、保留したデータと一緒に届いた順に取り出す
+    // data は取り出す時に TS パケットを作るジェネレータなので、後のメッセージと順番が入れ替わらないように、保留したデータと一緒に届いた順に取り出す
     this.pendingFrame = { timestamp, timescale, keyframe, data: [data] };
   }
 

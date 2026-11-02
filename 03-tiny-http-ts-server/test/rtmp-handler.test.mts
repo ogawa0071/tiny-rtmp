@@ -113,6 +113,11 @@ describe('TimestampUnwrapper', () => {
     expect(unwrap([video(0), audio(0), video(0x7FFFFFBD), video(0x7FFFFFDF), audio(0x7FFFFFEB), video(0), audio(0)])).toStrictEqual([0, 0, 0, 34, 46, 67, 67]);
   });
 
+  test('only the negative timestamps in the first second of the stream move the time of the video and audio', () => {
+    // 0.5 秒 (配信の最初の 1 秒の間) に届いた -40 ms の音声では全体を 40 ms ずらし、1.5 秒に届いた -96 ms の音声ではずらさない (0 にする)
+    expect(unwrap([video(0), video(500), audio(0x7FFFFFD8), video(533), video(1500), audio(0x7FFFFFA0), video(1533)])).toStrictEqual([0, 500, 0, 573, 1540, 0, 1573]);
+  });
+
   test('a negative timestamp that arrives later becomes 0 and does not move the time of the video and audio after it', () => {
     // 配信の途中 (5 秒) で -96 ms の音声が 1 つだけ届いても、ずらす量は最初に決めた 67 ms のままにする
     expect(unwrap([video(0), audio(0), video(0x7FFFFFBD), video(0), audio(5000), audio(0xFFFFFFA0), video(5033), audio(5023)])).toStrictEqual([0, 0, 0, 67, 5067, 0, 5100, 5090]);

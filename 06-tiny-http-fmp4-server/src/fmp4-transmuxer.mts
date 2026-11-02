@@ -26,6 +26,9 @@ const VIDEO_TRACK_ID = 1;
 const AUDIO_TRACK_ID = 2;
 // onMetaData にコーデックが書かれていない時に、まだ初期化情報が届いていないトラックを、最初のフレームから待つ長さ (ミリ秒)
 const UNDECLARED_TRACK_WAIT = 1000;
+// UNDECLARED_TRACK_WAIT の間に取っておくフレームの数の上限 (1 秒間に届くフレームの数より十分に多くする)
+// (timestamp が進まない配信では待ち終わらないので、取っておくフレームが増え続けないようにする)
+const MAX_WAITING_FRAMES = 1000;
 
 // 視聴者に送る fMP4 の断片 (moof + mdat)
 export type FMP4Fragment = {
@@ -93,6 +96,8 @@ export default class FMP4Transmuxer {
     if (!declared && missing) {
       this.firstFrameTimestamp ??= frame.timestamp;
       if (frame.timestamp - this.firstFrameTimestamp < UNDECLARED_TRACK_WAIT) {
+        // 上限に達したら一番古いフレームを捨てる (古い方から捨てるので、取っておいたフレームの途中に間は空かない)
+        if (this.waitingFrames.length >= MAX_WAITING_FRAMES) { this.waitingFrames.shift(); }
         this.waitingFrames.push(frame);
         return null;
       }
@@ -141,6 +146,8 @@ export default class FMP4Transmuxer {
     switch (payload.kind) {
       case 'Video':
         if (payload.packetType === PacketType.SequenceStart) {
+          // 初期化情報より先にフレームが届いた映像は、映像のトラックがない配信として扱うので (下)、後から初期化情報が届いても使わない
+          if (this.videoSequenceHeaderMissing) { return []; }
           this.avcDecoderConfigurationRecord = payload.avcDecoderConfigurationRecord;
           return [];
         }

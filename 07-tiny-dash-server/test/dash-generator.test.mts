@@ -248,6 +248,26 @@ describe('Sequence headers without the configuration', () => {
     expect(warnings).toStrictEqual(['Video sequence header is missing, video is ignored']);
     expectTracks(mpds, ['audio']);
   });
+
+  test('H.264 whose sequence header arrives after the first frames: the video stays ignored, so the MPD does not gain the video track', () => {
+    const warnings: string[] = [];
+    registerLogger(Object.assign(new NoopLogger(), { warn: (message: string) => { warnings.push(message); } }));
+    let mpds: (string | null)[] = [];
+    try {
+      const generator = new DASHGenerator();
+      generator.feed(metadata(7, 10));
+      // AVC の初期化情報が、最初のフレーム (0 ms) より後で、MPD を作れるようになる (最初のセグメントができる) 前の 300 ms に届く
+      mpds = publish(generator, { audioStart: 0, firstRequest: 0, beforeVideo: (t) => {
+        if (t === 300) { generator.feed(video(t, AVC_SEQUENCE_HEADER)); }
+      } });
+    } finally {
+      registerLogger(new NoopLogger());
+    }
+
+    // 映像のトラックがない配信として扱うと警告した後は、初期化情報が届いても映像を MPD に載せない
+    expect(warnings).toStrictEqual(['Video sequence header is missing, video is ignored']);
+    expectTracks(mpds, ['audio']);
+  });
 });
 
 describe('RTMP timestamps that wrap around', () => {
