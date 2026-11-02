@@ -1,6 +1,5 @@
 import ByteVector from './byte-vector.mts';
 
-
 const fixed_point_U16BE = (integer: number, decimal: number, vector: ByteVector): void => {
   vector.writeU16BE(integer);
   vector.writeU16BE(decimal);
@@ -49,10 +48,10 @@ export const fullbox = (name: string, version: number, flags: number, vector: By
 
 export const ftyp = (vector: ByteVector, cb?: callback): void => {
   return box('ftyp', vector, (vector) => {
-    vector.write(Buffer.from('isom', 'ascii'));
-    vector.writeU32BE(1);
-    vector.write(Buffer.from('isom', 'ascii'));
-    vector.write(Buffer.from('avc1', 'ascii'));
+    vector.write(Buffer.from('iso6', 'ascii'));
+    vector.writeU32BE(0);
+    vector.write(Buffer.from('iso6', 'ascii'));
+    vector.write(Buffer.from('mp41', 'ascii'));
     cb?.(vector);
   });
 };
@@ -66,12 +65,13 @@ export const mvhd = (timescale: number, vector: ByteVector, cb?: callback): void
     vector.writeU32BE(timescale); // timescale
     vector.writeU32BE(0); // duration
     fixed_point_U16BE(1, 0, vector); // prefered ratio
-    vector.writeU16BE(1); // prefered volume
+    vector.writeU16BE(0x0100); // prefered volume
     vector.writeU16BE(0); // predefined
     vector.write(Buffer.alloc(8)); // reserved
     vector.write(unit_composition_matrix); // composition_matrix
     vector.write(Buffer.alloc(24)); // reserved
     vector.writeI32BE(-1); // next_track_id
+    cb?.(vector);
   });
 };
 export const mvex = (vector: ByteVector, cb?: callback): void => {
@@ -83,13 +83,14 @@ export const trex = (track_id: number, vector: ByteVector, cb?: callback): void 
     vector.writeU32BE(1); // default_sample_description_index
     vector.writeU32BE(0); // default_sample_duration
     vector.writeU32BE(0); // default_sample_size
-    vector.writeU32BE(0x00010001); // default_sample_flags
+    vector.writeU32BE(0x00010000); // default_sample_flags
+    cb?.(vector);
   });
 };
 export const trak = (vector: ByteVector, cb?: callback): void => {
   box('trak', vector, cb);
 };
-export const tkhd = (track_id: number, width: number, height: number, vector: ByteVector, cb?: callback): void => {
+export const tkhd = (track_id: number, width: number, height: number, volume: number, vector: ByteVector, cb?: callback): void => {
   // MEMO: 0x000001 => track_enabled
   // MEMO: 0x000002 => track_in_movie
   // MEMO: 0x000004 => track_in_preview
@@ -102,7 +103,7 @@ export const tkhd = (track_id: number, width: number, height: number, vector: By
     vector.write(Buffer.alloc(8)); // reserved
     vector.writeU16BE(0); // layer
     vector.writeU16BE(0); // alternate_group
-    vector.writeU16BE(0); // volume
+    vector.writeU16BE(volume); // volume
     vector.writeU16BE(0); // reserved
     vector.write(unit_composition_matrix); // composition_matrix
     fixed_point_U16BE(width, 0, vector); // width
@@ -140,7 +141,7 @@ export const nmhd = (vector: ByteVector, cb?: callback): void => {
   fullbox('nmhd', 0, 0x000000, vector, cb);
 };
 export const vmhd = (vector: ByteVector, cb?: callback): void => {
-  fullbox('vmhd', 0, 0x000000, vector, (vector) => {
+  fullbox('vmhd', 0, 0x000001, vector, (vector) => {
     vector.writeU16BE(0); // graphicsmode
     vector.write(Buffer.alloc(6)); // opcolor
     cb?.(vector);
@@ -223,23 +224,13 @@ export const sampleEntry = (vector: ByteVector, cb?: callback): void => {
   cb?.(vector);
 };
 
-export const srat = (sample_rate: number, vector: ByteVector, cb?: callback): void => {
-  fullbox('srat', 0, 0x000000, vector, (vector) => {
-    vector.writeU32BE(sample_rate);
-    cb?.(vector);
-  });
-};
-
 export const audioSampleEntry = (channel_count: number, sample_size: number, sample_rate: number, vector: ByteVector, cb?: callback): void => {
   sampleEntry(vector);
   vector.write(Buffer.alloc(8)); // reserved
   vector.writeU16BE(channel_count); // 0: unknown, 1: mono, 2: stereo
   vector.writeU16BE(sample_size); // bit数 (8, 16, 24, ...)
   vector.writeU32BE(0); // reserved
-  fixed_point_U16BE(sample_rate, 0, vector); // sample_rate
-  if (sample_rate >= 2 ** 16) { // 16bit で収まらない sample_rate は srat box で記載
-    srat(sample_rate, vector);
-  }
+  fixed_point_U16BE(sample_rate < 2 ** 16 ? sample_rate : 0, 0, vector); // sample_rate
   // MEMO: MSE 実装だと chnl box が基本ないけど、いる場合はあるの?
   // コーデック情報がない PCM (Safari 18 は ipcm サポートあり) ではマルチチャンネル時にいりそうな気が...
   cb?.(vector);
@@ -255,7 +246,7 @@ export const esds = (audioSpecificConfig: Buffer, vector: ByteVector, cb?: callb
   fullbox('esds', 0, 0, vector, (vector) => {
     vector.writeU8(0x03); // descriptor_type
     vector.writeU8(0x17 + audioSpecificConfig.byteLength); // descriptor_length
-    vector.writeU16BE(0x01); // es_id
+    vector.writeU16BE(0); // es_id
     vector.writeU8(0); // stream_priority
     vector.writeU8(0x04); // descriptor_type
     vector.writeU8(0x0F + audioSpecificConfig.byteLength); // descriptor_length
@@ -302,7 +293,7 @@ export const avcC = (avcDecoderConfigurationRecord: Buffer, vector: ByteVector, 
 
 export const track = (track_id: number, width: number, height: number, timescale: number, type: string, vector: ByteVector, cb?: callback): void => {
   trak(vector, (vector) => {
-    tkhd(track_id, width, height, vector);
+    tkhd(track_id, width, height, type === 'soun' ? 0x0100 : 0, vector);
     mdia(vector, (vector) => {
       mdhd(timescale, vector);
       hdlr(type, 'PLAY, Inc', vector);
@@ -323,21 +314,21 @@ export const initialize = (timescale: number, track_ids: number[], vector: ByteV
   ftyp(vector);
   moov(vector, (vector) => {
     mvhd(timescale, vector);
+    cb?.(vector);
     mvex(vector, (vector) => {
       for (const track_id of track_ids) {
         trex(track_id, vector);
       }
     });
-    cb?.(vector);
   });
 };
 
 export const moof = (vector: ByteVector, cb?: callback): void => {
   box('moof', vector, cb);
 };
-export const mfhd = (vector: ByteVector, cb?: callback): void => {
+export const mfhd = (sequence_number: number, vector: ByteVector, cb?: callback): void => {
   fullbox('mfhd', 0, 0x000000, vector, (vector) => {
-    vector.writeU32BE(0); // sequence_number
+    vector.writeU32BE(sequence_number); // sequence_number
     cb?.(vector);
   });
 };
@@ -360,8 +351,8 @@ export const tfhd = (trackId: number, vector: ByteVector, cb?: callback): void =
 export const tfdt = (baseMediaDecodeTime: number, vector: ByteVector, cb?: callback): void => {
   fullbox('tfdt', 1, 0x000000, vector, (vector) => {
     // Number.MAX_SAFE_INTEGER (2^53 - 1) を超えることはない、という仮定のもとで number で表現している
-    vector.writeU32BE(Math.floor(baseMediaDecodeTime / 2 ** 32) % (2 ** 32));
-    vector.writeU32BE(Math.floor(baseMediaDecodeTime / 2 **  0) % (2 ** 32));
+    vector.writeU32BE(Math.floor(baseMediaDecodeTime / 2 ** 32));
+    vector.writeU32BE(baseMediaDecodeTime % (2 ** 32));
     cb?.(vector);
   });
 };
@@ -402,22 +393,24 @@ export const mdat = (data: Buffer, vector: ByteVector, cb?: callback): void => {
   });
 };
 export type FragmentInformation = {
+  sequence_number: number;
   track_id: number;
   dts: number;
   cto: number;
   duration: number;
   keyframe: boolean;
 };
+export const TRUN_DATA_OFFSET_POSITION = 4 + 4 + 4 + 4;
+
 export const fragment = (information: FragmentInformation, data: Buffer, vector: ByteVector, cb?: callback): void => {
-  let trun_offset = null;
   const moof_begin = vector.byteLength();
+  let trun_begin = 0;
   moof(vector, (vector) => {
-    mfhd(vector);
+    mfhd(information.sequence_number, vector);
     traf(vector, (vector) => {
       tfhd(information.track_id, vector);
-      tfdt(information.dts, vector, (vector) => {
-        trun_offset = vector.byteLength();
-      });
+      tfdt(information.dts, vector);
+      trun_begin = vector.byteLength();
       trun(0 /* ダミー */, [{
         duration: information.duration,
         bytes: data.byteLength,
@@ -428,7 +421,5 @@ export const fragment = (information: FragmentInformation, data: Buffer, vector:
   });
   const moof_end = vector.byteLength();
   mdat(data, vector, cb);
-  // trun の ダミーを正しい値にする
-  const trun_access_index = 4 /* size */ + 4 /* fourcc */ + 4 /* version + flags */ + 4;
-  vector.writeU32BE(moof_end - moof_begin + 8 /* mdat header */, trun_offset! + trun_access_index);
+  vector.writeU32BE(moof_end - moof_begin + 8 /* mdat header */, trun_begin + TRUN_DATA_OFFSET_POSITION);
 };

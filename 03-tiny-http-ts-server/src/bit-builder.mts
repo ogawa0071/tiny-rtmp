@@ -4,17 +4,17 @@ export default class BitBuilder {
 
   protected fill(): void {
     while (this.bits.length >= 8) {
-      let datum = 0;
-      for (let i = 0; i < 8; i++) {
-        datum = datum * 2 + this.bits.shift()!;
-      }
-      this.data.push(datum);
+      this.push(this.bits.splice(0, 8).reduce((byte, bit) => byte * 2 + bit, 0));
     }
+  }
+
+  protected push(byte: number): void {
+    this.data.push(byte);
   }
 
   public writeBits(value: number, length: number): void {
     for (let i = length - 1; i >= 0; i--) {
-      this.bits.push(Math.floor((value % (2 ** (i + 1))) / (2 ** i)));
+      this.bits.push(Math.floor(value / (2 ** i)) % 2);
     }
     this.fill();
   }
@@ -40,7 +40,6 @@ export default class BitBuilder {
   }
 
   public writeByteAlign(fill: 0 | 1 = 0): void {
-    if ((this.bits.length % 8) === 0) { return; }
     while ((this.bits.length % 8) !== 0) {
       this.bits.push(fill);
     }

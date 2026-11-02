@@ -2,6 +2,7 @@ import crypto from 'node:crypto';
 
 import { read_audio_specific_config } from '../../03-tiny-http-ts-server/src/aac.mts';
 import { make, esds, track } from '../../06-tiny-http-fmp4-server/src/fmp4.mts';
+import { aac_channel_count } from '../../06-tiny-http-fmp4-server/src/aac.mts';
 import { enca, EncryptionFormat, EncryptionScheme, frma, IVType, padIV, patternToFullSample, schi, schm, sinf, tenc, type EncryptionFormatCBCS, type EncryptionFormatCENC, type SubsampleInformation } from './cenc.mts';
 import ByteBuilder from '../../01-tiny-rtmp-server/src/byte-builder.mts';
 
@@ -15,7 +16,7 @@ export const write_mp4_aac_track_information = (track_id: number, timescale: num
 
   return make((vector) => {
     track(track_id, 0, 0, timescale, 'soun', vector, (vector) => {
-      enca(channelConfiguration, 16, samplingFrequency, vector, (vector) => {
+      enca(aac_channel_count(channelConfiguration), 16, samplingFrequency, vector, (vector) => {
         esds(audioSpecificConfig, vector, (vector) => {
           vector.write(Buffer.from([0x06, 0x01, 0x02])); // SyncLayer
         });

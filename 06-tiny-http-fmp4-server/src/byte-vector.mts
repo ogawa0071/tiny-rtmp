@@ -1,3 +1,5 @@
+type Writer = (buffer: Buffer, offset: number) => void;
+
 export default class ByteVector {
   private buffer: Buffer;
   private length = 0;
@@ -13,7 +15,7 @@ export default class ByteVector {
   }
 
   private extend(desired: number): void {
-    let capacity = this.buffer.byteLength;
+    let capacity = Math.max(1, this.buffer.byteLength);
     while (capacity < desired) {
       capacity *= 2;
     }
@@ -24,59 +26,46 @@ export default class ByteVector {
     }
   }
 
-  public write(buffer: Buffer, position?: number): void {
-    position ??= this.length;
-    position = position < 0 ? this.length + position : position;
-    if (position < 0 || position > this.length) {
+  private resolve(position: number): number {
+    return position < 0 ? this.length + position : position;
+  }
+
+  private writeAt(position: number | undefined, byteLength: number, write: Writer): void {
+    const offset = this.resolve(position ?? this.length);
+    if (offset < 0 || offset > this.length) {
       throw new RangeError('Attempt to access memory outside buffer bounds');
     }
-    this.extend(position + buffer.byteLength);
-    this.buffer.set(buffer, position);
-    this.length = Math.max(this.length, position + buffer.byteLength);
+    this.extend(offset + byteLength);
+    write(this.buffer, offset);
+    this.length = Math.max(this.length, offset + byteLength);
+  }
+
+  private readAt(position: number, byteLength: number): number {
+    const offset = this.resolve(position);
+    if (offset < 0 || offset + byteLength > this.length) {
+      throw new RangeError('Attempt to access memory outside buffer bounds');
+    }
+    return offset;
+  }
+
+  public write(buffer: Buffer, position?: number): void {
+    this.writeAt(position, buffer.byteLength, (dst, offset) => dst.set(buffer, offset));
   }
 
   public writeUIntBE(value: number, length: number, position?: number): void {
-    position ??= this.length;
-    position = position < 0 ? this.length + position : position;
-    if (position < 0 || position > this.length) {
-      throw new RangeError('Attempt to access memory outside buffer bounds');
-    }
-    this.extend(position + length);
-    this.buffer.writeUIntBE(value, position, length);
-    this.length = Math.max(this.length, position + length);
+    this.writeAt(position, length, (dst, offset) => dst.writeUIntBE(value, offset, length));
   }
 
   public writeIntBE(value: number, length: number, position?: number): void {
-    position ??= this.length;
-    position = position < 0 ? this.length + position : position;
-    if (position < 0 || position > this.length) {
-      throw new RangeError('Attempt to access memory outside buffer bounds');
-    }
-    this.extend(position + length);
-    this.buffer.writeIntBE(value, position, length);
-    this.length = Math.max(this.length, position + length);
+    this.writeAt(position, length, (dst, offset) => dst.writeIntBE(value, offset, length));
   }
 
   public writeUIntLE(value: number, length: number, position?: number): void {
-    position ??= this.length;
-    position = position < 0 ? this.length + position : position;
-    if (position < 0 || position > this.length) {
-      throw new RangeError('Attempt to access memory outside buffer bounds');
-    }
-    this.extend(position + length);
-    this.buffer.writeUIntLE(value, position, length);
-    this.length = Math.max(this.length, position + length);
+    this.writeAt(position, length, (dst, offset) => dst.writeUIntLE(value, offset, length));
   }
 
   public writeIntLE(value: number, length: number, position?: number): void {
-    position ??= this.length;
-    position = position < 0 ? this.length + position : position;
-    if (position < 0 || position > this.length) {
-      throw new RangeError('Attempt to access memory outside buffer bounds');
-    }
-    this.extend(position + length);
-    this.buffer.writeIntLE(value, position, length);
-    this.length = Math.max(this.length, position + length);
+    this.writeAt(position, length, (dst, offset) => dst.writeIntLE(value, offset, length));
   }
 
   public writeU8(value: number, position?: number): void {
@@ -136,47 +125,19 @@ export default class ByteVector {
   }
 
   public writeF32BE(float: number, position?: number): void {
-    position ??= this.length;
-    position = position < 0 ? this.length + position : position;
-    if (position < 0 || position > this.length) {
-      throw new RangeError('Attempt to access memory outside buffer bounds');
-    }
-    this.extend(position + 4);
-    this.buffer.writeFloatBE(float, position);
-    this.length = Math.max(this.length, position + 4);
+    this.writeAt(position, 4, (dst, offset) => dst.writeFloatBE(float, offset));
   }
 
   public writeF64BE(double: number, position?: number): void {
-    position ??= this.length;
-    position = position < 0 ? this.length + position : position;
-    if (position < 0 || position > this.length) {
-      throw new RangeError('Attempt to access memory outside buffer bounds');
-    }
-    this.extend(position + 8);
-    this.buffer.writeDoubleBE(double, position);
-    this.length = Math.max(this.length, position + 8);
+    this.writeAt(position, 8, (dst, offset) => dst.writeDoubleBE(double, offset));
   }
 
   public writeF32LE(float: number, position?: number): void {
-    position ??= this.length;
-    position = position < 0 ? this.length + position : position;
-    if (position < 0 || position > this.length) {
-      throw new RangeError('Attempt to access memory outside buffer bounds');
-    }
-    this.extend(position + 4);
-    this.buffer.writeFloatLE(float, position);
-    this.length = Math.max(this.length, position + 4);
+    this.writeAt(position, 4, (dst, offset) => dst.writeFloatLE(float, offset));
   }
 
   public writeF64LE(double: number, position?: number): void {
-    position ??= this.length;
-    position = position < 0 ? this.length + position : position;
-    if (position < 0 || position > this.length) {
-      throw new RangeError('Attempt to access memory outside buffer bounds');
-    }
-    this.extend(position + 8);
-    this.buffer.writeDoubleLE(double, position);
-    this.length = Math.max(this.length, position + 8);
+    this.writeAt(position, 8, (dst, offset) => dst.writeDoubleLE(double, offset));
   }
 
   public build(): Buffer {
@@ -184,10 +145,8 @@ export default class ByteVector {
   }
 
   public read(begin?: number, end?: number): Buffer {
-    begin ??= 0;
-    end ??= this.length;
-    begin = begin < 0 ? this.length + begin : begin;
-    end = end < 0 ? this.length + end : end;
+    begin = this.resolve(begin ?? 0);
+    end = this.resolve(end ?? this.length);
     if (begin < 0 || begin > end || end > this.length) {
       throw new RangeError('Attempt to access memory outside buffer bounds');
     }
@@ -195,35 +154,19 @@ export default class ByteVector {
   }
 
   public readUIntBE(position: number, length: number): number {
-    position = position < 0 ? this.length + position : position;
-    if (position < 0 || position + length > this.length) {
-      throw new RangeError('Attempt to access memory outside buffer bounds');
-    }
-    return this.buffer.readUIntBE(position, length);
+    return this.buffer.readUIntBE(this.readAt(position, length), length);
   }
 
   public readIntBE(position: number, length: number): number {
-    position = position < 0 ? this.length + position : position;
-    if (position < 0 || position + length > this.length) {
-      throw new RangeError('Attempt to access memory outside buffer bounds');
-    }
-    return this.buffer.readIntBE(position, length);
+    return this.buffer.readIntBE(this.readAt(position, length), length);
   }
 
   public readUIntLE(position: number, length: number): number {
-    position = position < 0 ? this.length + position : position;
-    if (position < 0 || position + length > this.length) {
-      throw new RangeError('Attempt to access memory outside buffer bounds');
-    }
-    return this.buffer.readUIntLE(position, length);
+    return this.buffer.readUIntLE(this.readAt(position, length), length);
   }
 
   public readIntLE(position: number, length: number): number {
-    position = position < 0 ? this.length + position : position;
-    if (position < 0 || position + length > this.length) {
-      throw new RangeError('Attempt to access memory outside buffer bounds');
-    }
-    return this.buffer.readIntLE(position, length);
+    return this.buffer.readIntLE(this.readAt(position, length), length);
   }
 
   public readU8(position: number): number {
@@ -283,35 +226,19 @@ export default class ByteVector {
   }
 
   public readF32BE(position: number): number {
-    position = position < 0 ? this.length + position : position;
-    if (position < 0 || position + 4 > this.length) {
-      throw new RangeError('Attempt to access memory outside buffer bounds');
-    }
-    return this.buffer.readFloatBE(position);
+    return this.buffer.readFloatBE(this.readAt(position, 4));
   }
 
   public readF64BE(position: number): number {
-    position = position < 0 ? this.length + position : position;
-    if (position < 0 || position + 8 > this.length) {
-      throw new RangeError('Attempt to access memory outside buffer bounds');
-    }
-    return this.buffer.readDoubleBE(position);
+    return this.buffer.readDoubleBE(this.readAt(position, 8));
   }
 
   public readF32LE(position: number): number {
-    position = position < 0 ? this.length + position : position;
-    if (position < 0 || position + 4 > this.length) {
-      throw new RangeError('Attempt to access memory outside buffer bounds');
-    }
-    return this.buffer.readFloatLE(position);
+    return this.buffer.readFloatLE(this.readAt(position, 4));
   }
 
   public readF64LE(position: number): number {
-    position = position < 0 ? this.length + position : position;
-    if (position < 0 || position + 8 > this.length) {
-      throw new RangeError('Attempt to access memory outside buffer bounds');
-    }
-    return this.buffer.readDoubleLE(position);
+    return this.buffer.readDoubleLE(this.readAt(position, 8));
   }
 
   public byteLength(): number {

@@ -229,3 +229,43 @@ describe('Regression Test', () => {
     }
   });
 });
+
+describe('Chunk Header', () => {
+  test('Timestamp delta wraps around at 2^32', async () => {
+    const reader = new AsyncByteReader();
+    const gen = read_message(reader)[Symbol.asyncIterator]();
+
+    reader.feed(Buffer.from('04ffffff00000108' + '01000000' + 'fffffff0' + 'aa', 'hex'));
+    reader.feed(Buffer.from('4400002000000108' + 'bb', 'hex'));
+    reader.feed(Buffer.from('c4' + 'cc', 'hex'));
+
+    expect((await gen.next()).value).toMatchObject({ timestamp: 0xFFFFFFF0, data: Buffer.from('aa', 'hex') });
+    expect((await gen.next()).value).toMatchObject({ timestamp: 0x10, data: Buffer.from('bb', 'hex') });
+    expect((await gen.next()).value).toMatchObject({ timestamp: 0x30, data: Buffer.from('cc', 'hex') });
+  });
+
+  test('Abort discards only the partial message, not the header state', async () => {
+    const reader = new AsyncByteReader();
+    const gen = read_message(reader)[Symbol.asyncIterator]();
+
+    reader.feed(Buffer.from('060000640000c809' + '01000000', 'hex'));
+    reader.feed(Buffer.alloc(128));
+    reader.feed(Buffer.from('020000000000040200000000' + '00000006', 'hex'));
+    reader.feed(Buffer.concat([Buffer.from('c6', 'hex'), Buffer.alloc(128, 0x11)]));
+    reader.feed(Buffer.concat([Buffer.from('c6', 'hex'), Buffer.alloc(72, 0x11)]));
+    reader.feed(Buffer.from('4600002100000209' + '1701', 'hex'));
+
+    expect((await gen.next()).value).toMatchObject({
+      message_type_id: 9,
+      message_stream_id: 1,
+      timestamp: 200,
+      data: Buffer.alloc(200, 0x11),
+    });
+    expect((await gen.next()).value).toMatchObject({
+      message_type_id: 9,
+      message_stream_id: 1,
+      timestamp: 233,
+      data: Buffer.from('1701', 'hex'),
+    });
+  });
+});

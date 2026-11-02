@@ -1,7 +1,8 @@
 {
   "compilerOptions": {
     /* Language and Environment */
-    "target": "es2024",
+    "target": "es2025",
+    "lib": ["es2025", "esnext.collection", "esnext.temporal", "esnext.typedarrays"],
     "module": "NodeNext",
     "moduleResolution": "nodenext",
     /* types */

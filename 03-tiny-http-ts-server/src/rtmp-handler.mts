@@ -1,17 +1,7 @@
 import { MessageType } from '../../01-tiny-rtmp-server/src/message.mts';
 import type { Message } from '../../01-tiny-rtmp-server/src/message.mts';
 import ByteReader from '../../01-tiny-rtmp-server/src/byte-reader.mts';
-import read_amf0 from '../../01-tiny-rtmp-server/src/amf0-reader.mts';
-
-type VideoMessage = Message & {
-  message_type_id: (typeof MessageType.Video);
-};
-type AudioMessage = Message & {
-  message_type_id: (typeof MessageType.Audio);
-};
-type AMF0DataMessage = Message & {
-  message_type_id: (typeof MessageType.DataAMF0);
-};
+import { isAMF0Object, type AMF0Object, type AMF0Value } from '../../01-tiny-rtmp-server/src/amf0-reader.mts';
 
 export const VideoCodecType = {
   AVC: 7,
@@ -72,7 +62,7 @@ export type AudioData = AACData & {
 export type ActionScriptData = {
   timestamp: number;
   kind: 'Data';
-  values: ReturnType<typeof read_amf0>;
+  values: AMF0Value[];
 };
 
 const handle_avc = (reader: ByteReader): AVCData | null => {
@@ -80,11 +70,11 @@ const handle_avc = (reader: ByteReader): AVCData | null => {
   const compositionTimeOffset = reader.readI24BE();
 
   switch (packetType) {
-    case PacketType.SequenceStart: return {
-      codec: 'AVC',
-      packetType,
-      avcDecoderConfigurationRecord: reader.read(),
-    };
+    case PacketType.SequenceStart: {
+      const avcDecoderConfigurationRecord = reader.read();
+      if (avcDecoderConfigurationRecord.byteLength === 0) { return null; }
+      return { codec: 'AVC', packetType, avcDecoderConfigurationRecord };
+    }
     case PacketType.CodedFrames: return {
       codec: 'AVC',
       packetType,
@@ -96,18 +86,20 @@ const handle_avc = (reader: ByteReader): AVCData | null => {
   }
 };
 
-export const handle_video = (message: VideoMessage): VideoData | null => {
-  const reader = new ByteReader(message.data);
+export const handle_video = ({ timestamp, data }: { timestamp: number; data: Buffer; }): VideoData | null => {
+  if (data.byteLength < 5) { return null; }
+  const reader = new ByteReader(data);
 
   const meta = reader.readU8();
   const frameType = (meta & 0xF0) >> 4;
-  const codec = (meta & 0x0F) >> 0;
+  const codec = meta & 0x0F;
+  if (frameType === FrameType.VIDEO_INFO_OR_COMMAND || (meta & 0x80) !== 0) { return null; }
 
   switch (codec) {
     case VideoCodecType.AVC: {
       const avc = handle_avc(reader);
       if (avc == null) { return null; }
-      return { kind: 'Video', frameType, timestamp: message.timestamp, ... avc };
+      return { kind: 'Video', frameType, timestamp, ... avc };
     }
     default:
       return null;
@@ -117,11 +109,11 @@ export const handle_video = (message: VideoMessage): VideoData | null => {
 const handle_aac = (reader: ByteReader): AACData | null => {
   const packetType = reader.readU8();
   switch (packetType) {
-    case AACPacketType.SequenceHeader: return {
-      codec: 'AAC',
-      packetType,
-      audioSpecificConfig: reader.read(),
-    };
+    case AACPacketType.SequenceHeader: {
+      const audioSpecificConfig = reader.read();
+      if (audioSpecificConfig.byteLength === 0) { return null; }
+      return { codec: 'AAC', packetType, audioSpecificConfig };
+    }
     case AACPacketType.Raw: return {
       codec: 'AAC',
       packetType,
@@ -132,36 +124,61 @@ const handle_aac = (reader: ByteReader): AACData | null => {
   }
 };
 
-export const handle_audio = (message: AudioMessage): AudioData | null => {
-  const reader = new ByteReader(message.data);
+export const handle_audio = ({ timestamp, data }: { timestamp: number; data: Buffer; }): AudioData | null => {
+  if (data.byteLength < 2) { return null; }
+  const reader = new ByteReader(data);
 
   const meta = reader.readU8();
   const codec = (meta & 0xF0) >> 4;
-  const rate = (meta & 0x0C) >> 2;
-  const size = (meta & 0x02) >> 1;
-  const type = (meta & 0x01) >> 0;
 
   switch (codec) {
     case AudioCodecType.AAC: {
       // In AAC: rate, size, type are derived in AudioSpecificConfig
       const aac = handle_aac(reader);
       if (aac == null) { return null; }
-      return { kind: 'Audio', timestamp: message.timestamp, ... aac };
+      return { kind: 'Audio', timestamp, ... aac };
     }
     default:
       return null;
   }
 };
 
-export const handle_amf0_data = (message: AMF0DataMessage): ActionScriptData | null => {
-  return { kind: 'Data', timestamp: message.timestamp, values: message.data };
+export const handle_amf0_data = ({ timestamp, data }: { timestamp: number; data: AMF0Value[]; }): ActionScriptData => {
+  return { kind: 'Data', timestamp, values: data };
 };
+
+export const read_onmetadata = (values: AMF0Value[]): AMF0Object | null => {
+  const [name, metadata] = values[0] === '@setDataFrame' ? values.slice(1) : values;
+  if (name !== 'onMetaData' || !isAMF0Object(metadata)) { return null; }
+  return metadata;
+};
+
+export class TimestampUnwrapper {
+  private previous: { received: number; timestamp: number; } | null = null;
+  private first: number | null = null;
+  private latest: number | null = null;
+  private offset = 0;
+
+  public unwrap(message: Message): Message {
+    if (message.message_type_id !== MessageType.Audio && message.message_type_id !== MessageType.Video) { return message; }
+    let timestamp = message.timestamp;
+    if (this.previous != null) {
+      const delta = ((message.timestamp - this.previous.received) % 2 ** 31 + 2 ** 31 + 2 ** 30) % 2 ** 31 - 2 ** 30;
+      timestamp = this.previous.timestamp + delta;
+    }
+    this.previous = { received: message.timestamp, timestamp };
+    this.first ??= timestamp;
+    this.latest = Math.max(this.latest ?? timestamp, timestamp);
+    if (this.latest - this.first < 1000) { this.offset = Math.max(this.offset, -timestamp); }
+    return { ... message, timestamp: Math.max(0, timestamp + this.offset) };
+  }
+}
 
 export default (message: Message): VideoData | AudioData | ActionScriptData | null => {
   switch (message.message_type_id) {
-    case MessageType.Video: return handle_video(message as VideoMessage);
-    case MessageType.Audio: return handle_audio(message as AudioMessage);
-    case MessageType.DataAMF0: return handle_amf0_data(message as AMF0DataMessage);
+    case MessageType.Video: return handle_video(message);
+    case MessageType.Audio: return handle_audio(message);
+    case MessageType.DataAMF0: return handle_amf0_data(message);
     default: return null;
   }
 };

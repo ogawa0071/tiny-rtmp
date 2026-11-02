@@ -1,5 +1,5 @@
 import type ByteVector from '../../06-tiny-http-fmp4-server/src/byte-vector.mts';
-import { audioSampleEntry, box, fullbox, mdat, mfhd, moof, tfdt, tfhd, traf, trun, visualSampleEntry, type callback, type FragmentInformation } from '../../06-tiny-http-fmp4-server/src/fmp4.mts';
+import { audioSampleEntry, box, fullbox, mdat, mfhd, moof, tfdt, tfhd, traf, trun, visualSampleEntry, TRUN_DATA_OFFSET_POSITION, type callback, type FragmentInformation } from '../../06-tiny-http-fmp4-server/src/fmp4.mts';
 
 export const pssh = (system_id: Buffer, kids: Buffer[], data: Buffer, vector: ByteVector, cb?: callback): void => {
   fullbox('pssh', 1, 0x000000, vector, (vector) => {
@@ -197,17 +197,18 @@ export const senc = (samples: SampleInformation[], ivType: (typeof IVType)[keyof
   });
 };
 
-export const fragment = (fragment: FragmentInformation, encryption: SampleInformation, ivType: (typeof IVType)[keyof typeof IVType], data: Buffer, vector: ByteVector, cb?: callback): void => {
-  let trun_offset = null;
+const SENC_FIRST_SAMPLE_POSITION = 4 + 4 + 4 + 4;
+const SAIO_OFFSET_POSITION = 4 + 4 + 4 + 4;
 
+export const fragment = (fragment: FragmentInformation, encryption: SampleInformation, ivType: (typeof IVType)[keyof typeof IVType], data: Buffer, vector: ByteVector, cb?: callback): void => {
   const moof_begin = vector.byteLength();
+  let trun_begin = 0;
   moof(vector, (vector) => {
-    mfhd(vector);
+    mfhd(fragment.sequence_number, vector);
     traf(vector, (vector) => {
       tfhd(fragment.track_id, vector);
-      tfdt(fragment.dts, vector, (vector) => {
-        trun_offset = vector.byteLength();
-      });
+      tfdt(fragment.dts, vector);
+      trun_begin = vector.byteLength();
       trun(0 /* ダミー */, [{
         duration: fragment.duration,
         bytes: data.byteLength,
@@ -219,15 +220,10 @@ export const fragment = (fragment: FragmentInformation, encryption: SampleInform
       saio([0] /* ダミー */, vector);
       const senc_begin = vector.byteLength();
       senc([encryption], ivType, vector);
-      // saio のダミーを正しい値にする
-      const senc_offset = 4 /* size */ + 4 /* fourcc */ + 4 /* version + flags */ + 4;
-      const saio_access_index = 4 /* size */ + 4 /* fourcc */ + 4 /* version + flags */ + 4;
-      vector.writeU32BE(senc_begin + senc_offset - moof_begin, saio_begin + saio_access_index);
+      vector.writeU32BE(senc_begin + SENC_FIRST_SAMPLE_POSITION - moof_begin, saio_begin + SAIO_OFFSET_POSITION);
     });
   });
   const moof_end = vector.byteLength();
   mdat(data, vector, cb);
-  // trun のダミーを正しい値にする
-  const trun_access_index = 4 /* size */ + 4 /* fourcc */ + 4 /* version + flags */ + 4;
-  vector.writeU32BE(moof_end - moof_begin + 8 /* mdat header */, trun_offset! + trun_access_index);
+  vector.writeU32BE(moof_end - moof_begin + 8 /* mdat header */, trun_begin + TRUN_DATA_OFFSET_POSITION);
 };

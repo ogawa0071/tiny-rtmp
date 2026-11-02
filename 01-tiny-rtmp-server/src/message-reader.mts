@@ -35,6 +35,24 @@ export type MessageReaderOption = Partial<{
   highWaterMark: number;
 }>;
 
+const decode_message = (information: MessageInformation, data: Buffer): Message | null => {
+  try {
+    const message = Message.from({
+      message_type_id: information.message_type_id,
+      message_stream_id: information.message_stream_id,
+      timestamp: information.timestamp,
+      data,
+    });
+    if (message == null) {
+      logger.error('Message Decoding Failed, ignore it', information);
+    }
+    return message;
+  } catch (e) {
+    logger.error('Message Decoding Failed, ignore it', { ... information, error: e });
+    return null;
+  }
+};
+
 export default async function* read_message(reader: AsyncByteReader, option?: MessageReaderOption): AsyncIterable<Message> {
   const highWaterMark = option?.highWaterMark ?? Number.POSITIVE_INFINITY;
   let buffered = 0;
@@ -46,16 +64,16 @@ export default async function* read_message(reader: AsyncByteReader, option?: Me
   while (true) {
     const basic = await reader.readU8();
     const fmt = (basic & 0b11000000) >> 6;
-    let cs_id = (basic & 0b00111111) >> 0;
+    let cs_id = basic & 0b00111111;
     switch (cs_id) {
       case 0: cs_id = 64 + await reader.readU8(); break;
       case 1: cs_id = 64 + await reader.readU16LE(); break;
     }
-    if (fmt !== 3 || !chunks.has(cs_id)) {
+    if (fmt !== 3) {
       buffered -= chunks.get(cs_id)?.byteLength() ?? 0;
-      chunks.set(cs_id, new ByteBuilder());
+      chunks.delete(cs_id);
     }
-    const chunk_builder = chunks.get(cs_id)!;
+    const chunk_builder = chunks.getOrInsertComputed(cs_id, () => new ByteBuilder());
 
     let information = informations.get(cs_id);
     let timestamp = fmt !== 3 ? await reader.readU24BE() : information?.timestamp;
@@ -66,7 +84,7 @@ export default async function* read_message(reader: AsyncByteReader, option?: Me
     const is_extended_timestamp = fmt !== 3 ? timestamp === 0xFFFFFF : information?.is_extended_timestamp;
     // チャンクに必要な情報がない時は何もできないしパースもできず、そのあとが保証できないので、例外で通知する
     if (timestamp == null || message_length == null || message_type_id == null || message_stream_id == null || is_extended_timestamp == null) {
-      throw new InsufficientChunkError('Insufficient Chunk Information in RTMP Message Recieving');
+      throw new InsufficientChunkError('Insufficient Chunk Information in RTMP Message Receiving');
     }
     const extended_timestamp = is_extended_timestamp ? await reader.readU32BE() : null;
 
@@ -74,13 +92,13 @@ export default async function* read_message(reader: AsyncByteReader, option?: Me
     if (fmt === 1 || fmt === 2) {
       if (information?.timestamp == null) {
         // チャンクに必要な情報がない時は何もできないしパースもできず、そのあとが保証できないので、例外で通知する
-        throw new InsufficientChunkError('Insufficient Chunk Information in RTMP Message Recieving');
+        throw new InsufficientChunkError('Insufficient Chunk Information in RTMP Message Receiving');
       }
       timestamp_delta = extended_timestamp ?? timestamp; // // if fmt === 1 or fmt === 2, timestamp is delta
-      timestamp = information.timestamp + timestamp_delta;
+      timestamp = (information.timestamp + timestamp_delta) % 2 ** 32;
     } else if (fmt === 3) {
       timestamp_delta = extended_timestamp ?? information?.timestamp_delta ?? timestamp; // fmt === 3, timestamp is previous
-      timestamp += (chunk_builder.byteLength() > 0) ? 0 : timestamp_delta;
+      timestamp = (timestamp + ((chunk_builder.byteLength() > 0) ? 0 : timestamp_delta)) % 2 ** 32;
     } else {
       timestamp = extended_timestamp ?? timestamp;
     }
@@ -100,39 +118,22 @@ export default async function* read_message(reader: AsyncByteReader, option?: Me
     if (length === message_length) {
       const data = chunk_builder.build();
 
-      let message = null;
-      try {
-        message = Message.from({
-          message_type_id: information.message_type_id,
-          message_stream_id: information.message_stream_id,
-          timestamp: information.timestamp,
-          data,
-        });
-      } catch (e) {
-        const message = e instanceof Error ? e.message : String(e);
-        const record = e instanceof Error ? { stack: e.stack, ... information } : information;
-        logger.error(`Message Decoding error: ${message}`, record);
-      }
-
+      const message = decode_message(information, data);
       if (message != null) {
         switch (message.message_type_id) {
           case MessageType.SetChunkSize:
             chunk_maximum_size = message.data.chunk_size;
             break;
           case MessageType.Abort: {
-            const cs_id = message.data.chunk_stream_id;
-            buffered -= chunks.get(cs_id)?.byteLength() ?? 0;
-            chunks.delete(cs_id);
-            informations.delete(cs_id);
+            const aborted_cs_id = message.data.chunk_stream_id;
+            buffered -= chunks.get(aborted_cs_id)?.byteLength() ?? 0;
+            chunks.delete(aborted_cs_id);
             break;
           }
-          default: {
+          default:
             yield message;
             break;
-          }
         }
-      } else {
-        logger.error('Message Decoding Failed, ignore it', information);
       }
 
       chunks.delete(cs_id);

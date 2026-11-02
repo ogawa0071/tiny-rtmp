@@ -6,36 +6,33 @@ export class BandwidthQuotaExceededError extends Error {
 }
 
 export type BandwidthEstimatorOption = {
-  intervalMills: number;
+  intervalMillis: number;
   movingAverageLength: number;
 };
 export const BandwidthEstimatorOption = {
   from(option?: Partial<BandwidthEstimatorOption>): BandwidthEstimatorOption {
     return {
-      intervalMills: 100,
-      movingAverageLength: 10,
-      ... option,
+      intervalMillis: option?.intervalMillis ?? 100,
+      movingAverageLength: option?.movingAverageLength ?? 10,
     };
   },
 };
 
 export default class BandwidthEstimator {
-  private option: BandwidthEstimatorOption;
-  private controller: AbortController;
   private limit: number;
-  private timerId: NodeJS.Timeout | null = null;
-  private readonly measureHandler = this.measure.bind(this);
-  private estimates: number[] = [];
+  private controller: AbortController;
   private movingAverageLength: number;
+  private timer: NodeJS.Timeout;
+  private estimates: number[] = [];
   private totalBytes: number = 0;
-  private previousTime: DOMHighResTimeStamp = performance.now();
+  private previousTime: number = performance.now();
 
   public constructor(limit: number, controller: AbortController, option?: Partial<BandwidthEstimatorOption>) {
+    const { intervalMillis, movingAverageLength } = BandwidthEstimatorOption.from(option);
     this.limit = limit;
     this.controller = controller;
-    this.option = BandwidthEstimatorOption.from(option);
-    this.movingAverageLength = this.option.movingAverageLength;
-    this.timerId = setInterval(this.measureHandler, this.option.intervalMills);
+    this.movingAverageLength = movingAverageLength;
+    this.timer = setInterval(() => { this.measure(); }, intervalMillis);
   }
 
   public feed(byteLength: number) {
@@ -43,31 +40,26 @@ export default class BandwidthEstimator {
   }
 
   public estimate(): number {
-    return this.estimates.reduce((sum, curr) => sum + curr, 0) / Math.min(this.estimates.length, this.movingAverageLength);
+    return this.estimates.reduce((sum, curr) => sum + curr, 0) / this.estimates.length;
   }
 
   public measure(): void {
     const currentTime = performance.now();
     const duration = (currentTime - this.previousTime) / 1000;
-    const bandwidth = (this.totalBytes * 8) / duration;
-    this.estimates.push(bandwidth);
-
-    if (this.estimates.length >= this.movingAverageLength) {
-      this.estimates.splice(0, this.estimates.length - this.movingAverageLength);
-      const average = this.estimate();
-      if (average >= this.limit) {
-        this.controller.abort(new BandwidthQuotaExceededError(`Bandwidth quota exceeded! limit: ${this.limit}bps, actual: ${Math.ceil(average)}bps`));
-      }
-    }
-
+    this.estimates.push((this.totalBytes * 8) / duration);
     this.previousTime = currentTime;
     this.totalBytes = 0;
+
+    if (this.estimates.length < this.movingAverageLength) { return; }
+    this.estimates.splice(0, this.estimates.length - this.movingAverageLength);
+    const average = this.estimate();
+    if (average >= this.limit) {
+      this.controller.abort(new BandwidthQuotaExceededError(`Bandwidth quota exceeded! limit: ${this.limit}bps, actual: ${Math.ceil(average)}bps`));
+    }
   }
 
   public destroy(): void {
-    if (this.timerId == null) { return; }
-    clearInterval(this.timerId);
-    this.timerId = null;
+    clearInterval(this.timer);
   }
   public [Symbol.dispose](): void {
     this.destroy();

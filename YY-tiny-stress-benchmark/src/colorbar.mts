@@ -1,14 +1,12 @@
-
-
-const y_pos = (x: number, y: number, width: number, height: number): number => {
+export const y_pos = (x: number, y: number, width: number): number => {
   return y * width + x;
 };
 
-const u_pos = (x: number, y: number, width: number, height: number): number => {
+export const u_pos = (x: number, y: number, width: number, height: number): number => {
   return (height * width) + y * Math.floor(width / 2) + x;
 };
 
-const v_pos = (x: number, y: number, width: number, height: number): number => {
+export const v_pos = (x: number, y: number, width: number, height: number): number => {
   return (height * width) + Math.floor(height * width / 4) + y * Math.floor(width / 2) + x;
 };
 
@@ -33,89 +31,41 @@ export const ColorbarConfig = {
   },
 };
 
+type YUV = readonly [y: number, u: number, v: number];
+const GRAY: YUV = [104, 128, 128];
+const BARS: readonly YUV[] = [
+  [180, 128, 128], // 75% White
+  [168, 44, 136], // Yellow
+  [145, 147, 44], // Cyan
+  [133, 63, 53], // Cyan
+  [63, 193, 204], // Magenta
+  [51, 109, 212], // Red
+  [28, 212, 120], // Blue
+];
+
 export default ({ width, height }: ColorbarConfig): Buffer => {
   const yuv = Buffer.alloc(Math.floor(width * height * 3 / 2));
+  const fill = (x: number, y: number, [Y, U, V]: YUV): void => {
+    yuv[y_pos(x * 2 + 0, y * 2 + 0, width)] = Y;
+    yuv[y_pos(x * 2 + 1, y * 2 + 0, width)] = Y;
+    yuv[y_pos(x * 2 + 0, y * 2 + 1, width)] = Y;
+    yuv[y_pos(x * 2 + 1, y * 2 + 1, width)] = Y;
+    yuv[u_pos(x, y, width, height)] = U;
+    yuv[v_pos(x, y, width, height)] = V;
+  };
 
   const a = width;
   const d = Math.floor(a / 8);
+  const chroma_width = Math.floor(width / 2);
 
   for (let y = 0; y < Math.floor(height / 2); y++) {
     // 40% Gray
     for (let i = 0; i < Math.floor(d / 2); i++) {
-      yuv[y_pos(i * 2 + 0, y * 2 + 0, width, height)] = 104;
-      yuv[y_pos(i * 2 + 1, y * 2 + 0, width, height)] = 104;
-      yuv[y_pos(i * 2 + 0, y * 2 + 1, width, height)] = 104;
-      yuv[y_pos(i * 2 + 1, y * 2 + 1, width, height)] = 104;
-      yuv[u_pos(i * 1 + 0, y * 1 + 0, width, height)] = 128;
-      yuv[v_pos(i * 1 + 0, y * 1 + 0, width, height)] = 128;
-
-      yuv[y_pos((width - 1) - (i * 2 + 0), y * 2 + 0, width, height)] = 104;
-      yuv[y_pos((width - 1) - (i * 2 + 1), y * 2 + 0, width, height)] = 104;
-      yuv[y_pos((width - 1) - (i * 2 + 0), y * 2 + 1, width, height)] = 104;
-      yuv[y_pos((width - 1) - (i * 2 + 1), y * 2 + 1, width, height)] = 104;
-      yuv[u_pos((Math.floor(width / 2) - 1) - i, y * 1 + 0, width, height)] = 128;
-      yuv[v_pos((Math.floor(width / 2) - 1) - i, y * 1 + 0, width, height)] = 128;
+      fill(i, y, GRAY);
+      fill(chroma_width - 1 - i, y, GRAY);
     }
-    //
-    for (let i = Math.floor(d / 2); i < (Math.floor(width / 2)) - Math.floor(d / 2); i++) {
-      switch (Math.floor((i - Math.floor(d / 2)) * 14 / ((a - 2 * d)))) {
-        case 0: // 75% White
-          yuv[y_pos(i * 2 + 0, y * 2 + 0, width, height)] = 180;
-          yuv[y_pos(i * 2 + 1, y * 2 + 0, width, height)] = 180;
-          yuv[y_pos(i * 2 + 0, y * 2 + 1, width, height)] = 180;
-          yuv[y_pos(i * 2 + 1, y * 2 + 1, width, height)] = 180;
-          yuv[u_pos(i * 1 + 0, y * 1 + 0, width, height)] = 128;
-          yuv[v_pos(i * 1 + 0, y * 1 + 0, width, height)] = 128;
-          break;
-        case 1: // Yellow
-          yuv[y_pos(i * 2 + 0, y * 2 + 0, width, height)] = 168;
-          yuv[y_pos(i * 2 + 1, y * 2 + 0, width, height)] = 168;
-          yuv[y_pos(i * 2 + 0, y * 2 + 1, width, height)] = 168;
-          yuv[y_pos(i * 2 + 1, y * 2 + 1, width, height)] = 168;
-          yuv[u_pos(i * 1 + 0, y * 1 + 0, width, height)] = 44;
-          yuv[v_pos(i * 1 + 0, y * 1 + 0, width, height)] = 136;
-          break;
-        case 2: // Cyan
-          yuv[y_pos(i * 2 + 0, y * 2 + 0, width, height)] = 145;
-          yuv[y_pos(i * 2 + 1, y * 2 + 0, width, height)] = 145;
-          yuv[y_pos(i * 2 + 0, y * 2 + 1, width, height)] = 145;
-          yuv[y_pos(i * 2 + 1, y * 2 + 1, width, height)] = 145;
-          yuv[u_pos(i * 1 + 0, y * 1 + 0, width, height)] = 147;
-          yuv[v_pos(i * 1 + 0, y * 1 + 0, width, height)] = 44;
-          break;
-        case 3: // Cyan
-          yuv[y_pos(i * 2 + 0, y * 2 + 0, width, height)] = 133;
-          yuv[y_pos(i * 2 + 1, y * 2 + 0, width, height)] = 133;
-          yuv[y_pos(i * 2 + 0, y * 2 + 1, width, height)] = 133;
-          yuv[y_pos(i * 2 + 1, y * 2 + 1, width, height)] = 133;
-          yuv[u_pos(i * 1 + 0, y * 1 + 0, width, height)] = 63;
-          yuv[v_pos(i * 1 + 0, y * 1 + 0, width, height)] = 53;
-          break;
-        case 4: // Magenta
-          yuv[y_pos(i * 2 + 0, y * 2 + 0, width, height)] = 63;
-          yuv[y_pos(i * 2 + 1, y * 2 + 0, width, height)] = 63;
-          yuv[y_pos(i * 2 + 0, y * 2 + 1, width, height)] = 63;
-          yuv[y_pos(i * 2 + 1, y * 2 + 1, width, height)] = 63;
-          yuv[u_pos(i * 1 + 0, y * 1 + 0, width, height)] = 193;
-          yuv[v_pos(i * 1 + 0, y * 1 + 0, width, height)] = 204;
-          break;
-        case 5: // Red
-          yuv[y_pos(i * 2 + 0, y * 2 + 0, width, height)] = 51;
-          yuv[y_pos(i * 2 + 1, y * 2 + 0, width, height)] = 51;
-          yuv[y_pos(i * 2 + 0, y * 2 + 1, width, height)] = 51;
-          yuv[y_pos(i * 2 + 1, y * 2 + 1, width, height)] = 51;
-          yuv[u_pos(i * 1 + 0, y * 1 + 0, width, height)] = 109;
-          yuv[v_pos(i * 1 + 0, y * 1 + 0, width, height)] = 212;
-          break;
-        case 6: // Blue
-          yuv[y_pos(i * 2 + 0, y * 2 + 0, width, height)] = 28;
-          yuv[y_pos(i * 2 + 1, y * 2 + 0, width, height)] = 28;
-          yuv[y_pos(i * 2 + 0, y * 2 + 1, width, height)] = 28;
-          yuv[y_pos(i * 2 + 1, y * 2 + 1, width, height)] = 28;
-          yuv[u_pos(i * 1 + 0, y * 1 + 0, width, height)] = 212;
-          yuv[v_pos(i * 1 + 0, y * 1 + 0, width, height)] = 120;
-          break;
-      }
+    for (let i = Math.floor(d / 2); i < chroma_width - Math.floor(d / 2); i++) {
+      fill(i, y, BARS[Math.floor((i - Math.floor(d / 2)) * 14 / (a - 2 * d))]);
     }
   }
 

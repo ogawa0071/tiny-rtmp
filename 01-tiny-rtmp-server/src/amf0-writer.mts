@@ -1,30 +1,42 @@
+import { AMF0Marker, ecma_arrays } from './amf0-reader.mts';
 import ByteBuilder from './byte-builder.mts';
 
-const number = (dst: ByteBuilder, data: number): void => {
-  const buffer = Buffer.alloc(8);
-  buffer.writeDoubleBE(data, 0);
-  dst.write(buffer);
-};
-
-const boolean = (dst: ByteBuilder, data: boolean): void => {
-  dst.write(Buffer.from([data ? 1 : 0]));
-};
-
-const string = (dst: ByteBuilder, data: string): void => {
+const utf8 = (dst: ByteBuilder, data: string): void => {
   const bytes = Buffer.from(data, 'utf-8');
   dst.writeU16BE(bytes.byteLength);
   dst.write(bytes);
 };
 
-const object = (dst: ByteBuilder, data: object): void => {
-  for (const [k, v] of Object.entries(data)) {
-    string(dst, k);
-    value(dst, v);
+const string = (dst: ByteBuilder, data: string): void => {
+  const bytes = Buffer.from(data, 'utf-8');
+  if (bytes.byteLength < 2 ** 16) {
+    dst.writeU8(AMF0Marker.String);
+    dst.writeU16BE(bytes.byteLength);
+  } else {
+    dst.writeU8(AMF0Marker.LongString);
+    dst.writeU32BE(bytes.byteLength);
   }
-  dst.writeU24BE(0x000009); // ObjectEnd
+  dst.write(bytes);
 };
 
-const array = (dst: ByteBuilder, data: unknown[]): void => {
+const object = (dst: ByteBuilder, data: object): void => {
+  const entries = Object.entries(data);
+  if (ecma_arrays.has(data)) {
+    dst.writeU8(AMF0Marker.ECMAArray);
+    dst.writeU32BE(entries.length);
+  } else {
+    dst.writeU8(AMF0Marker.Object);
+  }
+  for (const [k, v] of entries) {
+    utf8(dst, k);
+    value(dst, v);
+  }
+  utf8(dst, '');
+  dst.writeU8(AMF0Marker.ObjectEnd); // ObjectEnd
+};
+
+const strict_array = (dst: ByteBuilder, data: unknown[]): void => {
+  dst.writeU8(AMF0Marker.StrictArray);
   dst.writeU32BE(data.length);
   for (const datum of data) {
     value(dst, datum);
@@ -32,33 +44,31 @@ const array = (dst: ByteBuilder, data: unknown[]): void => {
 };
 
 const date = (dst: ByteBuilder, data: Date): void => {
+  dst.writeU8(AMF0Marker.Date);
   dst.writeF64BE(data.getTime());
-  dst.writeU16BE(0); // Not-Used
+  dst.writeI16BE(0);
 };
 
 const value = (dst: ByteBuilder, data: unknown): void => {
-  if (data === null) { dst.writeU8(0x05); return; }
-  if (data === undefined) { dst.writeU8(0x06); return; }
-  if (Array.isArray(data)) { dst.writeU8(0x0a); array(dst, data); return; }
-  if (data instanceof Date) { dst.writeU8(0x0b); date(dst, data); return; }
+  if (data === null) { dst.writeU8(AMF0Marker.Null); return; }
+  if (data === undefined) { dst.writeU8(AMF0Marker.Undefined); return; }
+  if (Array.isArray(data)) { strict_array(dst, data); return; }
+  if (data instanceof Date) { date(dst, data); return; }
   switch (typeof data) {
-    case 'number': dst.writeU8(0x00); number(dst, data); return;
-    case 'boolean': dst.writeU8(0x01); boolean(dst, data); return;
-    case 'string': {
-      const buffer = Buffer.from(data, 'utf-8');
-      if (buffer.byteLength < 2 ** 16) {
-        dst.writeU8(0x02);
-        dst.writeU16BE(buffer.byteLength);
-        dst.write(buffer);
-        return;
-      } else {
-        dst.writeU8(0x0c);
-        dst.writeU32BE(buffer.byteLength);
-        dst.write(buffer);
-        return;
-      }
-    }
-    case 'object': dst.writeU8(0x03); object(dst, data); return;
+    case 'number':
+      dst.writeU8(AMF0Marker.Number);
+      dst.writeF64BE(data);
+      return;
+    case 'boolean':
+      dst.writeU8(AMF0Marker.Boolean);
+      dst.writeU8(data ? 1 : 0);
+      return;
+    case 'string':
+      string(dst, data);
+      return;
+    case 'object':
+      object(dst, data);
+      return;
   }
   throw new Error('Invalid AMF0 Data');
 };
