@@ -14,8 +14,9 @@ export default class Segment {
   }
 
   public extinf(): number | null {
-    if (this.endTimestamp == null) { return null; }
-    return (this.endTimestamp - this.beginTimestamp) / this.timescale;
+    const duration = this.duration();
+    if (duration == null) { return null; }
+    return duration / this.timescale;
   }
 
   public duration(): number | null {
@@ -24,7 +25,7 @@ export default class Segment {
   }
 
   public segment(): Buffer | null {
-    if (this.extinf() == null) { return null; }
+    if (this.endTimestamp == null) { return null; }
     return Buffer.concat(this.media);
   }
 
@@ -33,7 +34,7 @@ export default class Segment {
   }
 
   public complete(timestamp: number): void {
-    if (this.extinf() != null) { return; }
+    if (this.endTimestamp != null) { return; }
     this.endTimestamp = timestamp;
   }
 }

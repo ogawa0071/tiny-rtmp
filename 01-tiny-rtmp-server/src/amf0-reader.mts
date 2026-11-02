@@ -1,10 +1,28 @@
 import ByteReader from './byte-reader.mts';
 
-const scriptend: unique symbol = Symbol();
+export const AMF0Marker = {
+  Number: 0x00,
+  Boolean: 0x01,
+  String: 0x02,
+  Object: 0x03,
+  MovieClip: 0x04,
+  Null: 0x05,
+  Undefined: 0x06,
+  Reference: 0x07,
+  ECMAArray: 0x08,
+  ObjectEnd: 0x09,
+  StrictArray: 0x0A,
+  Date: 0x0B,
+  LongString: 0x0C,
+} as const;
+
 export type AMF0Object = {
   [key: string]: AMF0Value;
 };
-export type AMF0Value = number | boolean | string | null | undefined | typeof scriptend | Date | AMF0Object | AMF0Value[];
+export type AMF0Value = number | boolean | string | null | undefined | Date | AMF0Object | AMF0Value[];
+
+const scriptend: unique symbol = Symbol('ObjectEnd');
+export const ecma_arrays = new WeakSet<object>();
 export const isAMF0Null = (data: AMF0Value): data is null => {
   return data === null;
 };
@@ -30,18 +48,15 @@ export const isAMF0Date = (data: AMF0Value): data is Date => {
   return data instanceof Date;
 };
 export const isAMF0Object = (data: AMF0Value): data is AMF0Object => {
-  if (data == null) { return false; }
-  if (data instanceof Date) { return false; }
-  if (Array.isArray(data)) { return false; }
-  if (typeof data === 'object') { return true; }
-  return false;
+  return typeof data === 'object' && data !== null && !(data instanceof Date) && !Array.isArray(data);
 };
+
 const string = (reader: ByteReader): string => {
   const length = reader.readU16BE();
   return reader.read(length).toString('utf-8');
 };
 
-const longstring = (reader: ByteReader): string => {
+const long_string = (reader: ByteReader): string => {
   const length = reader.readU32BE();
   return reader.read(length).toString('utf-8');
 };
@@ -51,51 +66,55 @@ const object = (reader: ByteReader): AMF0Object => {
   // Object.create(null) で prototype なしとする
   const object: AMF0Object = Object.create(null);
   while (true) {
-    const name = string(reader);
-    const val = value(reader);
+    const key = string(reader);
+    const val = value_or_end(reader);
     if (val === scriptend) { return object; }
-    object[name] = val;
+    object[key] = val;
   }
 };
 
-const mixedarray = (reader: ByteReader): AMF0Object  => {
+const ecma_array = (reader: ByteReader): AMF0Object => {
   reader.readU32BE(); // length
-  return object(reader);
+  const array = object(reader);
+  ecma_arrays.add(array);
+  return array;
 };
 
-const strictarray = (reader: ByteReader): AMF0Value[] => {
+const strict_array = (reader: ByteReader): AMF0Value[] => {
   const length = reader.readU32BE();
-  const array = [];
-  for (let i = 0; i < length; i++) {
-    array.push(value(reader));
-  }
-  return array;
+  return Array.from({ length }, () => value(reader));
 };
 
 const date = (reader: ByteReader): Date => {
   const timestamp = reader.readF64BE();
-  const localtimeoffset = reader.readI16BE();
+  reader.readI16BE();
   return new Date(timestamp);
 };
 
-const value = (reader: ByteReader): AMF0Value => {
-  const tag = reader.readU8();
-  switch (tag) {
-    case 0: return reader.readF64BE();
-    case 1: return reader.readU8() !== 0;
-    case 2: return string(reader);
-    case 3: return object(reader);
-    case 4: throw new Error('Unsupported Tag: 4 (movie clip)');
-    case 5: return null;
-    case 6: return undefined;
-    case 7: throw new Error('Unsupported Tag: 7 (reference)');
-    case 8: return mixedarray(reader);
-    case 9: return scriptend;
-    case 10: return strictarray(reader);
-    case 11: return date(reader);
-    case 12: return longstring(reader);
+const value_or_end = (reader: ByteReader): AMF0Value | typeof scriptend => {
+  const marker = reader.readU8();
+  switch (marker) {
+    case AMF0Marker.Number: return reader.readF64BE();
+    case AMF0Marker.Boolean: return reader.readU8() !== 0;
+    case AMF0Marker.String: return string(reader);
+    case AMF0Marker.Object: return object(reader);
+    case AMF0Marker.MovieClip: throw new Error('Unsupported Marker: 4 (movie clip)');
+    case AMF0Marker.Null: return null;
+    case AMF0Marker.Undefined: return undefined;
+    case AMF0Marker.Reference: throw new Error('Unsupported Marker: 7 (reference)');
+    case AMF0Marker.ECMAArray: return ecma_array(reader);
+    case AMF0Marker.ObjectEnd: return scriptend;
+    case AMF0Marker.StrictArray: return strict_array(reader);
+    case AMF0Marker.Date: return date(reader);
+    case AMF0Marker.LongString: return long_string(reader);
+    default: throw new Error(`Invalid Marker: ${marker}`);
   }
-  throw new Error(`Invalid tag: ${tag}`);
+};
+
+const value = (reader: ByteReader): AMF0Value => {
+  const val = value_or_end(reader);
+  if (val === scriptend) { throw new Error('Unexpected ObjectEnd Marker'); }
+  return val;
 };
 
 export default (data: Buffer): AMF0Value[] => {

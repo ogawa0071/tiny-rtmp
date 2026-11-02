@@ -1,11 +1,11 @@
 export default class AckCounter {
   private total: number = 0;
   private difference: number = 0;
-  private ack_window_size: number | undefined = undefined;
+  private ack_window_size: number | null = null;
   private callback: (bytes: number) => void;
 
-  public constructor(callback?: (bytes: number) => void) {
-    this.callback = callback ?? ((_: number) => {});
+  public constructor(callback: (bytes: number) => void = () => {}) {
+    this.callback = callback;
   }
 
   private call(): void {

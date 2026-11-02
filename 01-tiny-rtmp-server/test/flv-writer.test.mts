@@ -220,6 +220,42 @@ describe('Unit Test', () => {
     expect((await reader.readU32BE())).toStrictEqual(0);
   });
 
+  test('Write FLV Header in AMF0 onMetadata writed (No codec ids)', async () => {
+    const reader = new AsyncByteReader();
+    using writer = new FLWWriter(new Writable({
+      write(chunk, _, cb) {
+        reader.feed(chunk);
+        cb();
+      },
+    }));
+
+    const setDataFrame = write_amf0('onMetaData', {
+      duration: 0,
+      width: 320,
+      height: 240,
+      videodatarate: 0,
+      framerate: 0,
+      audiodatarate: 0,
+      audiosamplerate: 44100,
+      audiosamplesize: 16,
+      stereo: true,
+      filesize: 0,
+    });
+
+    writer.write({
+      timestamp: 0,
+      message_type_id: MessageType.DataAMF0,
+      message_stream_id: 1,
+      data: setDataFrame,
+    });
+
+    expect((await reader.read(3)).equals(Buffer.from([0x46, 0x4C, 0x56]))).toStrictEqual(true);
+    expect((await reader.readU8())).toStrictEqual(0x01);
+    expect((await reader.readU8())).toStrictEqual(0x05);
+    expect((await reader.readU32BE())).toStrictEqual(9);
+    expect((await reader.readU32BE())).toStrictEqual(0);
+  });
+
   test('Write Video Data', async () => {
     const reader = new AsyncByteReader();
     using writer = new FLWWriter(new Writable({

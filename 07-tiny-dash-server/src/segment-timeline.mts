@@ -25,7 +25,6 @@ export default class SegmentTimeline {
   private prefix: string;
 
   private sequenceNumber: number = -1;
-  private orphanedNumber: number;
 
   private liveWindowLength: number;
   private orphanedWindowLength: number;
@@ -37,6 +36,7 @@ export default class SegmentTimeline {
 
   private minimumSegmentDuration: number;
   private timescale: number;
+  private firstSegmentBandwidth: number | null = null;
 
   public constructor(prefix: string, timescale: number, initialize: Buffer, opt?: Partial<SegmentTimelineOption>) {
     this.prefix = prefix;
@@ -45,36 +45,39 @@ export default class SegmentTimeline {
     const option = SegmentTimelineOption.from(opt);
     this.liveWindowLength = option.liveWindowLength;
     this.orphanedWindowLength = option.orphanedWindowLength;
-    this.orphanedNumber = this.sequenceNumber - option.liveWindowLength;
     this.minimumSegmentDuration = option.minimumSegmentDuration;
   }
 
-  public append(timestamp: number): void {
-    if (this.currentSegment != null && (timestamp - this.currentSegment.begin()) < (this.minimumSegmentDuration * this.timescale)) {
-      return;
+  public append(timestamp: number, force: boolean = false): boolean {
+    if (this.currentSegment != null) {
+      const duration = timestamp - this.currentSegment.begin();
+      if (duration <= 0 || (!force && duration < this.minimumSegmentDuration * this.timescale)) { return false; }
     }
 
-    this.currentSegment?.complete(timestamp);
-    if (this.currentSegment) {
+    if (this.currentSegment != null) {
+      this.currentSegment.complete(timestamp);
       this.segmentMap.set(this.sequenceNumber, this.currentSegment);
+      this.firstSegmentBandwidth ??= Math.ceil(this.currentSegment.segment()!.byteLength * 8 * this.timescale / this.currentSegment.duration()!);
     }
-    if (this.sequenceNumber - this.liveWindowLength >= 0) {
-      const sequenceNumber = this.sequenceNumber - this.liveWindowLength;
-      const segment = this.segmentMap.get(sequenceNumber);
-
-      if (segment) {
-        this.orphanedMap.set(sequenceNumber, segment);
-        this.segmentMap.delete(sequenceNumber);
-      }
+    const orphaned = this.sequenceNumber - this.liveWindowLength;
+    const orphanedSegment = this.segmentMap.get(orphaned);
+    if (orphanedSegment != null) {
+      this.orphanedMap.set(orphaned, orphanedSegment);
+      this.segmentMap.delete(orphaned);
     }
-    if (this.orphanedNumber - this.orphanedWindowLength >= 0) {
-      const sequenceNumber = this.orphanedNumber - this.orphanedWindowLength;
-      this.orphanedMap.delete(sequenceNumber);
-    }
+    this.orphanedMap.delete(orphaned - this.orphanedWindowLength);
 
     this.sequenceNumber += 1;
-    this.orphanedNumber += 1;
     this.currentSegment = new Segment(timestamp, this.timescale);
+    return true;
+  }
+
+  public hasSegments(): boolean {
+    return this.segmentMap.size > 0;
+  }
+
+  public bandwidth(): number | null {
+    return this.firstSegmentBandwidth;
   }
 
   public feed(data: Buffer): void {
@@ -82,15 +85,16 @@ export default class SegmentTimeline {
   }
 
   public segment_template(): XMLNode {
+    const begin = Math.max(0, this.sequenceNumber - this.liveWindowLength);
     const template = XMLNode.from('SegmentTemplate', {
       timescale: `${this.timescale}`,
       media: `${this.prefix}_$Number$.m4s`,
       initialization: `${this.prefix}_init.mp4`,
-      startNumber: `${Math.max(0, this.sequenceNumber - this.liveWindowLength)}`,
+      startNumber: `${begin}`,
     });
 
     const timeline = XMLNode.from('SegmentTimeline');
-    for (let i = Math.max(0, this.sequenceNumber - this.liveWindowLength); i < this.sequenceNumber; i++) {
+    for (let i = begin; i < this.sequenceNumber; i++) {
       const segment = this.segmentMap.get(i)!;
       const S = XMLNode.from('S', { t: `${segment.begin()}`, d: `${segment.duration()!}` });
       timeline.children.push(S);

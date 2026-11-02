@@ -25,8 +25,8 @@ export const read_avc_decoder_configuration_record = (avcDecoderConfigurationRec
   });
   const numOfPictureParameterSets = reader.readU8();
   const PictureParameterSets = Array.from({ length: numOfPictureParameterSets }, () => {
-    const sequenceParameterSetLength = reader.readU16BE();
-    return reader.read(sequenceParameterSetLength);
+    const pictureParameterSetLength = reader.readU16BE();
+    return reader.read(pictureParameterSetLength);
   });
   return {
     configurationVersion,
@@ -45,21 +45,39 @@ export const write_annexb_avc = (sizedNalus: Buffer, avcDecoderConfigurationReco
   const annexb: Buffer[] = [];
   const startcode = Buffer.from([0x00, 0x00, 0x00, 0x01]);
   let hasAUD = false;
+  let hasSPS = false;
+  let hasPPS = false;
   let hasIDR = false;
   while (!reader.isEOF()) {
     const length = reader.readUIntBE(avcDecoderConfigurationRecord.lengthSize);
+    if (length === 0) { continue; }
     const nalu = reader.read(length);
     const naluType = nalu.readUInt8(0) & 0x1F;
 
     switch (naluType) {
       case 0x09: hasAUD = true; break;
+      case 0x07: hasSPS = true; break;
+      case 0x08: {
+        if (!hasSPS) {
+          for (const sps of avcDecoderConfigurationRecord.SequenceParameterSets) {
+            annexb.push(startcode, sps);
+          }
+          hasSPS = true;
+        }
+        hasPPS = true;
+        break;
+      }
       case 0x05: { // IDR
         if (hasIDR) { break; }
-        for (const sps of avcDecoderConfigurationRecord.SequenceParameterSets) {
-          annexb.push(startcode, sps);
+        if (!hasSPS) {
+          for (const sps of avcDecoderConfigurationRecord.SequenceParameterSets) {
+            annexb.push(startcode, sps);
+          }
         }
-        for (const pps of avcDecoderConfigurationRecord.PictureParameterSets) {
-          annexb.push(startcode, pps);
+        if (!hasPPS) {
+          for (const pps of avcDecoderConfigurationRecord.PictureParameterSets) {
+            annexb.push(startcode, pps);
+          }
         }
         hasIDR = true;
         break;

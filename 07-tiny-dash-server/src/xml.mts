@@ -9,12 +9,16 @@ export const XMLNode = {
   },
 };
 
+const escape = (value: string): string => {
+  return value.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;');
+};
+
 export const serializeXML = (node: XMLNode, depth: number = 0): string => {
   if (typeof node === 'string') {
-    return '  '.repeat(depth) + node + '\n';
+    return '  '.repeat(depth) + escape(node) + '\n';
   }
 
-  const attributes = Array.from(Object.entries(node.attributes)).map(([k, v]) => `${k}="${v}"`).join(' ');
+  const attributes = Object.entries(node.attributes).map(([k, v]) => `${k}="${escape(v)}"`).join(' ');
   let result = '  '.repeat(depth) + `<${node.name}${attributes === '' ? '' : ' ' + attributes}${node.children.length === 0 ? ' /' : ''}>\n`;
   if (node.children.length === 0) { return result; }
 

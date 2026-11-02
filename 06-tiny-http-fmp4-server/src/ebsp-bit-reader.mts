@@ -28,4 +28,4 @@ export default class EBSPBitReader extends BitReader {
     this.fst_byte = this.snd_byte;
     this.snd_byte = byte;
   }
-};
+}
