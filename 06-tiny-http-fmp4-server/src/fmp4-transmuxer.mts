@@ -26,8 +26,8 @@ const VIDEO_TRACK_ID = 1;
 const AUDIO_TRACK_ID = 2;
 // onMetaData にコーデックが書かれていない時に、まだ初期化情報が届いていないトラックを、最初のフレームから待つ長さ (ミリ秒)
 const UNDECLARED_TRACK_WAIT = 1000;
-// UNDECLARED_TRACK_WAIT の間に取っておくフレームの数の上限 (1 秒間に届くフレームの数より十分に多くする)
-// (timestamp が進まない配信では待ち終わらないので、取っておくフレームが増え続けないようにする)
+// 初期化情報を待っている間に取っておくフレームの数の上限 (1 秒間に届くフレームの数より十分に多くする)
+// (timestamp が進まない配信では、UNDECLARED_TRACK_WAIT の間に届いたフレームだけにしても減らないので、取っておくフレームが増え続けないようにする)
 const MAX_WAITING_FRAMES = 1000;
 
 // 視聴者に送る fMP4 の断片 (moof + mdat)
@@ -50,7 +50,7 @@ export default class FMP4Transmuxer {
   private videoSequenceHeaderMissing = false;
   // 最初に届いたフレームの timestamp (onMetaData にコーデックが書かれていない時に、UNDECLARED_TRACK_WAIT の間だけ届いていないトラックを待つ)
   private firstFrameTimestamp: number | null = null;
-  // UNDECLARED_TRACK_WAIT の間に届いたフレーム (初期化セグメントを作ってから fMP4 にする)
+  // 初期化セグメントを作れるまでの間に届いたフレーム (初期化セグメントを作ってから fMP4 にする: keep)
   private waitingFrames: Frame[] = [];
 
   private initializeSegment: Buffer | null = null;
@@ -80,9 +80,10 @@ export default class FMP4Transmuxer {
       ? this.firstAudioFormat === AudioCodecType.AAC
       : (this.onMetadata?.audiocodecid === AudioCodecType.AAC || this.onMetadata?.audiocodecid === 'mp4a');
     if ((video_expected && this.avcDecoderConfigurationRecord == null) || (audio_expected && this.audioSpecificConfig == null)) {
-      // 待っている間に届いたフレームは捨てる
-      // (下の UNDECLARED_TRACK_WAIT の間に取っておいたフレームがあれば、それも捨てる。取っておいたフレームを送ると、捨てたフレームの分だけ間が空く)
-      this.waitingFrames = [];
+      // 待っている間に届いたフレームも取っておく
+      // (B フレームのある H.264 と ADTS の AAC (MPEG-TS や HLS の入力など) を FFmpeg が -c copy で送ると、本当の AAC の初期化情報が最初の映像のキーフレームより後に届く。
+      //  捨てると最初のキーフレームがなくなり、視聴者は次のキーフレームまで見始められない)
+      this.keep(frame);
       return null;
     }
     if (this.avcDecoderConfigurationRecord == null && this.audioSpecificConfig == null) { return null; }
@@ -96,9 +97,7 @@ export default class FMP4Transmuxer {
     if (!declared && missing) {
       this.firstFrameTimestamp ??= frame.timestamp;
       if (frame.timestamp - this.firstFrameTimestamp < UNDECLARED_TRACK_WAIT) {
-        // 上限に達したら一番古いフレームを捨てる (古い方から捨てるので、取っておいたフレームの途中に間は空かない)
-        if (this.waitingFrames.length >= MAX_WAITING_FRAMES) { this.waitingFrames.shift(); }
-        this.waitingFrames.push(frame);
+        this.keep(frame);
         return null;
       }
     }
@@ -122,6 +121,14 @@ export default class FMP4Transmuxer {
         for (const track of tracks.values()) { vector.write(track); }
       });
     });
+  }
+
+  // 初期化セグメントを作れるまでの間に届いたフレームを取っておく
+  // 初期化情報がいつまでも届かないこともあるので、取っておくのは最近の UNDECLARED_TRACK_WAIT の間に届いたフレームだけ (多くても MAX_WAITING_FRAMES 個) にする
+  // (古い方から捨てるので、取っておいたフレームの途中に間は空かない)
+  private keep(frame: Frame): void {
+    this.waitingFrames.push(frame);
+    this.waitingFrames = this.waitingFrames.filter(({ timestamp }) => frame.timestamp - timestamp < UNDECLARED_TRACK_WAIT).slice(-MAX_WAITING_FRAMES);
   }
 
   // RTMP のメッセージを fMP4 の断片にする (初期化セグメントを作った時は、待っている間に取っておいたフレームの断片もまとめて返す)

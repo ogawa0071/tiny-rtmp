@@ -154,21 +154,22 @@ describe('Tracks in the initialization segment', () => {
     expect(fragments.length).toStrictEqual(1000);
   });
 
-  test('an onMetaData that arrives after the first frames and declares AAC: the frames kept until then are not sent before the gap', () => {
+  test('an onMetaData that arrives after the first frames and declares AAC: only the frames of the last second are kept while the AAC track is waited for', () => {
     const transmuxer = new FMP4Transmuxer();
     transmuxer.feed(video(0, AVC_SEQUENCE_HEADER));
     const fragments: FMP4Fragment[] = [];
     for (let t = 0; t < 3000; t += 100) {
-      // H.264 と AAC が書かれた onMetaData が最初のフレームより後に届き、AAC の初期化情報はさらに後に届く (その間の映像は捨てる)
+      // H.264 と AAC が書かれた onMetaData が最初のフレームより後に届き、AAC の初期化情報はさらに後に届く
       if (t === 500) { transmuxer.feed(metadata(7, 10)); }
       if (t === 2000) { transmuxer.feed(audio(t, AAC_SEQUENCE_HEADER)); }
       fragments.push(... transmuxer.feed(video(t, keyframes(t))));
       if (t >= 2000) { fragments.push(... transmuxer.feed(audio(t + 8, AAC_FRAME))); }
     }
 
-    // 映像は 2000 ms のキーフレームから送られる (onMetaData が届く前に取っておいた 0 ms からのフレームは、間が空くので送らない)
+    // 映像は、AAC の初期化情報が届く前の 1 秒 (UNDECLARED_TRACK_WAIT) の間に取っておいた、1000 ms のキーフレームから送られる
     const videoFragments = fragments.filter((fragment) => trackId(fragment) === 1);
-    expect(videoFragments.map(decodeTime)).toStrictEqual(Array.from({ length: 9 }, (_, i) => 2000 + i * 100));
+    expect(videoFragments.map(decodeTime)).toStrictEqual(Array.from({ length: 19 }, (_, i) => 1000 + i * 100));
+    expect(fragments.find(({ independent }) => independent)).toBe(videoFragments[0]);
   });
 
   test.each([
@@ -356,7 +357,7 @@ describe('Sequence headers without the configuration', () => {
     ['5.1ch (MultichannelConfig)', ['af00', '946d70346101060000003f'], []],
     ['2 AAC tracks (Multitrack)', ['af00', '95006d70346101', '95046d70346101010200000003'], ['95006d703461011210', '95046d70346101010200000003', '95016d7034610121']],
     ['AAC + Opus tracks (Multitrack)', ['af00', '95004f707573014f707573486561640102000080bb0000000000', '95044f70757301010200000003'], ['95014f70757301fc']],
-  ])('FFmpeg -c copy from ADTS AAC, %s: the AAC track is waited for, with or without onMetaData', (_, beforeVideo, afterVideo) => {
+  ])('FFmpeg -c copy from ADTS AAC, %s: the AAC track is waited for, with or without onMetaData, and viewers can start from the first keyframe', (_, beforeVideo, afterVideo) => {
     for (const object of [{ videocodecid: 7, audiocodecid: 10 }, null]) {
       const transmuxer = new FMP4Transmuxer();
       if (object != null) { transmuxer.feed(onmetadata(object)); }
@@ -375,6 +376,10 @@ describe('Sequence headers without the configuration', () => {
 
       expect(tracks(transmuxer)).toStrictEqual(['avc1', 'mp4a']);
       expect(trackIds(fragments)).toStrictEqual(new Set([1, 2]));
+      // 本当の AAC の初期化情報より先に届いた 0 ms のキーフレームから、全ての映像のフレームが送られる (最後のフレームは長さが分からないので、まだ送られない)
+      const videoFragments = fragments.filter((fragment) => trackId(fragment) === 1);
+      expect(videoFragments.map(decodeTime)).toStrictEqual(Array.from({ length: 29 }, (_, i) => i * 100));
+      expect(fragments.find(({ independent }) => independent)).toBe(videoFragments[0]);
     }
   });
 });

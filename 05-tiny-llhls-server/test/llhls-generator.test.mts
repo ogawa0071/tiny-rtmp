@@ -3,6 +3,8 @@ import { describe, expect, test } from 'vitest';
 import { MessageType } from '../../01-tiny-rtmp-server/src/message.mts';
 import type { Message } from '../../01-tiny-rtmp-server/src/message.mts';
 import type { AMF0Object } from '../../01-tiny-rtmp-server/src/amf0-reader.mts';
+import { NoopLogger, registerLogger } from '../../01-tiny-rtmp-server/src/logger.mts';
+import type { Logger } from '../../01-tiny-rtmp-server/src/logger.mts';
 
 import LLHLSGenerator from '../src/llhls-generator.mts';
 
@@ -12,6 +14,8 @@ const AAC_SEQUENCE_HEADER = Buffer.from('af00120856e500', 'hex');
 const AAC_FRAME = Buffer.from('af0121', 'hex');
 // AVC のフレーム (FrameType 1 はキーフレーム、2 はインターフレーム)
 const avc = (frameType: number): Buffer => Buffer.from([(frameType << 4) | 7, 1, 0, 0, 0, 0, 0, 0, 1, 0x65]);
+// FFmpeg が、まだ初期化情報がない時に送ってくる中身が空の AVC の初期化情報
+const EMPTY_AVC_SEQUENCE_HEADER = Buffer.from('1700000000', 'hex');
 
 const onmetadata = (object: AMF0Object): Message => ({
   message_type_id: MessageType.DataAMF0, message_stream_id: 1, timestamp: 0, data: ['@setDataFrame', 'onMetaData', object],
@@ -44,17 +48,51 @@ const partialSegments = (generator: LLHLSGenerator): Promise<[string, Buffer][]>
 const pids = (segment: Buffer): number[] => {
   return Array.from({ length: segment.byteLength / 188 }, (_, i) => segment.readUInt16BE(i * 188 + 1) & 0x1FFF);
 };
-// セグメントの最初の PMT (PID 256) に載っている ES の stream_type の一覧 (0x1B: AVC, 0x0F: AAC)
-const streamTypes = (segment: Buffer): number[] => {
-  const packet = segment.subarray(pids(segment).indexOf(256) * 188);
-  const section = packet.subarray(5 + packet[4]); // TS パケットのヘッダ (4 byte) と pointer_field の後ろから
-  const end = 3 + (section.readUInt16BE(1) & 0x0FFF) - 4; // CRC_32 の前まで
-  const types: number[] = [];
-  // program_info の後ろに、ES ごとに stream_type (1 byte), elementary_PID (2 byte), ES_info_length (2 byte), ES_info が並ぶ
-  for (let i = 12 + (section.readUInt16BE(10) & 0x0FFF); i < end; i += 5 + (section.readUInt16BE(i + 3) & 0x0FFF)) {
-    types.push(section[i]);
-  }
-  return types;
+// セグメントに入っている PMT (PID 256) の version_number と、載っている ES の stream_type (0x1B: AVC, 0x0F: AAC) の一覧
+const pmts = (segment: Buffer): [number, number[]][] => {
+  return pids(segment).flatMap((pid, index) => {
+    if (pid !== 256) { return []; }
+    const packet = segment.subarray(index * 188, (index + 1) * 188);
+    const section = packet.subarray(5 + packet[4]); // TS パケットのヘッダ (4 byte) と pointer_field の後ろから
+    const version = (section[5] >> 1) & 0x1F; // reserved (2 bit), version_number (5 bit), current_next_indicator (1 bit)
+    const end = 3 + (section.readUInt16BE(1) & 0x0FFF) - 4; // CRC_32 の前まで
+    const types: number[] = [];
+    // program_info の後ろに、ES ごとに stream_type (1 byte), elementary_PID (2 byte), ES_info_length (2 byte), ES_info が並ぶ
+    for (let i = 12 + (section.readUInt16BE(10) & 0x0FFF); i < end; i += 5 + (section.readUInt16BE(i + 3) & 0x0FFF)) {
+      types.push(section[i]);
+    }
+    return [[version, types] as [number, number[]]];
+  });
+};
+// セグメントの最初の PMT に載っている ES の stream_type の一覧
+const streamTypes = (segment: Buffer): number[] => pmts(segment)[0][1];
+// 警告のメッセージを記録するロガー
+class WarningLogger implements Logger {
+  public readonly warnings: string[] = [];
+  public trace(): void {}
+  public debug(): void {}
+  public info(): void {}
+  public warn(message: string): void { this.warnings.push(message); }
+  public error(): void {}
+  public fatal(): void {}
+}
+const warnings = (run: () => void): string[] => {
+  const logger = new WarningLogger();
+  registerLogger(logger);
+  try { run(); } finally { registerLogger(new NoopLogger()); }
+  return logger.warnings;
+};
+
+// 映像 (PID 258) と音声 (PID 259) の PES の PTS を、TS パケットの順に並べたもの (PES の先頭の TS パケット (payload_unit_start_indicator が 1 のもの) から読む)
+const pts = (segment: Buffer): number[] => {
+  return pids(segment).flatMap((pid, i) => {
+    const packet = segment.subarray(i * 188, (i + 1) * 188);
+    if ((pid !== 258 && pid !== 259) || (packet[1] & 0x40) === 0) { return []; }
+    // adaptation_field があれば、その後ろから PES が始まる
+    const pes = packet.subarray((packet[3] & 0x20) !== 0 ? 5 + packet[4] : 4);
+    // PES のヘッダ (9 byte) の後ろの PTS (33 bit を 3, 15, 15 bit に分けて、それぞれの後ろに marker_bit を置いてある)
+    return [((pes[9] >> 1) & 0x07) * 2 ** 30 + (pes.readUInt16BE(10) >> 1) * 2 ** 15 + (pes.readUInt16BE(12) >> 1)];
+  });
 };
 
 describe('Streams without video', () => {
@@ -123,7 +161,7 @@ describe('Streams with video', () => {
     expect(extinfs(generator)).toStrictEqual([2, 2, 2]);
   });
 
-  test('onMetaData without the video: segments are cut at the keyframes once the AVC video arrives', () => {
+  test('onMetaData without the video: segments are cut at the keyframes once the AVC video arrives', async () => {
     // 区切ったセグメントが全てプレイリストに残るように、ライブウィンドウを長くする
     const generator = new LLHLSGenerator({ liveWindowLength: 10, partialSegmentDuration: 0.3 });
     generator.feed(onmetadata({ audiocodecid: 10 }));
@@ -139,6 +177,9 @@ describe('Streams with video', () => {
     // HLS (04-tiny-hls-server) と同じく、映像が届くまでは AAC のフレーム (0, 1003, 2005 ミリ秒) で区切り、
     // 届いてからは 1 秒以上たったキーフレーム (3500, 4500, 5500, 6500 ミリ秒) で区切る
     expect(extinfs(generator)).toStrictEqual([1.003, 1.002, 1.495, 1, 1, 1]);
+    // 映像が届いたら PMT に AVC の ES を加えて、PMT の version_number を 1 増やす (H.222.0 2.4.4.9)
+    const changes = (await segments(generator)).flatMap(pmts).filter(([version, types], index, list) => index === 0 || version !== list[index - 1][0] || types.join() !== list[index - 1][1].join());
+    expect(changes).toStrictEqual([[0, [0x0F]], [1, [0x1B, 0x0F]]]);
   });
 
   // キーフレームの間隔が 1 秒より短い配信では、セグメントの途中のキーフレームを含むパーシャルセグメントも INDEPENDENT=YES になる
@@ -172,6 +213,32 @@ describe('Streams with video', () => {
 });
 
 describe('Partial segments in the middle of a GOP', () => {
+  // パーシャルセグメントの多くは、セグメントの途中の (キーフレームではない) フレームから始まる
+  // そのパーシャルセグメントも PAT と PMT から始まるように、フレームとその後に届いた音声は、どのパーシャルセグメントに入れるかを決めてから、届いた順に TS パケットにする
+  // (決める前に TS パケットにすると PAT/PMT がパーシャルセグメントの途中に入り、届いた順に TS パケットにしないと時刻が戻る)
+  test('29.97 fps, 2 s GOP: every partial segment starts with PAT and PMT, and keeps the video and audio in the order they arrived', async () => {
+    const generator = new LLHLSGenerator({ liveWindowLength: 3, partialSegmentDuration: 0.3 });
+    generator.feed(onmetadata({ videocodecid: 7, audiocodecid: 10 }));
+    generator.feed(video(0, AVC_SEQUENCE_HEADER));
+    generator.feed(audio(0, AAC_SEQUENCE_HEADER));
+    // 29.97 fps の映像 (60 フレームごとにキーフレーム) と 48 kHz の AAC
+    let i = 0;
+    for (let frame = 0; frame < 60 * 5; frame++) {
+      const t = Math.round(frame * 1001 / 30);
+      for (; aac(i) <= t; i++) { generator.feed(audio(aac(i), AAC_FRAME)); }
+      generator.feed(video(t, avc(frame % 60 === 0 ? 1 : 2)));
+    }
+
+    expect(await generator.published()).toStrictEqual(true);
+    // キーフレームを含まない (INDEPENDENT=YES ではない) パーシャルセグメントがある
+    expect(parts(generator).filter((part) => !part.endsWith(',INDEPENDENT=YES')).length).toBeGreaterThan(0);
+    for (const [name, data] of await partialSegments(generator)) {
+      expect(pids(data).slice(0, 2), name).toStrictEqual([0, 256]);
+      // 映像と音声は timestamp の順に届くので、届いた順に TS パケットにしていれば PTS も順に並ぶ (この映像には B フレームがないので、PTS は DTS と同じ)
+      expect(pts(data), name).toStrictEqual(pts(data).toSorted((a, b) => a - b));
+    }
+  });
+
   // HLS (04-tiny-hls-server) と同じく、パーシャルセグメントの途中のキーフレームの前にも PAT と PMT を入れる
   test('keyframes inside a partial segment also get PAT and PMT in front of them', async () => {
     const generator = new LLHLSGenerator({ liveWindowLength: 10, partialSegmentDuration: 0.25 });
@@ -198,6 +265,34 @@ describe('Partial segments in the middle of a GOP', () => {
     for (const index of keyframes) {
       const before = list.slice(0, index);
       expect(before.lastIndexOf(0)).toBeGreaterThan(before.lastIndexOf(258));
+    }
+  });
+});
+
+describe('H.264 whose real sequence header never arrives (FFmpeg 6.0 or earlier with an encoder without global header)', () => {
+  // HLS (04-tiny-hls-server) と同じく、その映像は MPEG-TS にできないので、映像のない配信として扱う
+  test('with AAC: the video is reported as ignored, and every partial segment is cut at the AAC frames with a PMT that lists only AAC', async () => {
+    const generator = new LLHLSGenerator({ liveWindowLength: 3, partialSegmentDuration: 0.3 });
+    expect(warnings(() => {
+      generator.feed(onmetadata({ videocodecid: 7, audiocodecid: 10 }));
+      generator.feed(video(0, EMPTY_AVC_SEQUENCE_HEADER));
+      generator.feed(audio(0, AAC_SEQUENCE_HEADER));
+      // 10 fps の映像 (1 秒ごとにキーフレーム) と AAC
+      let i = 0;
+      for (let t = 0; t < 4500; t += 100) {
+        generator.feed(video(t, avc(t % 1000 === 0 ? 1 : 2)));
+        for (; aac(i) < t + 100; i++) { generator.feed(audio(aac(i), AAC_FRAME)); }
+      }
+    })).toStrictEqual(['Video sequence header is missing, video is ignored']);
+
+    expect(await generator.published()).toStrictEqual(true);
+    // 音声だけの配信と同じく、AAC のフレームで区切り、どのパーシャルセグメントも INDEPENDENT=YES にする
+    expect(extinfs(generator)).toStrictEqual([1.002, 1.003, 1.003]);
+    expect(parts(generator).every((part) => part.endsWith(',INDEPENDENT=YES'))).toStrictEqual(true);
+    for (const [name, data] of await partialSegments(generator)) {
+      expect(pids(data).slice(0, 2), name).toStrictEqual([0, 256]);
+      expect(streamTypes(data), name).toStrictEqual([0x0F]);
+      expect(pids(data), name).not.toContain(258);
     }
   });
 });

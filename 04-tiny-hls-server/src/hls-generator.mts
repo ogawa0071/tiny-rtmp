@@ -1,7 +1,7 @@
 import type { Message } from '../../01-tiny-rtmp-server/src/message.mts';
 
 import MPEGTSTransmuxer from '../../03-tiny-http-ts-server/src/mpegts-transmuxer.mts';
-import handle_rtmp_payload, { AACPacketType, FrameType, PacketType, read_onmetadata, TimestampUnwrapper, VideoCodecType } from '../../03-tiny-http-ts-server/src/rtmp-handler.mts';
+import handle_rtmp_payload, { AACPacketType, FrameType, PacketType, TimestampUnwrapper } from '../../03-tiny-http-ts-server/src/rtmp-handler.mts';
 
 import MediaPlaylist from './media-playlist.mts';
 import { PlaylistTimestamp } from './playlist-timestamp.mts';
@@ -11,8 +11,6 @@ export default class HLSGenerator {
   private transmuxer = new MPEGTSTransmuxer();
   private timestamps = new TimestampUnwrapper();
   private playlist: MediaPlaylist;
-  // 映像 (AVC) のない配信か (音声だけの配信や、このサーバで扱えない AVC 以外の映像の配信)
-  private audioOnly = false;
 
   public constructor(liveWindowLength: number = 3) {
     this.playlist = new MediaPlaylist({ liveWindowLength });
@@ -39,22 +37,20 @@ export default class HLSGenerator {
     const message = this.timestamps.unwrap(received);
     const payload = handle_rtmp_payload(message);
     const timestamp = PlaylistTimestamp.fromRTMP(message.timestamp);
-    // onMetaData に音声のコーデックが書かれていて、AVC が書かれていなければ、映像のない配信とする (コーデックを 'avc1' の文字列で送ってくる配信ソフトもある)
-    // onMetaData を送ってこない配信ソフトや、onMetaData にコーデックを書かない配信ソフト (yasea など) では分からないので、映像のキーフレームを待つ
+    // 先にこのメッセージを渡して、映像 (AVC) のない配信か (PMT に AVC の ES を載せないか) を決めさせる (MPEGTSTransmuxer の hasVideo)
+    // (TS パケットにするのは、下でセグメントの先頭にするかを決めてから、playlist.feed で取り出す時なので、PAT/PMT はその時に入る)
+    const packets = this.transmuxer.feed(message);
+    // 映像のない配信 (音声だけの配信や、このサーバで扱えない AVC 以外の映像の配信) か
+    // onMetaData を送ってこない配信ソフトや、onMetaData にコーデックを書かない配信ソフト (yasea など) では、映像が届くまで分からないので、映像のキーフレームを待つ
     // (映像が音声より遅れて届くこともあり、音声だけで区切ったセグメントの後から映像が始まると、そこから再生を始めたプレイヤーは映像を再生できない)
-    const metadata = payload?.kind === 'Data' ? read_onmetadata(payload.values) : null;
-    if (metadata?.audiocodecid != null) {
-      this.audioOnly = metadata.videocodecid !== VideoCodecType.AVC && metadata.videocodecid !== 'avc1';
-    }
-    // AVC の映像が届いたら、映像のキーフレームで区切る
-    if (payload?.kind === 'Video') { this.audioOnly = false; }
-    // 映像のない配信では、PMT にも音声だけを載せる (届かない映像を待ってしまうプレイヤーがある)
-    this.transmuxer.audioOnly = this.audioOnly;
+    // onMetaData に書かれていなかった映像が後から届いたら、そこからは映像のキーフレームで区切る
+    // (トラックが変わる所には EXT-X-DISCONTINUITY が必要だが (RFC 8216 4.3.2.3)、映像はセグメントの途中から始まるので付けていない)
+    const audioOnly = !this.transmuxer.hasVideo();
 
     // キーフレームから新しいセグメントを始める
     // 映像のない配信では、音声のフレームから (1 秒以上たったら) 新しいセグメントを始める (AAC のフレームはどれも単体でデコードできる)
-    const video = payload?.kind === 'Video' && payload.packetType === PacketType.CodedFrames;
-    const audio = this.audioOnly && payload?.kind === 'Audio' && payload.packetType === AACPacketType.Raw;
+    const video = !audioOnly && payload?.kind === 'Video' && payload.packetType === PacketType.CodedFrames;
+    const audio = audioOnly && payload?.kind === 'Audio' && payload.packetType === AACPacketType.Raw;
     const keyframe = video && payload.frameType === FrameType.KEY_FRAME;
     const started = (keyframe || audio) && this.playlist.append(timestamp);
     // セグメント単体でもデコードを始められるように、セグメントの先頭に PAT/PMT を入れる
@@ -65,6 +61,6 @@ export default class HLSGenerator {
     }
 
     // 配信が終わった時は、セグメントを区切るフレーム (映像のない配信では音声のフレーム) の最後のものの時刻までで、最後のセグメントを完成させる
-    this.playlist.feed(this.transmuxer.feed(message), timestamp, video || audio);
+    this.playlist.feed(packets, timestamp, video || audio);
   }
 }

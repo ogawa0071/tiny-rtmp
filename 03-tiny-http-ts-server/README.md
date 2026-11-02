@@ -4,7 +4,7 @@
 
 ## 主要コンポーネント
 
-- mpegts-transmuxer.mts - FLVからMPEG-TSへの変換処理
+- mpegts-transmuxer.mts - FLVからMPEG-TSへの変換処理 (PMT には、データの届く映像 (H.264) と音声 (AAC) の ES だけを載せる。onMetaData と、最初に届いた映像・音声のコーデックで決める)
 - mpegts.mts - MPEG-TSフォーマットのパケット生成
 - aac.mts / avc.mts - AACとAVCコーデックの処理
 - bit-reader.mts / bit-builder.mts - ビットレベルでのデータ操作ユーティリティ

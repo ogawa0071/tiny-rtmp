@@ -3,6 +3,8 @@ import { describe, expect, test } from 'vitest';
 import { MessageType } from '../../01-tiny-rtmp-server/src/message.mts';
 import type { Message } from '../../01-tiny-rtmp-server/src/message.mts';
 import type { AMF0Object } from '../../01-tiny-rtmp-server/src/amf0-reader.mts';
+import { NoopLogger, registerLogger } from '../../01-tiny-rtmp-server/src/logger.mts';
+import type { Logger } from '../../01-tiny-rtmp-server/src/logger.mts';
 
 import HLSGenerator from '../src/hls-generator.mts';
 
@@ -16,6 +18,8 @@ const avc = (frameType: number): Buffer => Buffer.from([(frameType << 4) | 7, 1,
 const AVC_END_OF_SEQUENCE = Buffer.from('1702000000', 'hex');
 // Enhanced RTMP の H.265 のフレーム (このサーバでは扱わない)
 const HEVC_FRAME = Buffer.from('9168766331000000', 'hex');
+// FFmpeg が、まだ初期化情報がない時に送ってくる中身が空の AVC の初期化情報
+const EMPTY_AVC_SEQUENCE_HEADER = Buffer.from('1700000000', 'hex');
 
 const onmetadata = (object: AMF0Object): Message => ({
   message_type_id: MessageType.DataAMF0, message_stream_id: 1, timestamp: 0, data: ['@setDataFrame', 'onMetaData', object],
@@ -36,17 +40,40 @@ const segments = (generator: HLSGenerator): Buffer[] => {
 const pids = (segment: Buffer): number[] => {
   return Array.from({ length: segment.byteLength / 188 }, (_, i) => segment.readUInt16BE(i * 188 + 1) & 0x1FFF);
 };
-// セグメントの最初の PMT (PID 256) に載っている ES の stream_type の一覧 (0x1B: AVC, 0x0F: AAC)
-const streamTypes = (segment: Buffer): number[] => {
-  const packet = segment.subarray(pids(segment).indexOf(256) * 188);
-  const section = packet.subarray(5 + packet[4]); // TS パケットのヘッダ (4 byte) と pointer_field の後ろから
-  const end = 3 + (section.readUInt16BE(1) & 0x0FFF) - 4; // CRC_32 の前まで
-  const types: number[] = [];
-  // program_info の後ろに、ES ごとに stream_type (1 byte), elementary_PID (2 byte), ES_info_length (2 byte), ES_info が並ぶ
-  for (let i = 12 + (section.readUInt16BE(10) & 0x0FFF); i < end; i += 5 + (section.readUInt16BE(i + 3) & 0x0FFF)) {
-    types.push(section[i]);
-  }
-  return types;
+// セグメントに入っている PMT (PID 256) の version_number と、載っている ES の stream_type (0x1B: AVC, 0x0F: AAC) の一覧
+const pmts = (segment: Buffer): [number, number[]][] => {
+  return pids(segment).flatMap((pid, index) => {
+    if (pid !== 256) { return []; }
+    const packet = segment.subarray(index * 188, (index + 1) * 188);
+    const section = packet.subarray(5 + packet[4]); // TS パケットのヘッダ (4 byte) と pointer_field の後ろから
+    const version = (section[5] >> 1) & 0x1F; // reserved (2 bit), version_number (5 bit), current_next_indicator (1 bit)
+    const end = 3 + (section.readUInt16BE(1) & 0x0FFF) - 4; // CRC_32 の前まで
+    const types: number[] = [];
+    // program_info の後ろに、ES ごとに stream_type (1 byte), elementary_PID (2 byte), ES_info_length (2 byte), ES_info が並ぶ
+    for (let i = 12 + (section.readUInt16BE(10) & 0x0FFF); i < end; i += 5 + (section.readUInt16BE(i + 3) & 0x0FFF)) {
+      types.push(section[i]);
+    }
+    return [[version, types] as [number, number[]]];
+  });
+};
+// セグメントの最初の PMT に載っている ES の stream_type の一覧
+const streamTypes = (segment: Buffer): number[] => pmts(segment)[0][1];
+
+// 警告のメッセージを記録するロガー
+class WarningLogger implements Logger {
+  public readonly warnings: string[] = [];
+  public trace(): void {}
+  public debug(): void {}
+  public info(): void {}
+  public warn(message: string): void { this.warnings.push(message); }
+  public error(): void {}
+  public fatal(): void {}
+}
+const warnings = (run: () => void): string[] => {
+  const logger = new WarningLogger();
+  registerLogger(logger);
+  try { run(); } finally { registerLogger(new NoopLogger()); }
+  return logger.warnings;
 };
 
 describe('End of stream', () => {
@@ -89,16 +116,18 @@ describe('End of stream', () => {
 });
 
 describe('Streams without video', () => {
-  test.each([
+  test.each<[string, AMF0Object | null, Buffer | null]>([
     ['audio only (FFmpeg -vn)', { audiocodecid: 10, audiosamplerate: 48000, stereo: true }, null],
     ['H.265 + AAC (videocodecid is the FourCC number)', { videocodecid: 0x68766331, audiocodecid: 10 }, HEVC_FRAME],
+    // onMetaData がなければ、最初に届いた映像が H.264 ではないと分かった時から、映像のない配信として扱う
+    ['no onMetaData, H.265 + AAC (FFmpeg -flvflags no_metadata)', null, HEVC_FRAME],
   ])('%s: segments are cut at the AAC frames every second or more, and the playlist is published', async (_, object, frame) => {
     const generator = new HLSGenerator();
-    generator.feed(onmetadata(object));
+    if (object != null) { generator.feed(onmetadata(object)); }
     generator.feed(audio(0, AAC_SEQUENCE_HEADER));
     for (let i = 0; aac(i) < 4500; i++) {
-      generator.feed(audio(aac(i), AAC_FRAME));
       if (frame != null && i % 3 === 0) { generator.feed(video(aac(i), frame)); }
+      generator.feed(audio(aac(i), AAC_FRAME));
     }
 
     expect(await generator.published()).toStrictEqual(true);
@@ -159,6 +188,10 @@ describe('Streams with video', () => {
     // 映像が届くまでは AAC のフレーム (0, 1003, 2005 ミリ秒) で区切り、届いてからは 1 秒以上たったキーフレーム (3500, 4500, 5500, 6500 ミリ秒) で区切る
     // (2500 ミリ秒のキーフレームは、2005 ミリ秒からのセグメントがまだ 1 秒に満たないので区切らない。最後のセグメントは最後の映像のフレームの 6900 ミリ秒まで)
     expect(extinfs(generator.m3u8())).toStrictEqual([1.003, 1.002, 1.495, 1, 1, 1, 0.4]);
+    // 映像が届いたら PMT に AVC の ES を加えて、PMT の version_number を 1 増やす (PMT の中身を変えたら増やす: H.222.0 2.4.4.9)
+    // (2005 ミリ秒からのセグメントの途中で変わる。HLS ではトラックが変わる所に EXT-X-DISCONTINUITY が必要だが (RFC 8216 4.3.2.3)、そこでセグメントを区切れないので付けない)
+    const changes = segments(generator).flatMap(pmts).filter(([version, types], index, list) => index === 0 || version !== list[index - 1][0] || types.join() !== list[index - 1][1].join());
+    expect(changes).toStrictEqual([[0, [0x0F]], [1, [0x1B, 0x0F]]]);
   });
 
   test('keyframes inside a segment also get PAT and PMT in front of them', () => {
@@ -186,6 +219,45 @@ describe('Streams with video', () => {
         expect(before.lastIndexOf(0)).toBeGreaterThan(before.lastIndexOf(258));
       }
     }
+  });
+});
+
+describe('H.264 whose real sequence header never arrives (FFmpeg 6.0 or earlier with an encoder without global header)', () => {
+  // 中身が空の初期化情報しか届かず、フレームは開始コード付き (Annex B) のまま届くので、その映像は MPEG-TS にできない
+  test('with AAC: the video is reported as ignored, and segments are cut at the AAC frames with a PMT that lists only AAC', async () => {
+    const generator = new HLSGenerator();
+    expect(warnings(() => {
+      generator.feed(onmetadata({ videocodecid: 7, audiocodecid: 10 }));
+      generator.feed(video(0, EMPTY_AVC_SEQUENCE_HEADER));
+      generator.feed(audio(0, AAC_SEQUENCE_HEADER));
+      // 10 fps の映像 (1 秒ごとにキーフレーム) と AAC
+      let i = 0;
+      for (let t = 0; t < 4500; t += 100) {
+        generator.feed(video(t, avc(t % 1000 === 0 ? 1 : 2)));
+        for (; aac(i) < t + 100; i++) { generator.feed(audio(aac(i), AAC_FRAME)); }
+      }
+    })).toStrictEqual(['Video sequence header is missing, video is ignored']);
+
+    expect(await generator.published()).toStrictEqual(true);
+    // 音声だけの配信と同じく、1 秒以上たってから最初の AAC のフレームで区切る
+    expect(extinfs(generator.m3u8())).toStrictEqual([1.003, 1.002, 1.003, 1.003]);
+    for (const segment of segments(generator)) {
+      expect(pids(segment).slice(0, 2)).toStrictEqual([0, 256]);
+      expect(streamTypes(segment)).toStrictEqual([0x0F]);
+      expect(pids(segment)).not.toContain(258);
+    }
+  });
+
+  test('without audio (FFmpeg -an): the video is reported as ignored and no playlist of empty segments is published', async () => {
+    const generator = new HLSGenerator();
+    expect(warnings(() => {
+      generator.feed(onmetadata({ videocodecid: 7 }));
+      generator.feed(video(0, EMPTY_AVC_SEQUENCE_HEADER));
+      for (let t = 0; t < 4500; t += 100) { generator.feed(video(t, avc(t % 1000 === 0 ? 1 : 2))); }
+      generator.end();
+    })).toStrictEqual(['Video sequence header is missing, video is ignored']);
+
+    expect(await generator.published()).toStrictEqual(false);
   });
 });
 

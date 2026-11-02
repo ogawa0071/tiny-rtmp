@@ -172,7 +172,7 @@ export default class MediaPlaylist {
 
   // 今書き込んでいるパーシャルセグメント (seconds 秒) が、いつもより長いフレーム (次のフレームが欠けた、映像が途切れた) から始まっているか
   // 最初のフレームの長い分を除いた長さ (いつも通りのパーシャルセグメントの長さ、timestamp の丸めで 1 ミリ秒短いこともある) が、
-  // この長さ (と 1 ミリ秒) の PART-TARGET の 85% に届かないなら、いつもより長いフレームから始まるとみなす (ここから PART-TARGET を決めると、いつも通りのパーシャルセグメントが 85% に届かない)
+  // この長さ (と 1 ミリ秒) の PART-TARGET の 85% に届かないなら、いつもより長いフレームから始まるとみなす (ここから PART-TARGET を決めると、いつも通りのパーシャルセグメントが 85% に届かないことがある)
   // (timestamp が数ミリ秒揺れて、1 つ前のフレームより少し長いだけなら届くので、いつも通りのパーシャルセグメントとして扱う)
   private stalled(seconds: number): boolean {
     return this.partialSegmentExtra > 0 && seconds - this.partialSegmentExtra - 0.001 < 0.85 * (seconds + 0.001);

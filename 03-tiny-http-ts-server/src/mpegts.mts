@@ -80,6 +80,8 @@ export const StreamType = {
 
 export type PMT = {
   program_number: number;
+  // PMT の中身を変えた時は 1 増やす (32 で 0 に戻る: H.222.0 2.4.4.9)
+  version_number: number;
   pcr_pid: number;
   program_info?: Buffer;
   streams: {
@@ -99,7 +101,7 @@ export const write_pmt = (pmt: PMT) => {
   builder.writeBits(0, 12); // section_length (後で埋める)
   builder.writeBits(pmt.program_number, 16); // program_number
   builder.writeBits(0b11, 2); // reserved
-  builder.writeBits(0, 5); // version_number
+  builder.writeBits(pmt.version_number, 5); // version_number
   builder.writeBits(0b1, 1); // current_next_indicator
   builder.writeBits(0, 8); // section_number
   builder.writeBits(0, 8); // last_section_number

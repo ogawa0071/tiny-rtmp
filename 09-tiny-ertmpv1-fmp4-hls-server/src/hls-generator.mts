@@ -37,8 +37,8 @@ const AUDIO_TRACK_ID = 2;
 const HEVC_FOURCC = Buffer.from('hvc1', 'ascii').readUInt32BE(0);
 // onMetaData にコーデックが書かれていない時に、まだ初期化情報が届いていないトラックを、最初のフレームから待つ長さ (ミリ秒)
 const UNDECLARED_TRACK_WAIT = 1000;
-// UNDECLARED_TRACK_WAIT の間に取っておくフレームの数の上限 (1 秒間に届くフレームの数より十分に多くする)
-// (timestamp が進まない配信では待ち終わらないので、取っておくフレームが増え続けないようにする)
+// 初期化情報を待っている間に取っておくフレームの数の上限 (1 秒間に届くフレームの数より十分に多くする)
+// (timestamp が進まない配信では、UNDECLARED_TRACK_WAIT の間に届いたフレームだけにしても減らないので、取っておくフレームが増え続けないようにする)
 const MAX_WAITING_FRAMES = 1000;
 
 export default class HLSGenerator {
@@ -62,7 +62,7 @@ export default class HLSGenerator {
   private firstAudioFormat: number | null = null;
   // 最初に届いたフレームの timestamp (onMetaData にコーデックが書かれていない時に、UNDECLARED_TRACK_WAIT の間だけ届いていないトラックを待つ)
   private firstFrameTimestamp: number | null = null;
-  // UNDECLARED_TRACK_WAIT の間に届いたフレーム (初期化セグメントを作ってから書き出す)
+  // 初期化セグメントを作れるまでの間に届いたフレーム (初期化セグメントを作ってから書き出す: keep)
   private waitingFrames: Frame[] = [];
   private sequenceNumber = 0; // mfhd の sequence_number (moof ごとに 1 から増やす)
 
@@ -175,9 +175,10 @@ export default class HLSGenerator {
         ? this.firstAudioFormat === AudioCodecType.AAC
         : (audiocodecid === AudioCodecType.AAC || audiocodecid === 'mp4a');
       if ((video_expected && this.videoTrack == null && this.unsupportedVideoCodec == null) || (audio_expected && this.audioTrack == null)) {
-        // 待っている間に届いたフレームは捨てる
-        // (下の UNDECLARED_TRACK_WAIT の間に取っておいたフレームがあれば、それも捨てる。取っておいたフレームを書き出すと、捨てたフレームの分だけ間が空く)
-        this.waitingFrames = [];
+        // 待っている間に届いたフレームも取っておく
+        // (B フレームのある H.264 と ADTS の AAC (MPEG-TS や HLS の入力など) を FFmpeg が -c copy で送ると、本当の AAC の初期化情報が最初の映像のキーフレームより後に届く。
+        //  捨てると最初のキーフレームがなくなり、次のキーフレームまでの映像がセグメントにならない)
+        this.keep(payload);
         return;
       }
       if (this.videoTrack == null && this.audioTrack == null) { return; }
@@ -190,9 +191,7 @@ export default class HLSGenerator {
       if (!declared && missing) {
         this.firstFrameTimestamp ??= payload.timestamp;
         if (payload.timestamp - this.firstFrameTimestamp < UNDECLARED_TRACK_WAIT) {
-          // 上限に達したら一番古いフレームを捨てる (古い方から捨てるので、取っておいたフレームの途中に間は空かない)
-          if (this.waitingFrames.length >= MAX_WAITING_FRAMES) { this.waitingFrames.shift(); }
-          this.waitingFrames.push(payload);
+          this.keep(payload);
           return;
         }
       }
@@ -212,6 +211,14 @@ export default class HLSGenerator {
     for (const frame of this.waitingFrames) { this.write(frame); }
     this.waitingFrames = [];
     this.write(payload);
+  }
+
+  // 初期化セグメントを作れるまでの間に届いたフレームを取っておく
+  // 初期化情報がいつまでも届かないこともあるので、取っておくのは最近の UNDECLARED_TRACK_WAIT の間に届いたフレームだけ (多くても MAX_WAITING_FRAMES 個) にする
+  // (古い方から捨てるので、取っておいたフレームの途中に間は空かない)
+  private keep(payload: Frame): void {
+    this.waitingFrames.push(payload);
+    this.waitingFrames = this.waitingFrames.filter(({ timestamp }) => payload.timestamp - timestamp < UNDECLARED_TRACK_WAIT).slice(-MAX_WAITING_FRAMES);
   }
 
   // フレームを fMP4 にしてセグメントに書き出す (初期化セグメントにないトラックのフレームは書き出さない)
